@@ -8,7 +8,8 @@ on:
 jobs:
   github-release:
     name: "Create GitHub Release"
-    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    runs-on: macos-26
     outputs:
       version: ${{ steps.get_version.outputs.VERSION }}
     steps:
@@ -36,7 +37,8 @@ jobs:
 
   publish:
     needs: github-release
-    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    runs-on: macos-26
     environment: release
     permissions:
       id-token: write
@@ -50,7 +52,7 @@ jobs:
 
   slack_notify:
     needs: [github-release, publish]
-    timeout-minutes: 20
+    timeout-minutes: 5
     runs-on: ubuntu-slim
     if: ${{ always() }}
     permissions:
