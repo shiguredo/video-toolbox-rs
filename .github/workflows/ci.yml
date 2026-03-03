@@ -53,7 +53,7 @@ jobs:
       - docs-rs
     runs-on: ubuntu-slim
     if: always()
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
       actions: read
     steps:
