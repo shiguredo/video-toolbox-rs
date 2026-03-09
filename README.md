@@ -3,6 +3,8 @@
 [![crates.io](https://img.shields.io/crates/v/shiguredo_video_toolbox.svg)](https://crates.io/crates/shiguredo_video_toolbox)
 [![docs.rs](https://docs.rs/shiguredo_video_toolbox/badge.svg)](https://docs.rs/shiguredo_video_toolbox)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub Actions](https://github.com/shiguredo/video-toolbox-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/shiguredo/video-toolbox-rs/actions/workflows/ci.yml)
+[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/shiguredo)
 
 ## About Shiguredo's open source software
 
