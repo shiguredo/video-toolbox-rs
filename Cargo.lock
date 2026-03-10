@@ -527,7 +527,7 @@ checksum = "b060fffc1e7378d42623f8257807c1e44bd522f3c17b5179efb656b7ad77bd44"
 
 [[package]]
 name = "shiguredo_video_toolbox"
-version = "2026.1.0-canary.0"
+version = "2026.1.0-canary.1"
 dependencies = [
  "bindgen",
  "log",
