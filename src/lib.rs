@@ -690,6 +690,82 @@ impl Encoder {
         }
     }
 
+    /// CVPixelBuffer を直接エンコードする（ゼロコピー）
+    ///
+    /// video-device-rs の `PixelBuffer::as_ptr()` で取得した CVPixelBuffer ポインタを渡す。
+    /// 内部で CFRetain するため、呼び出し元はこの関数の後にポインタ元を drop してよい。
+    ///
+    /// エンコード結果は [`Encoder::next_frame()`] で取得できる
+    ///
+    /// # Safety
+    ///
+    /// `pixel_buffer_ptr` は有効な CVPixelBuffer ポインタでなければならない。
+    pub unsafe fn encode_pixel_buffer(
+        &mut self,
+        pixel_buffer_ptr: *mut c_void,
+        options: &EncodeOptions,
+    ) -> Result<(), Error> {
+        unsafe {
+            // ピクセルフォーマットの検証
+            let format_type = sys::CVPixelBufferGetPixelFormatType(pixel_buffer_ptr.cast());
+            let actual = match format_type {
+                x if x == u32::from_be_bytes(*b"y420") => PixelFormat::I420,
+                x if x == sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => PixelFormat::Nv12,
+                _ => {
+                    // 未知のフォーマットは I420 でも Nv12 でもないので、
+                    // どちらを actual にしても不一致になる。期待値の逆を返す。
+                    let actual = match self.config.pixel_format {
+                        PixelFormat::I420 => PixelFormat::Nv12,
+                        PixelFormat::Nv12 => PixelFormat::I420,
+                    };
+                    return Err(Error::PixelFormatMismatch {
+                        expected: self.config.pixel_format,
+                        actual,
+                    });
+                }
+            };
+            if actual != self.config.pixel_format {
+                return Err(Error::PixelFormatMismatch {
+                    expected: self.config.pixel_format,
+                    actual,
+                });
+            }
+
+            // CFRetain して CfPtrMut でラップ（スコープ終了時に CFRelease される）
+            sys::CFRetain(pixel_buffer_ptr.cast());
+            let image_buffer = CfPtrMut(pixel_buffer_ptr.cast::<sys::__CVBuffer>());
+
+            let frame_properties = if options.force_key_frame {
+                cf_dictionary(&[(
+                    sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
+                    sys::kCFBooleanTrue as *const c_void,
+                )])
+            } else {
+                std::ptr::null()
+            };
+            let _frame_properties_guard = if !frame_properties.is_null() {
+                Some(CfPtr(frame_properties.cast::<c_void>()))
+            } else {
+                None
+            };
+
+            let status = sys::VTCompressionSessionEncodeFrame(
+                self.session,
+                image_buffer.0,
+                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
+                sys::kCMTimeInvalid,
+                frame_properties,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            Error::check(status, "VTCompressionSessionEncodeFrame")?;
+
+            self.next_input_pts += self.config.fps_denominator as i64;
+
+            Ok(())
+        }
+    }
+
     /// これ以上データが来ないことをエンコーダーに伝える
     ///
     /// 残りのエンコード結果は [`Encoder::next_frame()`] で取得できる
