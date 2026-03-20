@@ -369,6 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             duration: 1,
             data_offset: *data_offset,
             data_size: encoded.data.len(),
+            composition_time_offset: None,
         };
         muxer.append_sample(&sample)?;
         *data_offset += encoded.data.len() as u64;
