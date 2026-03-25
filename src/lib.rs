@@ -19,7 +19,10 @@ use std::{
 
 use sys::VTCompressionSessionCreate;
 
+mod codec_info;
 mod sys;
+
+pub use codec_info::*;
 
 /// エラー
 #[derive(Debug)]
@@ -1574,7 +1577,7 @@ impl<T> Drop for CfPtrMut<T> {
 }
 
 #[derive(Debug)]
-struct CfPtr<T>(*const T);
+pub(crate) struct CfPtr<T>(pub(crate) *const T);
 
 impl<T> Drop for CfPtr<T> {
     fn drop(&mut self) {
@@ -1796,22 +1799,35 @@ mod tests {
 
     #[test]
     fn init_vp9_decoder() {
-        let result = Decoder::new(DecoderConfig {
+        if !supported_codecs()
+            .iter()
+            .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
+        {
+            return;
+        }
+
+        Decoder::new(DecoderConfig {
             codec: DecoderCodec::Vp9 {
                 width: WIDTH,
                 height: HEIGHT,
             },
             pixel_format: PixelFormat::I420,
-        });
-        if let Err(Error::UnsupportedCodec { codec }) = &result {
-            eprintln!("VP9 decoder not supported on this platform: {codec}");
-            return;
-        }
-        result.expect("failed to create VP9 decoder");
+        })
+        .expect("failed to create VP9 decoder");
     }
 
     #[test]
     fn init_av1_decoder() {
+        if !supported_codecs()
+            .iter()
+            .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.supported)
+        {
+            return;
+        }
+
+        // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
+        // コーデック固有のパラメータが不足して失敗する場合がある。
+        // 実際のビットストリームからデコードする場合は正常に動作する。
         let result = Decoder::new(DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
@@ -1819,8 +1835,7 @@ mod tests {
             },
             pixel_format: PixelFormat::I420,
         });
-        if let Err(Error::UnsupportedCodec { codec }) = &result {
-            eprintln!("AV1 decoder not supported on this platform: {codec}");
+        if let Err(Error::UnsupportedCodec { .. }) = &result {
             return;
         }
         result.expect("failed to create AV1 decoder");
@@ -1909,6 +1924,13 @@ mod tests {
 
     #[test]
     fn vp9_decoder() -> Result<(), Error> {
+        if !supported_codecs()
+            .iter()
+            .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
+        {
+            return Ok(());
+        }
+
         use shiguredo_libvpx::{
             CodecConfig as VpxCodecConfig, EncodeOptions as VpxEncodeOptions,
             Encoder as VpxEncoder, EncoderConfig as VpxEncoderConfig,
@@ -1972,17 +1994,10 @@ mod tests {
         assert!(!encoded_frames.is_empty(), "VP9 encoder produced no frames");
 
         // Video Toolbox VP9 デコーダーを作成
-        let mut decoder = match Decoder::new(DecoderConfig {
+        let mut decoder = Decoder::new(DecoderConfig {
             codec: DecoderCodec::Vp9 { width, height },
             pixel_format: PixelFormat::I420,
-        }) {
-            Ok(decoder) => decoder,
-            Err(Error::UnsupportedCodec { codec }) => {
-                eprintln!("VP9 decoder not supported on this platform: {codec}");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
+        })?;
 
         // 各フレームをデコードして PSNR を検証
         let min_psnr_db = 25.0;
@@ -2051,5 +2066,43 @@ mod tests {
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
         }
+    }
+
+    #[test]
+    fn test_supported_codecs() {
+        let codecs = supported_codecs();
+
+        // 4 種類のコーデックが返る
+        assert_eq!(codecs.len(), 4);
+
+        // H.264 デコード・エンコードは全 Mac でサポートされている
+        let h264 = codecs
+            .iter()
+            .find(|c| c.codec == VideoCodecType::H264)
+            .unwrap();
+        assert!(h264.decoding.supported);
+        assert!(h264.encoding.supported);
+
+        // HEVC デコード・エンコードは全 Mac でサポートされている
+        let hevc = codecs
+            .iter()
+            .find(|c| c.codec == VideoCodecType::Hevc)
+            .unwrap();
+        assert!(hevc.decoding.supported);
+        assert!(hevc.encoding.supported);
+
+        // VP9 エンコードは VideoToolbox ではサポートされていない
+        let vp9 = codecs
+            .iter()
+            .find(|c| c.codec == VideoCodecType::Vp9)
+            .unwrap();
+        assert!(!vp9.encoding.supported);
+
+        // AV1 エンコードは VideoToolbox ではサポートされていない
+        let av1 = codecs
+            .iter()
+            .find(|c| c.codec == VideoCodecType::Av1)
+            .unwrap();
+        assert!(!av1.encoding.supported);
     }
 }
