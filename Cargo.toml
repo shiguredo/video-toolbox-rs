@@ -17,6 +17,7 @@ log = "0.4.26"
 
 [dev-dependencies]
 raden = "2026.1.0-canary.2"
+shiguredo_libvpx = "2026.1.0-canary.2"
 shiguredo_mp4 = "2026.2.0"
 
 [build-dependencies]

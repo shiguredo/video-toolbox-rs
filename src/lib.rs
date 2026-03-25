@@ -47,6 +47,11 @@ pub enum Error {
         /// 実際のサイズ
         actual: usize,
     },
+    /// コーデックが未対応
+    UnsupportedCodec {
+        /// コーデック名
+        codec: &'static str,
+    },
 }
 
 impl Error {
@@ -85,6 +90,9 @@ impl std::fmt::Display for Error {
                     f,
                     "insufficient frame data for {plane} plane: expected at least {expected} bytes, but got {actual}"
                 )
+            }
+            Self::UnsupportedCodec { codec } => {
+                write!(f, "codec {codec} is not supported on this platform")
             }
         }
     }
@@ -1131,14 +1139,28 @@ impl Decoder {
     /// デコーダーのインスタンスを生成する
     pub fn new(config: DecoderConfig<'_>) -> Result<Self, Error> {
         unsafe {
-            let description = Self::create_format_description(&config.codec)?;
-            let session = Self::create_decompression_session(description, config.pixel_format)?;
+            let description = Self::create_format_description(&config.codec)
+                .map_err(|e| Self::wrap_unsupported_codec_error(&config.codec, e))?;
+            let session = Self::create_decompression_session(description, config.pixel_format)
+                .map_err(|e| {
+                    sys::CFRelease(description as *const c_void);
+                    Self::wrap_unsupported_codec_error(&config.codec, e)
+                })?;
 
             Ok(Self {
                 description,
                 session,
                 pixel_format: config.pixel_format,
             })
+        }
+    }
+
+    /// VP9/AV1 コーデックの場合、エラーを UnsupportedCodec に変換する
+    fn wrap_unsupported_codec_error(codec: &DecoderCodec<'_>, error: Error) -> Error {
+        match codec {
+            DecoderCodec::Vp9 { .. } => Error::UnsupportedCodec { codec: "VP9" },
+            DecoderCodec::Av1 { .. } => Error::UnsupportedCodec { codec: "AV1" },
+            _ => error,
         }
     }
 
@@ -1774,7 +1796,6 @@ mod tests {
 
     #[test]
     fn init_vp9_decoder() {
-        // ハードウェアサポートがない環境では失敗する可能性がある
         let result = Decoder::new(DecoderConfig {
             codec: DecoderCodec::Vp9 {
                 width: WIDTH,
@@ -1782,27 +1803,15 @@ mod tests {
             },
             pixel_format: PixelFormat::I420,
         });
-        if let Err(ref e) = result {
-            eprintln!("VP9 decoder not supported on this platform: {e}");
+        if let Err(Error::UnsupportedCodec { codec }) = &result {
+            eprintln!("VP9 decoder not supported on this platform: {codec}");
+            return;
         }
-        // VP9 がサポートされている場合は正常に初期化できること
-        if result.is_ok() {
-            assert!(
-                Decoder::new(DecoderConfig {
-                    codec: DecoderCodec::Vp9 {
-                        width: 0,
-                        height: 0,
-                    },
-                    pixel_format: PixelFormat::I420,
-                })
-                .is_err()
-            );
-        }
+        result.expect("failed to create VP9 decoder");
     }
 
     #[test]
     fn init_av1_decoder() {
-        // ハードウェアサポートがない環境では失敗する可能性がある
         let result = Decoder::new(DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
@@ -1810,22 +1819,207 @@ mod tests {
             },
             pixel_format: PixelFormat::I420,
         });
-        if let Err(ref e) = result {
-            eprintln!("AV1 decoder not supported on this platform: {e}");
+        if let Err(Error::UnsupportedCodec { codec }) = &result {
+            eprintln!("AV1 decoder not supported on this platform: {codec}");
+            return;
         }
-        // AV1 がサポートされている場合は正常に初期化できること
-        if result.is_ok() {
-            assert!(
-                Decoder::new(DecoderConfig {
-                    codec: DecoderCodec::Av1 {
-                        width: 0,
-                        height: 0,
+        result.expect("failed to create AV1 decoder");
+    }
+
+    /// SMPTE カラーバー風の I420 フレームを生成する
+    ///
+    /// 7 色の縦ストライプ（白/黄/シアン/緑/マゼンタ/赤/青）を
+    /// BT.601 で YUV に変換し I420 形式で返す。
+    fn generate_colorbar_i420(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        // SMPTE カラーバーの RGB 値（白/黄/シアン/緑/マゼンタ/赤/青）
+        let bars: [(u8, u8, u8); 7] = [
+            (235, 235, 235), // 白
+            (235, 235, 16),  // 黄
+            (16, 235, 235),  // シアン
+            (16, 235, 16),   // 緑
+            (235, 16, 235),  // マゼンタ
+            (235, 16, 16),   // 赤
+            (16, 16, 235),   // 青
+        ];
+
+        let y_size = width * height;
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        let uv_size = uv_width * uv_height;
+        let mut y_plane = vec![0u8; y_size];
+        let mut u_plane = vec![0u8; uv_size];
+        let mut v_plane = vec![0u8; uv_size];
+
+        for y in 0..height {
+            for x in 0..width {
+                let bar_index = x * 7 / width;
+                let (r, g, b) = bars[bar_index];
+
+                // BT.601 RGB -> YCbCr
+                let rf = r as f64;
+                let gf = g as f64;
+                let bf = b as f64;
+                let yv = (0.257 * rf + 0.504 * gf + 0.098 * bf + 16.0).clamp(16.0, 235.0) as u8;
+                y_plane[y * width + x] = yv;
+
+                // UV は 2x2 ブロック単位（左上ピクセルで代表する）
+                if y % 2 == 0 && x % 2 == 0 {
+                    let u =
+                        (-0.148 * rf - 0.291 * gf + 0.439 * bf + 128.0).clamp(16.0, 240.0) as u8;
+                    let v = (0.439 * rf - 0.368 * gf - 0.071 * bf + 128.0).clamp(16.0, 240.0) as u8;
+                    let uv_row = y / 2;
+                    let uv_col = x / 2;
+                    u_plane[uv_row * uv_width + uv_col] = u;
+                    v_plane[uv_row * uv_width + uv_col] = v;
+                }
+            }
+        }
+
+        (y_plane, u_plane, v_plane)
+    }
+
+    /// Y プレーン同士の PSNR を計算する（dB）
+    ///
+    /// デコード結果はストライドにパディングが含まれる場合があるため、
+    /// ストライドを指定して有効ピクセルのみを比較する。
+    fn psnr_y(
+        original: &[u8],
+        original_stride: usize,
+        decoded: &[u8],
+        decoded_stride: usize,
+        width: usize,
+        height: usize,
+    ) -> f64 {
+        let mut mse_sum: f64 = 0.0;
+        let pixel_count = width * height;
+        for y in 0..height {
+            for x in 0..width {
+                let orig = original[y * original_stride + x] as f64;
+                let dec = decoded[y * decoded_stride + x] as f64;
+                let diff = orig - dec;
+                mse_sum += diff * diff;
+            }
+        }
+        let mse = mse_sum / pixel_count as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    }
+
+    #[test]
+    fn vp9_decoder() -> Result<(), Error> {
+        use shiguredo_libvpx::{
+            CodecConfig as VpxCodecConfig, EncodeOptions as VpxEncodeOptions,
+            Encoder as VpxEncoder, EncoderConfig as VpxEncoderConfig,
+            EncodingDeadline as VpxEncodingDeadline, ImageData as VpxImageData,
+            ImageFormat as VpxImageFormat, RateControlMode as VpxRateControlMode,
+            Vp9Config as VpxVp9Config,
+        };
+
+        let width: u32 = 320;
+        let height: u32 = 240;
+        let num_frames: usize = 10;
+
+        let (y_plane, u_plane, v_plane) = generate_colorbar_i420(width as usize, height as usize);
+
+        // shiguredo_libvpx で VP9 エンコード
+        let vpx_config = VpxEncoderConfig {
+            width: width as usize,
+            height: height as usize,
+            image_format: VpxImageFormat::I420,
+            fps_numerator: 30,
+            fps_denominator: 1,
+            target_bitrate: 1_000_000,
+            min_quantizer: 0,
+            max_quantizer: 63,
+            cq_level: 10,
+            cpu_used: Some(8),
+            deadline: VpxEncodingDeadline::Realtime,
+            rate_control: VpxRateControlMode::Cbr,
+            lag_in_frames: None,
+            threads: std::num::NonZeroUsize::new(1),
+            error_resilient: false,
+            keyframe_interval: std::num::NonZeroUsize::new(30),
+            frame_drop_threshold: None,
+            codec: VpxCodecConfig::Vp9(VpxVp9Config::default()),
+        };
+        let mut vpx_encoder = VpxEncoder::new(vpx_config).expect("failed to create VP9 encoder");
+
+        let mut encoded_frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..num_frames {
+            vpx_encoder
+                .encode(
+                    &VpxImageData::I420 {
+                        y: &y_plane,
+                        u: &u_plane,
+                        v: &v_plane,
                     },
-                    pixel_format: PixelFormat::I420,
-                })
-                .is_err()
-            );
+                    &VpxEncodeOptions {
+                        force_keyframe: i == 0,
+                    },
+                )
+                .expect("failed to encode VP9 frame");
+            while let Some(frame) = vpx_encoder.next_frame() {
+                encoded_frames.push(frame.data().to_vec());
+            }
         }
+        vpx_encoder.finish().expect("failed to finish VP9 encoder");
+        while let Some(frame) = vpx_encoder.next_frame() {
+            encoded_frames.push(frame.data().to_vec());
+        }
+
+        assert!(!encoded_frames.is_empty(), "VP9 encoder produced no frames");
+
+        // Video Toolbox VP9 デコーダーを作成
+        let mut decoder = match Decoder::new(DecoderConfig {
+            codec: DecoderCodec::Vp9 { width, height },
+            pixel_format: PixelFormat::I420,
+        }) {
+            Ok(decoder) => decoder,
+            Err(Error::UnsupportedCodec { codec }) => {
+                eprintln!("VP9 decoder not supported on this platform: {codec}");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 各フレームをデコードして PSNR を検証
+        let min_psnr_db = 25.0;
+        for (i, encoded_data) in encoded_frames.iter().enumerate() {
+            let decoded = decoder
+                .decode(encoded_data)?
+                .unwrap_or_else(|| panic!("frame {i}: decode returned None"));
+
+            match decoded {
+                DecodedFrame::I420(ref frame) => {
+                    assert_eq!(frame.width(), width as usize, "frame {i}: width mismatch");
+                    assert_eq!(
+                        frame.height(),
+                        height as usize,
+                        "frame {i}: height mismatch"
+                    );
+
+                    let psnr = psnr_y(
+                        &y_plane,
+                        width as usize,
+                        frame.y_plane(),
+                        frame.y_stride(),
+                        width as usize,
+                        height as usize,
+                    );
+                    assert!(
+                        psnr >= min_psnr_db,
+                        "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
+                    );
+                }
+                DecodedFrame::Nv12(_) => {
+                    panic!("frame {i}: expected I420 but got NV12");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn encoder_config(is_h265: bool) -> EncoderConfig {
