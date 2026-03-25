@@ -11,6 +11,9 @@
 
 ## develop
 
+- [ADD] `Error::UnsupportedCodec` バリアントを追加する
+  - VP9 / AV1 デコーダーが環境で利用できない場合に明確なエラーを返す
+  - @voluntas
 - [ADD] `Error::InsufficientFrameData` バリアントを追加する
   - @voluntas
 - [FIX] H.264 プロファイルレベルを 3.1 固定から AutoLevel に変更する
@@ -76,6 +79,12 @@
   - `prioritize_speed_over_quality` を `prioritize_encoding_speed_over_quality` に変更する
   - @voluntas
 - [CHANGE] `EncoderConfig` から未使用の `use_parallelization` フィールドを削除する
+  - @voluntas
+
+### misc
+
+- VP9 デコーダーテストを追加する
+  - shiguredo_libvpx でカラーバーをエンコードし Video Toolbox でデコードして PSNR を検証する
   - @voluntas
 
 ## 2025.1.0

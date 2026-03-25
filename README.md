@@ -208,6 +208,24 @@ if let Some(frame) = decoder.decode(&avcc_data)? {
 | VP9 | `DecoderCodec::Vp9 { width, height }` |
 | AV1 | `DecoderCodec::Av1 { width, height }` |
 
+VP9 と AV1 はハードウェアサポートに依存するため、環境によっては利用できない場合があります。
+利用できない場合は `Error::UnsupportedCodec` エラーが返されます。
+
+```rust
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
+
+match Decoder::new(DecoderConfig {
+    codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
+    pixel_format: PixelFormat::I420,
+}) {
+    Ok(decoder) => { /* デコード処理 */ }
+    Err(Error::UnsupportedCodec { codec }) => {
+        eprintln!("{codec} is not supported on this platform");
+    }
+    Err(e) => return Err(e),
+}
+```
+
 ## 動的解像度変更
 
 WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に解像度が変わるユースケースに対応しています。
