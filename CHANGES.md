@@ -11,6 +11,13 @@
 
 ## develop
 
+- [UPDATE] VP9 / AV1 デコーダーテストで `supported_codecs()` による事前チェックを行い非対応環境ではテストをスキップする
+  - @voluntas
+- [ADD] コーデック情報取得 API `supported_codecs()` を追加する
+  - `VideoCodecType`, `CodecInfo`, `DecodingInfo`, `EncodingInfo` 型を追加する
+  - デコード判定に `VTIsHardwareDecodeSupported` を使用する
+  - エンコード判定に `VTCopyVideoEncoderList` を使用する
+  - @voluntas
 - [ADD] `Error::UnsupportedCodec` バリアントを追加する
   - VP9 / AV1 デコーダーが環境で利用できない場合に明確なエラーを返す
   - @voluntas

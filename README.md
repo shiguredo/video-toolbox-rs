@@ -190,6 +190,34 @@ if let Some(frame) = decoder.decode(&avcc_data)? {
 | `FrameData::I420` | `y`, `u`, `v` | I420 形式 (3 プレーン) |
 | `FrameData::Nv12` | `y`, `uv` | NV12 形式 (2 プレーン) |
 
+## コーデック情報の取得
+
+`supported_codecs()` で、実行環境で利用可能なコーデック情報を一覧取得できます。
+
+デコード判定に `VTIsHardwareDecodeSupported`、エンコード判定に `VTCopyVideoEncoderList` と `VTCopySupportedPropertyDictionaryForEncoder` を使用しています。
+
+```rust
+use shiguredo_video_toolbox::{supported_codecs, VideoCodecType, EncodingProfiles};
+
+for info in supported_codecs() {
+    println!("{:?}: decoding={}, encoding={}",
+        info.codec, info.decoding.supported, info.encoding.supported);
+
+    if info.decoding.supported {
+        println!("  decoding: hw={}", info.decoding.hardware_accelerated);
+    }
+
+    if info.encoding.supported {
+        println!("  encoding: hw={}", info.encoding.hardware_accelerated);
+        match &info.encoding.profiles {
+            EncodingProfiles::H264(profiles) => println!("  profiles: {:?}", profiles),
+            EncodingProfiles::Hevc(profiles) => println!("  profiles: {:?}", profiles),
+            EncodingProfiles::None => {}
+        }
+    }
+}
+```
+
 ## サポートコーデック
 
 ### エンコード
