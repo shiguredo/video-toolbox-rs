@@ -11,6 +11,16 @@
 
 ## develop
 
+- [ADD] `Error::InvalidConfig` バリアントを追加する
+  - @voluntas
+- [FIX] `Encoder::encode()` で入力フレームのメモリ寿命が非同期エンコード中に保証されない問題を修正する
+  - `CVPixelBufferCreateWithPlanarBytes` を `CVPixelBufferCreate` + データコピーに変更する
+  - @voluntas
+- [FIX] `fps_denominator` が 0 の場合にゼロ除算パニックが発生する問題を修正する
+  - `Encoder::new()` と `Encoder::reconfigure()` で設定値を検証する
+  - @voluntas
+- [FIX] エンコーダーとデコーダーのコールバックで NULL 出力を考慮していない問題を修正する
+  - @voluntas
 - [UPDATE] VP9 / AV1 デコーダーテストで `supported_codecs()` による事前チェックを行い非対応環境ではテストをスキップする
   - @voluntas
 - [ADD] コーデック情報取得 API `supported_codecs()` を追加する

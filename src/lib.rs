@@ -55,6 +55,13 @@ pub enum Error {
         /// コーデック名
         codec: &'static str,
     },
+    /// 不正な設定値
+    InvalidConfig {
+        /// フィールド名
+        field: &'static str,
+        /// 理由
+        reason: &'static str,
+    },
 }
 
 impl Error {
@@ -96,6 +103,9 @@ impl std::fmt::Display for Error {
             }
             Self::UnsupportedCodec { codec } => {
                 write!(f, "codec {codec} is not supported on this platform")
+            }
+            Self::InvalidConfig { field, reason } => {
+                write!(f, "invalid config: {field}: {reason}")
             }
         }
     }
@@ -269,6 +279,7 @@ pub struct Encoder {
 impl Encoder {
     /// エンコーダーのインスタンスを生成する
     pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+        Self::validate_config(&config)?;
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Box::new(tx);
         let session = unsafe { Self::create_compression_session(&config, &tx)? };
@@ -290,6 +301,7 @@ impl Encoder {
     /// 新しい設定でセッションを再作成する。
     /// フラッシュされたフレームは `next_frame()` で取得できる。
     pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
+        Self::validate_config(&config)?;
         // 未出力フレームをフラッシュ
         self.finish()?;
 
@@ -537,6 +549,48 @@ impl Encoder {
         Ok(())
     }
 
+    /// エンコーダー設定を検証する
+    fn validate_config(config: &EncoderConfig) -> Result<(), Error> {
+        if config.fps_denominator == 0 {
+            return Err(Error::InvalidConfig {
+                field: "fps_denominator",
+                reason: "must not be zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// 入力プレーンデータを CVPixelBuffer のプレーンにコピーする
+    ///
+    /// CVPixelBuffer のストライド（bytes_per_row）が入力幅より大きい場合は
+    /// 行ごとにコピーする。
+    unsafe fn copy_plane(
+        pixel_buffer: sys::CVPixelBufferRef,
+        plane_index: usize,
+        src: &[u8],
+        src_width: usize,
+        src_height: usize,
+    ) {
+        unsafe {
+            let dst = sys::CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) as *mut u8;
+            let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
+
+            if dst_stride == src_width {
+                // ストライドと入力幅が一致する場合は一括コピー
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+            } else {
+                // ストライドが異なる場合は行ごとにコピー
+                for row in 0..src_height {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(row * src_width),
+                        dst.add(row * dst_stride),
+                        src_width,
+                    );
+                }
+            }
+        }
+    }
+
     /// フレームデータの長さが必要なサイズを満たしているか検証する
     fn validate_frame_data(
         frame: &FrameData<'_>,
@@ -620,55 +674,44 @@ impl Encoder {
         Self::validate_frame_data(frame, width, height)?;
 
         unsafe {
-            let mut image_buffer = std::ptr::null_mut();
-            let status = match frame {
-                FrameData::I420 { y, u, v } => sys::CVPixelBufferCreateWithPlanarBytes(
-                    std::ptr::null_mut(),
-                    width,
-                    height,
-                    u32::from_be_bytes(*b"y420"),
-                    std::ptr::null_mut(),
-                    0,
-                    3,
-                    [
-                        y.as_ptr().cast::<c_void>().cast_mut(),
-                        u.as_ptr().cast::<c_void>().cast_mut(),
-                        v.as_ptr().cast::<c_void>().cast_mut(),
-                    ]
-                    .as_mut_ptr(),
-                    [width, width.div_ceil(2), width.div_ceil(2)].as_mut_ptr(),
-                    [height, height.div_ceil(2), height.div_ceil(2)].as_mut_ptr(),
-                    [width, width.div_ceil(2), width.div_ceil(2)].as_mut_ptr(),
-                    None,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut image_buffer,
-                ),
-                FrameData::Nv12 { y, uv } => sys::CVPixelBufferCreateWithPlanarBytes(
-                    std::ptr::null_mut(),
-                    width,
-                    height,
-                    sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    std::ptr::null_mut(),
-                    0,
-                    2,
-                    [
-                        y.as_ptr().cast::<c_void>().cast_mut(),
-                        uv.as_ptr().cast::<c_void>().cast_mut(),
-                    ]
-                    .as_mut_ptr(),
-                    [width, width].as_mut_ptr(),
-                    [height, height.div_ceil(2)].as_mut_ptr(),
-                    [width, width].as_mut_ptr(),
-                    None,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut image_buffer,
-                ),
+            // CVPixelBufferCreate で CoreVideo にメモリを確保させ、入力データをコピーする。
+            // CVPixelBufferCreateWithPlanarBytes を使うと外部メモリへの参照を渡すことになり、
+            // VTCompressionSessionEncodeFrame が非同期にデータを読む場合にメモリ寿命が保証されない。
+            let pixel_format_type = match frame {
+                FrameData::I420 { .. } => sys::kCVPixelFormatType_420YpCbCr8Planar,
+                FrameData::Nv12 { .. } => sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             };
-            Error::check(status, "CVPixelBufferCreateWithPlanarBytes")?;
+
+            let mut image_buffer = std::ptr::null_mut();
+            let status = sys::CVPixelBufferCreate(
+                std::ptr::null_mut(),
+                width,
+                height,
+                pixel_format_type,
+                std::ptr::null(),
+                &mut image_buffer,
+            );
+            Error::check(status, "CVPixelBufferCreate")?;
 
             let image_buffer = CfPtrMut(image_buffer);
+
+            let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
+            Error::check(status, "CVPixelBufferLockBaseAddress")?;
+
+            match frame {
+                FrameData::I420 { y, u, v } => {
+                    Self::copy_plane(image_buffer.0, 0, y, width, height);
+                    Self::copy_plane(image_buffer.0, 1, u, width.div_ceil(2), height.div_ceil(2));
+                    Self::copy_plane(image_buffer.0, 2, v, width.div_ceil(2), height.div_ceil(2));
+                }
+                FrameData::Nv12 { y, uv } => {
+                    Self::copy_plane(image_buffer.0, 0, y, width, height);
+                    Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2));
+                }
+            }
+
+            let status = sys::CVPixelBufferUnlockBaseAddress(image_buffer.0, 0);
+            Error::check(status, "CVPixelBufferUnlockBaseAddress")?;
 
             let frame_properties = if options.force_key_frame {
                 cf_dictionary(&[(
@@ -851,6 +894,11 @@ impl Encoder {
     ) {
         if let Err(e) = Error::check(status, callback_name) {
             log::error!("{e}");
+            return;
+        }
+
+        // フレームドロップ等で sample_buffer が NULL になる場合がある
+        if sample_buffer.is_null() {
             return;
         }
 
@@ -1396,6 +1444,11 @@ impl Decoder {
     ) {
         if let Err(e) = Error::check(status, "output_callback") {
             log::error!("{e}");
+            return;
+        }
+
+        // フレームドロップ等で image_buffer が NULL になる場合がある
+        if image_buffer.is_null() {
             return;
         }
 
