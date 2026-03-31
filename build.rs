@@ -28,6 +28,7 @@ fn main() {
                 "pub struct __CVBuffer;",
                 "pub struct CMTime;",
                 "pub struct CVImageBufferRef;",
+                "pub struct CVPixelBufferRef;",
                 "pub struct VTDecodeInfoFlags;",
                 "pub struct VTDecompressionSessionRef;",
                 "pub struct CMVideoFormatDescriptionRef;",
