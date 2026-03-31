@@ -13,6 +13,9 @@
 
 - [ADD] `Error::InvalidConfig` バリアントを追加する
   - @voluntas
+- [FIX] `Encoder::encode()` で必要サイズより長い入力スライスを渡した場合にヒープオーバーランが発生する問題を修正する
+  - `copy_plane()` のコピーサイズを `src.len()` から `src_width * src_height` に変更する
+  - @voluntas
 - [FIX] `Encoder::encode()` で入力フレームのメモリ寿命が非同期エンコード中に保証されない問題を修正する
   - `CVPixelBufferCreateWithPlanarBytes` を `CVPixelBufferCreate` + データコピーに変更する
   - @voluntas

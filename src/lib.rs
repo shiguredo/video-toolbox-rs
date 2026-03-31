@@ -575,9 +575,10 @@ impl Encoder {
             let dst = sys::CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) as *mut u8;
             let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
 
+            let copy_size = src_width * src_height;
             if dst_stride == src_width {
                 // ストライドと入力幅が一致する場合は一括コピー
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy_size);
             } else {
                 // ストライドが異なる場合は行ごとにコピー
                 for row in 0..src_height {
