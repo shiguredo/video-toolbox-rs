@@ -11,6 +11,11 @@
 
 ## develop
 
+## 2026.1.0
+
+**リリース日**: 2026-04-01
+
+
 - [ADD] `Error::InvalidConfig` バリアントを追加する
   - @voluntas
 - [FIX] `Encoder::encode()` で必要サイズより長い入力スライスを渡した場合にヒープオーバーランが発生する問題を修正する
@@ -103,6 +108,8 @@
 
 ### misc
 
+- CI の `release/**` ブランチ push でも GitHub Actions を実行する
+  - @voluntas
 - VP9 デコーダーテストを追加する
   - shiguredo_libvpx でカラーバーをエンコードし Video Toolbox でデコードして PSNR を検証する
   - @voluntas
