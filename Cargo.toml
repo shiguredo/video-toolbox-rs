@@ -1,0 +1,25 @@
+[package]
+name = "shiguredo_video_toolbox"
+version = "2026.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Shiguredo Inc."]
+license = "Apache-2.0"
+description = "Rust bindings for Apple Video Toolbox hardware video encoders and decoders"
+homepage = "https://github.com/shiguredo/video-toolbox-rs"
+repository = "https://github.com/shiguredo/video-toolbox-rs"
+readme = "README.md"
+build = "build.rs"
+include = ["/src/**", "/build.rs", "/README.md", "/LICENSE"]
+
+[dependencies]
+log = "0.4"
+
+[build-dependencies]
+bindgen = "0.72"
+
+[dev-dependencies]
+raden = "2026.1.0-canary.2"
+shiguredo_libvpx = "2026.1.0"
+shiguredo_mp4 = "2026.2.0"
+

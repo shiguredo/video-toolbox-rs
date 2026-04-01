@@ -1,0 +1,10 @@
+target/
+*.mp4
+
+# Agents
+.claude/
+.codex/
+.cursor/
+
+# macOS
+.DS_Store

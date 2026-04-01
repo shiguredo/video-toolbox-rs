@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "develop"
+      - "feature/**"
+      - "release/**"
+    paths-ignore:
+      - "**.md"
+  schedule:
+    # JST 10:00 (UTC 01:00), 月-金
+    - cron: "0 1 * * 1-5"
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  # macOS 実機でのビルドテスト (セルフホストランナー)
+  test-video-toolbox:
+    name: Test (VideoToolbox)
+    runs-on:
+      group: Self
+      labels: [self-hosted, macOS, ARM64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      - name: Update PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo test --workspace -- --test-threads=1
+
+  # docs.rs 向けビルド確認
+  docs-rs:
+    name: docs.rs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DOCS_RS: 1
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup update stable
+      - run: cargo doc --no-deps
+
+  slack_notify:
+    needs:
+      - test-video-toolbox
+      - docs-rs
+    runs-on: ubuntu-slim
+    if: always()
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Slack Notification
+        uses: shiguredo/github-actions/.github/actions/slack-notify@main
+        with:
+          status: ${{ job.status }}
+          slack_webhook: ${{ secrets.SLACK_WEBHOOK }}
+          slack_channel: rust-oss
+          notify_mode: failure_and_fixed
+        env:
+          GH_TOKEN: ${{ github.token }}
