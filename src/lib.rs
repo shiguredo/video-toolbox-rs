@@ -133,6 +133,36 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Video Toolbox / CoreMedia の `i32` 寸法引数に渡す前に、`u32` が正の `i32` に収まることを検証する。
+fn validate_video_dimensions_for_toolbox(width: u32, height: u32) -> Result<(), Error> {
+    let max = i32::MAX as u32;
+    if width == 0 {
+        return Err(Error::InvalidConfig {
+            field: "width",
+            reason: "must not be zero",
+        });
+    }
+    if height == 0 {
+        return Err(Error::InvalidConfig {
+            field: "height",
+            reason: "must not be zero",
+        });
+    }
+    if width > max {
+        return Err(Error::InvalidConfig {
+            field: "width",
+            reason: "must fit in i32 for Video Toolbox dimensions",
+        });
+    }
+    if height > max {
+        return Err(Error::InvalidConfig {
+            field: "height",
+            reason: "must fit in i32 for Video Toolbox dimensions",
+        });
+    }
+    Ok(())
+}
+
 /// ピクセルフォーマット
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -578,18 +608,7 @@ impl Encoder {
 
     /// エンコーダー設定を検証する
     fn validate_config(config: &EncoderConfig) -> Result<(), Error> {
-        if config.width == 0 {
-            return Err(Error::InvalidConfig {
-                field: "width",
-                reason: "must not be zero",
-            });
-        }
-        if config.height == 0 {
-            return Err(Error::InvalidConfig {
-                field: "height",
-                reason: "must not be zero",
-            });
-        }
+        validate_video_dimensions_for_toolbox(config.width, config.height)?;
         if config.fps_denominator == 0 {
             return Err(Error::InvalidConfig {
                 field: "fps_denominator",
@@ -607,6 +626,14 @@ impl Encoder {
             return Err(Error::InvalidConfig {
                 field: "fps_numerator",
                 reason: "must fit in i32 for CMTime timescale",
+            });
+        }
+        if let Some(bitrate) = config.average_bitrate
+            && bitrate > i64::MAX as u64
+        {
+            return Err(Error::InvalidConfig {
+                field: "average_bitrate",
+                reason: "must fit in i64 for CFNumber",
             });
         }
         Ok(())
@@ -1453,11 +1480,17 @@ impl Decoder {
         }
     }
 
-    /// VP9/AV1 コーデックの場合、エラーを UnsupportedCodec に変換する
+    /// VP9/AV1 コーデックの場合、Video Toolbox の失敗のみ `UnsupportedCodec` に変換する（設定不整合の `InvalidConfig` はそのまま返す）。
     fn wrap_unsupported_codec_error(codec: &DecoderCodec<'_>, error: Error) -> Error {
         match codec {
-            DecoderCodec::Vp9 { .. } => Error::UnsupportedCodec { codec: "VP9" },
-            DecoderCodec::Av1 { .. } => Error::UnsupportedCodec { codec: "AV1" },
+            DecoderCodec::Vp9 { .. } => match error {
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "VP9" },
+                _ => error,
+            },
+            DecoderCodec::Av1 { .. } => match error {
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "AV1" },
+                _ => error,
+            },
             _ => error,
         }
     }
@@ -1551,6 +1584,7 @@ impl Decoder {
                     )?;
                 }
                 DecoderCodec::Vp9 { width, height } => {
+                    validate_video_dimensions_for_toolbox(*width, *height)?;
                     let status = sys::CMVideoFormatDescriptionCreate(
                         std::ptr::null_mut(),
                         u32::from_be_bytes(*b"vp09"),
@@ -1562,6 +1596,7 @@ impl Decoder {
                     Error::check(status, "CMVideoFormatDescriptionCreate")?;
                 }
                 DecoderCodec::Av1 { width, height } => {
+                    validate_video_dimensions_for_toolbox(*width, *height)?;
                     let status = sys::CMVideoFormatDescriptionCreate(
                         std::ptr::null_mut(),
                         u32::from_be_bytes(*b"av01"),

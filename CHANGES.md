@@ -166,6 +166,11 @@
   - @voluntas
 - [FIX] エンコード出力で `CMBlockBufferGetDataLength` が防御的上限を超える場合はログして当該フレームを破棄する
   - @voluntas
+- [FIX] `Encoder::validate_config` で `width` / `height` が `i32::MAX` を超える場合を拒否し、`DecoderCodec::Vp9` / `Av1` の `CMVideoFormatDescriptionCreate` 呼び出し前に同じ寸法範囲を検証する
+  - `Decoder::wrap_unsupported_codec_error` は `VideoToolbox` エラーのみ `UnsupportedCodec` に変換し、`InvalidConfig` はそのまま返す
+  - @voluntas
+- [FIX] `EncoderConfig` の `average_bitrate` が `i64::MAX` を超える `u64` のときに `CFNumber` へ負の値が渡るのを防ぐため、`InvalidConfig` で拒否する
+  - @voluntas
 
 ### misc
 

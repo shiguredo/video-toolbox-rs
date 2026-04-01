@@ -1,8 +1,8 @@
 //! `src/lib.rs` に対応する単体テスト（設定検証のエラーパス等）
 
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, Error, FrameData, H264EncoderConfig,
-    H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodeOptions, Encoder, EncoderConfig,
+    Error, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
 fn minimal_encoder_config() -> EncoderConfig {
@@ -65,6 +65,75 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
         Encoder::new(c),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn encoder_rejects_width_above_i32_max() {
+    let mut c = minimal_encoder_config();
+    c.width = i32::MAX as u32 + 1;
+    assert!(matches!(
+        Encoder::new(c),
+        Err(Error::InvalidConfig { field: "width", .. })
+    ));
+}
+
+#[test]
+fn encoder_rejects_height_above_i32_max() {
+    let mut c = minimal_encoder_config();
+    c.height = i32::MAX as u32 + 1;
+    assert!(matches!(
+        Encoder::new(c),
+        Err(Error::InvalidConfig {
+            field: "height",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn encoder_rejects_average_bitrate_above_i64_max() {
+    let mut c = minimal_encoder_config();
+    c.average_bitrate = Some(i64::MAX as u64 + 1);
+    assert!(matches!(
+        Encoder::new(c),
+        Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn decoder_vp9_rejects_width_above_i32_max() {
+    let r = Decoder::new(DecoderConfig {
+        codec: DecoderCodec::Vp9 {
+            width: i32::MAX as u32 + 1,
+            height: 480,
+        },
+        pixel_format: PixelFormat::I420,
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig { field: "width", .. })
+    ));
+}
+
+#[test]
+fn decoder_av1_rejects_height_above_i32_max() {
+    let r = Decoder::new(DecoderConfig {
+        codec: DecoderCodec::Av1 {
+            width: 640,
+            height: i32::MAX as u32 + 1,
+        },
+        pixel_format: PixelFormat::I420,
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig {
+            field: "height",
             ..
         })
     ));

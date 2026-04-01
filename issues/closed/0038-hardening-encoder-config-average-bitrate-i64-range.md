@@ -1,6 +1,7 @@
 # `average_bitrate` を `u64 as i64` で渡すと大きな値が負のビットレートになる
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: GPT-5.2
 
 ## なぜこの対応が必要か
@@ -23,3 +24,8 @@ Rust では **`u64::MAX as i64` は `-1`** のように、**`i64::MAX` を超え
 
 - **`as i64` によって負の値になりうる経路**をコード上で潰す。
 - 可能なら **境界の単体テスト**（`i64::MAX as u64` は通す、`i64::MAX as u64 + 1` は拒否など）。
+
+## 解決方法
+
+- `Encoder::validate_config` で `average_bitrate` が `i64::MAX as u64` を超える場合は `InvalidConfig` とする（`add_common_properties` 前に拒否）。
+- 単体テスト `encoder_rejects_average_bitrate_above_i64_max` を追加した。
