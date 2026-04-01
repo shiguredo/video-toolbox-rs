@@ -2046,124 +2046,47 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn init_h264_encoder() {
-        // OK
-        let config = encoder_config(false);
-        assert!(Encoder::new(config).is_ok());
+    /// 黒フレーム 1 枚のエンコード〜`next_frame` 取出し（`Encoder::new` の成功も含む）
+    ///
+    /// [NOTE]: `encode(&[0; SIZE], ..)` のようにリテラル配列を直接渡すとコンパイルエラーになる
+    fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
+        let config = encoder_config(is_h265);
+        let mut encoder = Encoder::new(config)?;
+        let mut count = 0;
 
-        // NG
-        let mut config = encoder_config(false);
-        config.width = 0;
-        assert!(Encoder::new(config).is_err());
-    }
+        let y = [0; SIZE];
+        let u = [0; SIZE / 4];
+        let v = [0; SIZE / 4];
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            &EncodeOptions::default(),
+        )?;
 
-    #[test]
-    fn encoder_rejects_zero_fps_numerator() {
-        let mut config = encoder_config(false);
-        config.fps_numerator = 0;
-        assert!(matches!(
-            Encoder::new(config),
-            Err(Error::InvalidConfig {
-                field: "fps_numerator",
-                reason: "must not be zero"
-            })
-        ));
-    }
+        while encoder.next_frame()?.is_some() {
+            count += 1;
+        }
 
-    #[test]
-    fn init_h265_encoder() {
-        // OK
-        let config = encoder_config(true);
-        assert!(Encoder::new(config).is_ok());
+        encoder.finish()?;
+        while encoder.next_frame()?.is_some() {
+            count += 1;
+        }
 
-        // NG
-        let mut config = encoder_config(true);
-        config.width = 0;
-        assert!(Encoder::new(config).is_err());
+        assert_eq!(count, 1);
+        Ok(())
     }
 
     #[test]
     fn encode_h264_black() -> Result<(), Error> {
-        let config = encoder_config(false);
-        let mut encoder = Encoder::new(config)?;
-        let mut count = 0;
-
-        // [NOTE]: encode(&[0; SIZE], ..) の様に変数を経由せずに指定するとエラーになる
-        let y = [0; SIZE];
-        let u = [0; SIZE / 4];
-        let v = [0; SIZE / 4];
-        encoder.encode(
-            &FrameData::I420 {
-                y: &y,
-                u: &u,
-                v: &v,
-            },
-            &EncodeOptions::default(),
-        )?;
-
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
-        encoder.finish()?;
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
-        assert_eq!(count, 1);
-        Ok(())
+        encode_black_frame_roundtrip(false)
     }
 
     #[test]
     fn encode_h265_black() -> Result<(), Error> {
-        let config = encoder_config(true);
-        let mut encoder = Encoder::new(config)?;
-        let mut count = 0;
-
-        // [NOTE]: encode(&[0; SIZE], ..) の様に変数を経由せずに指定するとエラーになる
-        let y = [0; SIZE];
-        let u = [0; SIZE / 4];
-        let v = [0; SIZE / 4];
-        encoder.encode(
-            &FrameData::I420 {
-                y: &y,
-                u: &u,
-                v: &v,
-            },
-            &EncodeOptions::default(),
-        )?;
-
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
-        encoder.finish()?;
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
-        assert_eq!(count, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn init_vp9_decoder() -> Result<(), Error> {
-        if !supported_codecs()
-            .iter()
-            .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
-        {
-            return Ok(());
-        }
-
-        Decoder::new(DecoderConfig {
-            codec: DecoderCodec::Vp9 {
-                width: WIDTH,
-                height: HEIGHT,
-            },
-            pixel_format: PixelFormat::I420,
-        })?;
-        Ok(())
+        encode_black_frame_roundtrip(true)
     }
 
     #[test]
@@ -2461,5 +2384,53 @@ mod tests {
             .find(|c| c.codec == VideoCodecType::Av1)
             .unwrap();
         assert!(!av1.encoding.supported);
+    }
+
+    /// `vec_u8_from_raw_parts_safe` の NULL ポインタ周り（長さ 0 は許容、非ゼロ長は拒否）
+    #[test]
+    fn vec_u8_from_raw_parts_safe_null_pointer_by_length() {
+        assert_eq!(
+            super::vec_u8_from_raw_parts_safe(std::ptr::null(), 0, "ctx"),
+            Some(Vec::new())
+        );
+        assert!(super::vec_u8_from_raw_parts_safe(std::ptr::null(), 1, "ctx").is_none());
+    }
+
+    #[test]
+    fn vec_u8_from_raw_parts_safe_rejects_len_above_iso14496_15_max() {
+        let b = [0u8];
+        assert!(
+            super::vec_u8_from_raw_parts_safe(
+                b.as_ptr(),
+                super::MAX_PARAMETER_SET_COPY_BYTES + 1,
+                "ctx"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn vec_u8_from_raw_parts_safe_copies_valid_bytes() {
+        let b = [1u8, 2u8, 3u8];
+        assert_eq!(
+            super::vec_u8_from_raw_parts_safe(b.as_ptr(), 3, "ctx"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn error_display_limit_exceeded_and_cf_object_creation_failed() {
+        let e = Error::LimitExceeded {
+            reason: "unit test reason",
+        };
+        assert!(e.to_string().contains("limit exceeded"));
+        assert!(e.to_string().contains("unit test reason"));
+
+        let e2 = Error::CfObjectCreationFailed {
+            function: "CFNumberCreate",
+        };
+        let s = e2.to_string();
+        assert!(s.contains("CFNumberCreate"));
+        assert!(s.contains("null"));
     }
 }

@@ -1,8 +1,8 @@
 //! `src/lib.rs` に対応する単体テスト（設定検証のエラーパス等）
 
 use shiguredo_video_toolbox::{
-    CodecConfig, Encoder, EncoderConfig, Error, H264EncoderConfig, H264EntropyMode, H264Profile,
-    PixelFormat,
+    CodecConfig, EncodeOptions, Encoder, EncoderConfig, Error, FrameData, H264EncoderConfig,
+    H264EntropyMode, H264Profile, PixelFormat,
 };
 
 fn minimal_encoder_config() -> EncoderConfig {
@@ -26,6 +26,12 @@ fn minimal_encoder_config() -> EncoderConfig {
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
     }
+}
+
+fn minimal_nv12_encoder_config() -> EncoderConfig {
+    let mut c = minimal_encoder_config();
+    c.pixel_format = PixelFormat::Nv12;
+    c
 }
 
 #[test]
@@ -62,4 +68,107 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
             ..
         })
     ));
+}
+
+#[test]
+fn encoder_rejects_zero_fps_denominator() {
+    let mut c = minimal_encoder_config();
+    c.fps_denominator = 0;
+    assert!(matches!(
+        Encoder::new(c),
+        Err(Error::InvalidConfig {
+            field: "fps_denominator",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn encoder_rejects_zero_fps_numerator() {
+    let mut c = minimal_encoder_config();
+    c.fps_numerator = 0;
+    assert!(matches!(
+        Encoder::new(c),
+        Err(Error::InvalidConfig {
+            field: "fps_numerator",
+            reason: "must not be zero"
+        })
+    ));
+}
+
+#[test]
+fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let y = [0u8; 1];
+    let u = [0u8; 160_000];
+    let v = [0u8; 160_000];
+    let r = enc.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::InsufficientFrameData { plane: "Y", .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let y = vec![0u8; 640 * 480];
+    let u = [0u8; 1];
+    let v = vec![0u8; 160 * 120];
+    let r = enc.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::InsufficientFrameData { plane: "U", .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let y = vec![0u8; 640 * 480];
+    let uv = vec![0u8; 640 * 240];
+    let r = enc.encode(
+        &FrameData::Nv12 { y: &y, uv: &uv },
+        &EncodeOptions::default(),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::PixelFormatMismatch {
+            expected: PixelFormat::I420,
+            actual: PixelFormat::Nv12,
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_nv12_encoder_config())?;
+    let y = vec![0u8; 640 * 480];
+    let uv = [0u8; 1];
+    let r = enc.encode(
+        &FrameData::Nv12 { y: &y, uv: &uv },
+        &EncodeOptions::default(),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::InsufficientFrameData { plane: "UV", .. })
+    ));
+    Ok(())
 }
