@@ -97,13 +97,13 @@ encoder.encode(&frame, &EncodeOptions {
 })?;
 
 // エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("encoded bytes: {}", encoded.data.len());
 }
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("flushed bytes: {}", encoded.data.len());
 }
 ```
@@ -290,7 +290,7 @@ let new_config = EncoderConfig {
 encoder.reconfigure(new_config)?;
 
 // フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("flushed bytes: {}", encoded.data.len());
 }
 ```
