@@ -1,6 +1,7 @@
 # `encode` で `CVPixelBuffer` をロックしたまま `VTCompressionSessionEncodeFrame` している
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
@@ -20,3 +21,8 @@ Model: Composer 2 Fast
 ## 解決の完了条件
 
 - 上記の「契約に合致」または「意図的で根拠あり」のどちらかが **コードとドキュメントで追試可能**な状態になっていること。
+
+## 解決方法
+
+- `Encoder::encode` では `copy_plane` を囲む内側スコープのみ `CVPixelBufferLockBaseAddress` と `CvPixelBufferUnlockGuard` をかけ、`VTCompressionSessionEncodeFrame` はアンロック後に呼ぶように変更した（`src/lib.rs`）。
+- `encode_pixel_buffer` はロックを取得しない旨を rustdoc に追記した。

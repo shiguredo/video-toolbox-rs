@@ -818,21 +818,34 @@ impl Encoder {
 
             let image_buffer = CfPtrMut(image_buffer);
 
-            let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
-            Error::check(status, "CVPixelBufferLockBaseAddress")?;
-
-            // `copy_plane` が Err のときも `Drop` で必ずアンロックする（`CfPtrMut` の `CFRelease` 前にロック残しを防ぐ）
-            let _pixel_unlock = CvPixelBufferUnlockGuard(image_buffer.0);
-
-            match frame {
-                FrameData::I420 { y, u, v } => {
-                    Self::copy_plane(image_buffer.0, 0, y, width, height)?;
-                    Self::copy_plane(image_buffer.0, 1, u, width.div_ceil(2), height.div_ceil(2))?;
-                    Self::copy_plane(image_buffer.0, 2, v, width.div_ceil(2), height.div_ceil(2))?;
-                }
-                FrameData::Nv12 { y, uv } => {
-                    Self::copy_plane(image_buffer.0, 0, y, width, height)?;
-                    Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2))?;
+            // CPU でプレーンへ書き込む間だけロックし、`VTCompressionSessionEncodeFrame` 呼び出し前に解放する。
+            // `copy_plane` が Err のときも `Drop` でアンロックする（`CfPtrMut` の `CFRelease` 前にロック残しを防ぐ）。
+            {
+                let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
+                Error::check(status, "CVPixelBufferLockBaseAddress")?;
+                let _pixel_unlock = CvPixelBufferUnlockGuard(image_buffer.0);
+                match frame {
+                    FrameData::I420 { y, u, v } => {
+                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
+                        Self::copy_plane(
+                            image_buffer.0,
+                            1,
+                            u,
+                            width.div_ceil(2),
+                            height.div_ceil(2),
+                        )?;
+                        Self::copy_plane(
+                            image_buffer.0,
+                            2,
+                            v,
+                            width.div_ceil(2),
+                            height.div_ceil(2),
+                        )?;
+                    }
+                    FrameData::Nv12 { y, uv } => {
+                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
+                        Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2))?;
+                    }
                 }
             }
 
@@ -884,6 +897,7 @@ impl Encoder {
     /// `pixel_buffer_ptr` は有効な CVPixelBuffer ポインタでなければならない。
     /// また [`EncoderConfig`] の解像度・プレーン構成と整合するピクセルバッファであることは **呼び出し側の責務**とする。
     /// （本関数はピクセルフォーマットのみ検証し、幅・高さの不一致は即クラッシュしない場合があるが、エンコード結果は不正になりうる。）
+    /// 本関数は `CVPixelBufferLockBaseAddress` を呼ばない。呼び出し側がロックしている場合、Video Toolbox の期待に合わせて **エンコード前にアンロック**するのは呼び出し側の責務とする。
     pub unsafe fn encode_pixel_buffer(
         &mut self,
         pixel_buffer_ptr: *mut c_void,
@@ -1073,6 +1087,13 @@ impl Encoder {
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
             // 非連続バッファでは `data_pointer_len < block_len` になり得るため、`CMBlockBufferCopyDataBytes` で全長をコピーする。
             let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
+            if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
+                log::error!(
+                    "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
+                    max = MAX_ENCODED_BLOCK_COPY_BYTES
+                );
+                return;
+            }
             let mut data = vec![0u8; block_len];
             let status = sys::CMBlockBufferCopyDataBytes(
                 data_buffer,
@@ -1300,6 +1321,12 @@ pub struct EncodedFrame {
 ///
 /// Annex B バイトストリーム上の NAL がこれを超える理論ケースは、本上限では拒否される（実運用では稀）。
 const MAX_PARAMETER_SET_COPY_BYTES: usize = u16::MAX as usize;
+
+/// エンコード出力 1 フレーム分を `Vec` にコピーするときの防御的上限（バイト）。
+///
+/// `MAX_PARAMETER_SET_COPY_BYTES`（パラメータセット用）とは別。`CMBlockBufferGetDataLength` が異常に大きい場合の OOM を防ぐ。
+/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はログして当該フレームを破棄する。
+const MAX_ENCODED_BLOCK_COPY_BYTES: usize = 256 * 1024 * 1024;
 
 /// `slice::from_raw_parts` の前提（長さ 0 でも非 NULL ポインタ、長さ正では NULL 禁止）を満たすためのヘルパー
 fn vec_u8_from_raw_parts_safe(
@@ -1706,6 +1733,8 @@ impl Drop for Decoder {
 unsafe impl Send for Decoder {}
 
 /// デコードされた映像フレーム
+///
+/// [`Decoder::decode`] が `Some` を返しても、プレーン参照が空スライスになることは **あり得る**（[`I420Frame`] / [`Nv12Frame`] の各 `*_plane` 参照）。
 pub enum DecodedFrame<'a> {
     /// I420 形式
     I420(I420Frame<'a>),
@@ -1720,6 +1749,9 @@ pub enum DecodedFrame<'a> {
 /// プラットフォームが基底アドレスに NULL を返した場合、または行数とストライドの乗算が
 /// `usize` で表現できない場合、各 `*_plane` は **空のスライス**を返す。
 /// 解像度が正である通常のデコードでは空にはならない想定である。
+///
+/// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル**として扱う。
+/// 呼び出し側は `y_plane().is_empty()` 等で分岐し、通常のピクセル処理に進まないこと。
 #[derive(Debug)]
 pub struct I420Frame<'a> {
     inner: CfPtrMut<sys::__CVBuffer>,
@@ -1732,7 +1764,7 @@ pub struct I420Frame<'a> {
 impl I420Frame<'_> {
     /// ロック済みプレーンを `&[u8]` として返す
     ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。
+    /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
     fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
         let len = match row_count.checked_mul(bytes_per_row) {
             Some(n) if n > 0 => n,
@@ -1802,6 +1834,8 @@ impl Drop for I420Frame<'_> {
 /// ## プレーン参照
 ///
 /// [`I420Frame`] と同様、異常時は各 `*_plane` が空スライスになることがある。
+///
+/// **空スライスは異常時のセンチネル**であり、空でないことを前提にピクセル処理して進めないこと。
 #[derive(Debug)]
 pub struct Nv12Frame<'a> {
     inner: CfPtrMut<sys::__CVBuffer>,
@@ -1814,7 +1848,7 @@ pub struct Nv12Frame<'a> {
 impl Nv12Frame<'_> {
     /// ロック済みプレーンを `&[u8]` として返す
     ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。
+    /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
     fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
         let len = match row_count.checked_mul(bytes_per_row) {
             Some(n) if n > 0 => n,
@@ -2350,12 +2384,14 @@ mod tests {
 
     #[test]
     fn test_supported_codecs() {
+        // README の動作要件（macOS / arm64）および CI のセルフホスト（`macOS` / `ARM64`）と整合する前提。
+        // Intel Mac のローカル等では H.264/HEVC の assert が失敗しうる（README の「テスト」セクションを参照）。
         let codecs = supported_codecs();
 
         // 4 種類のコーデックが返る
         assert_eq!(codecs.len(), 4);
 
-        // H.264 デコード・エンコードは全 Mac でサポートされている
+        // H.264 デコード・エンコード（上記前提の環境ではハードウェア対応を期待）
         let h264 = codecs
             .iter()
             .find(|c| c.codec == VideoCodecType::H264)
@@ -2363,7 +2399,7 @@ mod tests {
         assert!(h264.decoding.supported);
         assert!(h264.encoding.supported);
 
-        // HEVC デコード・エンコードは全 Mac でサポートされている
+        // HEVC デコード・エンコード（上記前提の環境ではハードウェア対応を期待）
         let hevc = codecs
             .iter()
             .find(|c| c.codec == VideoCodecType::Hevc)

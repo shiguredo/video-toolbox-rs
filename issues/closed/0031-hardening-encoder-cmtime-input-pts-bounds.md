@@ -1,6 +1,7 @@
 # `CMTimeMake` の timescale に `fps_numerator as i32` を使うと負の timescale になり得る
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
@@ -37,7 +38,5 @@ Model: Composer 2 Fast
 5. **前回からの差分**: **実バグの可能性**を issue に昇格。
 
 ## 解決方法
-
-Completed: 2026-04-01
 
 - `validate_config` で `fps_numerator > i32::MAX as u32` を `InvalidConfig` として拒否する。単体テスト `encoder_rejects_fps_numerator_above_i32_max` を追加した。

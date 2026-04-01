@@ -1,6 +1,7 @@
 # `supported_codecs` のデコード可否がハードウェア判定のみであることを API ドキュメントに明記する
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
@@ -18,3 +19,8 @@ Model: Composer 2 Fast
 ## 解決の完了条件
 
 - docs.rs で読める **公開 API の説明**に上記が含まれること。
+
+## 解決方法
+
+- `DecodingInfo` および `supported_codecs` の rustdoc に、ハードウェア判定に基づく旨を追記した。
+- `probe_decoding` のモジュールコメントを簡潔にした。

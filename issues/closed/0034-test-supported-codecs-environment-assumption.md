@@ -1,6 +1,7 @@
 # `test_supported_codecs` の厳格な assert と実行環境の前提
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
@@ -35,3 +36,8 @@ issue 本文が CI フレーク中心のままだと、**修正先が README な
 
 - **現状の CI（セルフホスト `macOS` / `ARM64`）と README（`macOS (arm64)`）**を踏まえたうえで、テストの前提が **文書・テスト・ワークフロー／運用のいずれかで一貫**していること。
 - 採った方針で、**主な修正先が README かテストか CI 記述か**が追試できること。
+
+## 解決方法
+
+- README に「テスト」セクションを追加し、CI のセルフホスト前提とローカルでの差し支えを記載した。
+- `tests::test_supported_codecs` に、README の動作要件・CI と整合する前提である旨のコメントを追加した。

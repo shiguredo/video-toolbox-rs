@@ -40,6 +40,12 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - macOS (arm64)
 - Xcode Command Line Tools (ビルド時に Video Toolbox のヘッダーファイルが必要)
 
+## テスト
+
+- CI（`.github/workflows/ci.yml` の `test-video-toolbox`）は **セルフホストランナー**（`labels: self-hosted, macOS, ARM64`）上で `cargo test` を実行する。
+- 上記の動作要件と揃えた環境では、`supported_codecs` 等のテストが **H.264 / HEVC のハードウェア対応**を前提にしている。
+- **Intel Mac**、古い macOS、仮想化・特殊構成でローカル実行した場合、同じテストが **失敗**することがある。
+
 ## ビルド
 
 ```bash

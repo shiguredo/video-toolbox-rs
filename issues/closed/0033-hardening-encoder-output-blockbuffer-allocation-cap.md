@@ -1,6 +1,7 @@
 # エンコード出力で `CMBlockBufferGetDataLength` に基づく `Vec` 確保に上限がない
 
 Created: 2026-04-01  
+Completed: 2026-04-01  
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
@@ -34,3 +35,7 @@ Model: Composer 2 Fast
 
 - 上限の **数値と根拠**がコードと短いコメントで追試できること。
 - **脅威モデル**（VT コールバック経由）と **超過時の契約**（ログ・破棄等）が、実装と一致していること。
+
+## 解決方法
+
+- `MAX_ENCODED_BLOCK_COPY_BYTES`（256 MiB）を `src/lib.rs` に追加し、`CMBlockBufferGetDataLength` が超過時は **英語の `log::error!`** して当該フレームを破棄する（パラメータセット用 `MAX_PARAMETER_SET_COPY_BYTES` とは別定数）。

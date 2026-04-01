@@ -46,11 +46,15 @@ pub struct CodecInfo {
 }
 
 /// デコード情報
+///
+/// `supported` は `VTIsHardwareDecodeSupported` に基づく **ハードウェアデコード可否**である。
+/// ソフトウェアデコードのみ利用可能な環境では `false` になり得るが、**システム全体がデコード不能**という意味ではない。
+/// `hardware_accelerated` は現状 `supported` と同じ値になる（内部の `probe_decoding` 実装）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodingInfo {
-    /// デコードが可能か
+    /// ハードウェアデコードが可能か（`VTIsHardwareDecodeSupported`）
     pub supported: bool,
-    /// ハードウェアアクセラレーションが利用可能か
+    /// ハードウェアアクセラレーションが利用可能か（現状 `supported` と同じ）
     pub hardware_accelerated: bool,
 }
 
@@ -110,6 +114,8 @@ pub enum HevcEncodingProfile {
 }
 
 /// このバックエンドで利用可能なコーデック情報の一覧を返す
+///
+/// 各要素の [`CodecInfo::decoding`] は [`DecodingInfo`] を参照する。デコード可否の意味は [`DecodingInfo`] の rustdoc を参照すること。
 #[cfg(target_os = "macos")]
 pub fn supported_codecs() -> Vec<CodecInfo> {
     VideoCodecType::all()
@@ -122,10 +128,9 @@ pub fn supported_codecs() -> Vec<CodecInfo> {
         .collect()
 }
 
-/// VTIsHardwareDecodeSupported でデコード情報を判定する
+/// `VTIsHardwareDecodeSupported` でデコード情報を判定する
 ///
-/// VideoToolbox はハードウェアアクセラレーション前提の API であるため、
-/// supported と hardware_accelerated は同じ値になる。
+/// 返却する `supported` / `hardware_accelerated` は **ハードウェアパス**の可否に対応する。
 #[cfg(target_os = "macos")]
 fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
     let fourcc = codec.to_fourcc();

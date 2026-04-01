@@ -160,6 +160,12 @@
 - [FIX] エンコードコールバックで `CMBlockBufferGetDataPointer` の戻り長だけを出力長に使うと非連続 `CMBlockBuffer` で圧縮データが途中までしか取れない問題を修正する
   - `CMBlockBufferCopyDataBytes` で `CMBlockBufferGetDataLength` 分をコピーする
   - @voluntas
+- [UPDATE] README にテスト前提を記載し、`DecodingInfo`・`supported_codecs`・`DecodedFrame` / `I420Frame` / `Nv12Frame` の rustdoc を補う
+  - @voluntas
+- [FIX] `Encoder::encode` で `VTCompressionSessionEncodeFrame` 呼び出し前に `CVPixelBuffer` をアンロックする
+  - @voluntas
+- [FIX] エンコード出力で `CMBlockBufferGetDataLength` が防御的上限を超える場合はログして当該フレームを破棄する
+  - @voluntas
 
 ### misc
 
