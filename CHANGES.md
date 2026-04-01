@@ -11,6 +11,13 @@
 
 ## develop
 
+### misc
+
+
+## 2026.1.1
+
+**リリース日**: 2026-04-01
+
 - [UPDATE] `Encoder` の設定検証・プレーンコピー・パラメータ抽出・ドキュメントを堅牢化する
   - `fps_numerator` が `i32::MAX` を超える場合は `InvalidConfig` とする（`CMTimeMake` の timescale 用）
   - `copy_plane` で CVPixelBuffer のプレーン寸法・格納バイト数とコピー範囲を照合する
@@ -18,6 +25,7 @@
   - `Encoder` と `next_frame` のドキュメントを補う（無制限 mpsc・出力 PTS 列のギャップ）
   - 同一 PTS のエンコード出力が上書きされたときにログする
   - @voluntas
+
 
 ## 2026.1.0
 
