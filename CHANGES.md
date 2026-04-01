@@ -174,6 +174,8 @@
 
 ### misc
 
+- README に VP9 / AV1 デコード初期化時の `UnsupportedCodec` と `InvalidConfig` の違いを追記する
+  - @voluntas
 - VP9 デコーダーテストを追加する
   - shiguredo_libvpx でカラーバーをエンコードし Video Toolbox でデコードして PSNR を検証する
   - @voluntas

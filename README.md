@@ -243,7 +243,11 @@ for info in supported_codecs() {
 | AV1 | `DecoderCodec::Av1 { width, height }` |
 
 VP9 と AV1 はハードウェアサポートに依存するため、環境によっては利用できない場合があります。
-利用できない場合は `Error::UnsupportedCodec` エラーが返されます。
+
+デコード初期化時のエラーは次のように分かれます。
+
+- **環境が VP9 / AV1 デコードに対応していない**など、Video Toolbox が失敗した場合は `Error::UnsupportedCodec` が返されます。
+- **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
 use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
@@ -255,6 +259,9 @@ match Decoder::new(DecoderConfig {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
+    }
+    Err(Error::InvalidConfig { field, .. }) => {
+        eprintln!("invalid decoder config: {field}");
     }
     Err(e) => return Err(e),
 }
