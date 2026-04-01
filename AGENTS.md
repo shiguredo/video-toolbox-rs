@@ -46,8 +46,8 @@
 - 1 issue 完了ごとに 1 コミットすること
 - Issue の作成日はファイルのタイトルの後に `Created: YYYY-MM-DD` として記載すること
 - Issue の完了日はファイルのタイトルの後に `Completed: YYYY-MM-DD` として記載すること
-- Issue を作成した LLM の Model と Version をファイルのタイトルの後に `Model: <model-name> <version>` として記載すること
-  - Opus 4.6 や GPT-5.4 など
+- Issue を作成した LLM の Model をファイルのタイトルの後に `Model: <model-name>` として記載すること
+  - Composer 2 Fast、Opus 4.6、GPT-5.4 など
 - Issue はなぜこの対応が必要なのかの根拠を明確にすること
 
 ### issue が実は解決してなかった場合

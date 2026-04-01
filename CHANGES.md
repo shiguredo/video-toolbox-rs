@@ -11,25 +11,31 @@
 
 ## develop
 
+### misc
+
+
+## 2026.1.1
+
+**リリース日**: 2026-04-01
+
+- [UPDATE] `Encoder` の設定検証・プレーンコピー・パラメータ抽出・ドキュメントを堅牢化する
+  - `fps_numerator` が `i32::MAX` を超える場合は `InvalidConfig` とする（`CMTimeMake` の timescale 用）
+  - `copy_plane` で CVPixelBuffer のプレーン寸法・格納バイト数とコピー範囲を照合する
+  - パラメータセット抽出で異常に大きい長さを拒否する（ISO/IEC 14496-15 の `unsigned int(16)` に合わせ 65535 バイト上限と根拠コメント）
+  - `Encoder` と `next_frame` のドキュメントを補う（無制限 mpsc・出力 PTS 列のギャップ）
+  - 同一 PTS のエンコード出力が上書きされたときにログする
+  - @voluntas
+
+
 ## 2026.1.0
 
 **リリース日**: 2026-04-01
 
-
-- [ADD] `Error::InvalidConfig` バリアントを追加する
-  - @voluntas
-- [FIX] `Encoder::encode()` で必要サイズより長い入力スライスを渡した場合にヒープオーバーランが発生する問題を修正する
-  - `copy_plane()` のコピーサイズを `src.len()` から `src_width * src_height` に変更する
-  - @voluntas
-- [FIX] `Encoder::encode()` で入力フレームのメモリ寿命が非同期エンコード中に保証されない問題を修正する
-  - `CVPixelBufferCreateWithPlanarBytes` を `CVPixelBufferCreate` + データコピーに変更する
-  - @voluntas
-- [FIX] `fps_denominator` が 0 の場合にゼロ除算パニックが発生する問題を修正する
-  - `Encoder::new()` と `Encoder::reconfigure()` で設定値を検証する
-  - @voluntas
-- [FIX] エンコーダーとデコーダーのコールバックで NULL 出力を考慮していない問題を修正する
-  - @voluntas
 - [UPDATE] VP9 / AV1 デコーダーテストで `supported_codecs()` による事前チェックを行い非対応環境ではテストをスキップする
+  - @voluntas
+- [ADD] `Error::CfObjectCreationFailed` バリアントを追加し、CF の辞書・数値生成が NULL を返した場合を `LimitExceeded` と区別する
+  - @voluntas
+- [ADD] `Error::InvalidConfig` バリアントを追加する
   - @voluntas
 - [ADD] コーデック情報取得 API `supported_codecs()` を追加する
   - `VideoCodecType`, `CodecInfo`, `DecodingInfo`, `EncodingInfo` 型を追加する
@@ -52,6 +58,13 @@
 - [ADD] `PixelFormat` enum を追加する
   - @voluntas
 - [ADD] `EncodeOptions` struct を追加し、`force_key_frame` でキーフレーム生成を強制可能にする
+  - @voluntas
+- [CHANGE] `Encoder::next_frame` の戻り値を `Result<Option<EncodedFrame>, Error>` にし、出力 PTS の `checked_add` 失敗時は `Error::LimitExceeded` を返す
+  - `checked_add` の可否は `output_frames` から取り出す前に検証し、オーバーフロー時にエンコード済みフレームを失わない
+  - `try_recv()` で受信がなくても、バッファ済みの `output_frames` から `next_output_pts` 一致分を返す
+  - @voluntas
+- [CHANGE] `Error::LimitExceeded` バリアントを追加する
+  - CF オブジェクト生成失敗・PTS 加算オーバーフロー・プレーンコピー算術オーバーフロー等で返す
   - @voluntas
 - [CHANGE] `EncoderConfig` に `pixel_format` フィールドを追加する
   - @voluntas
@@ -99,16 +112,82 @@
   - @voluntas
 - [CHANGE] `EncoderConfig` から未使用の `use_parallelization` フィールドを削除する
   - @voluntas
+- [FIX] `codec_info` で Core Foundation の参照を `CFGetTypeID` なしで辞書・数値・配列・文字列として扱っていた箇所を型検証する
+  - @voluntas
+- [FIX] `Encoder::validate_config` で `width` / `height` が 0 の場合を拒否し、`validate_frame_data` の解像度乗算に `checked_mul` を用いる
+  - @voluntas
+- [FIX] `copy_plane` でプレーン基底アドレスが NULL の場合はエラーにし、`bytes_per_row` がコピー幅より小さい場合はエラーにする（行バッファ外書き込みの防止）
+  - @voluntas
+- [FIX] `process_encoded_output` でキーフレーム時に `CMSampleBufferGetFormatDescription` が NULL の場合は打ち切る
+  - @voluntas
+- [FIX] `is_keyframe` で添付が `CFDictionary` であることを `CFGetTypeID` で確認する
+  - @voluntas
+- [FIX] パラメータ抽出で `CMVideoFormatDescriptionRef` が NULL の場合は打ち切る
+  - @voluntas
+- [FIX] `Decoder::decode` と `I420Frame` / `Nv12Frame` のドキュメントを補足する
+  - @voluntas
+- [FIX] VP9 ラウンドトリップテストで libvpx の失敗時はテストを打ち切る
+  - @voluntas
+- [FIX] `Decoder::decode` で圧縮データを `Vec` にコピーしてから `CMBlockBufferCreateWithMemoryBlock` に渡す
+  - @voluntas
+- [FIX] `cf_dictionary` / `cf_number_*` の戻り NULL を `LimitExceeded` として扱う
+  - @voluntas
+- [FIX] `Encoder` の入力 / 出力 PTS を `checked_add` で更新し、オーバーフロー時はエラーまたはログする
+  - @voluntas
+- [FIX] `copy_plane` で `checked_mul` によりコピー長・行オフセットのオーバーフローを検出する
+  - @voluntas
+- [FIX] `I420Frame` / `Nv12Frame` のプレーン参照で NULL および算術オーバーフロー時は空スライスとする
+  - @voluntas
+- [FIX] `CMSampleBufferGetDataBuffer` が NULL のときはエンコード出力処理を行わない
+  - @voluntas
+- [FIX] `CMBlockBufferGetDataPointer` の結果を `vec_u8_from_raw_parts_safe` 経由でコピーする
+  - @voluntas
+- [FIX] `is_keyframe` で `CFArray` の要素数を確認する
+  - @voluntas
+- [FIX] `Encoder::validate_config` で `fps_numerator` が 0 の場合を拒否する
+  - @voluntas
+- [FIX] H.264 / H.265 のパラメータセット抽出でポインタとサイズの組み合わせを検証する
+  - @voluntas
+- [FIX] `Encoder::encode()` で必要サイズより長い入力スライスを渡した場合にヒープオーバーランが発生する問題を修正する
+  - `copy_plane()` のコピーサイズを `src.len()` から `src_width * src_height` に変更する
+  - @voluntas
+- [FIX] `Encoder::encode()` で入力フレームのメモリ寿命が非同期エンコード中に保証されない問題を修正する
+  - `CVPixelBufferCreateWithPlanarBytes` を `CVPixelBufferCreate` + データコピーに変更する
+  - @voluntas
+- [FIX] `fps_denominator` が 0 の場合にゼロ除算パニックが発生する問題を修正する
+  - `Encoder::new()` と `Encoder::reconfigure()` で設定値を検証する
+  - @voluntas
+- [FIX] エンコーダーとデコーダーのコールバックで NULL 出力を考慮していない問題を修正する
+  - @voluntas
 - [FIX] H.264 プロファイルレベルを 3.1 固定から AutoLevel に変更する
   - @voluntas
 - [FIX] `average_bitrate` の CFNumber 型を i32 から i64 に変更し高ビットレートに対応する
   - @voluntas
 - [FIX] `kVTCompressionPropertyKey_PixelTransferProperties` への誤った設定を削除する
   - @voluntas
+- [FIX] `Encoder::encode()` で `copy_plane` が失敗したときに `CVPixelBufferUnlockBaseAddress` が呼ばれずロックしたまま `CFRelease` され得る問題を修正する
+  - ロック解除を `Drop` ガードで保証する
+  - @voluntas
+- [FIX] エンコードコールバックで `CMBlockBufferGetDataPointer` の戻り長だけを出力長に使うと非連続 `CMBlockBuffer` で圧縮データが途中までしか取れない問題を修正する
+  - `CMBlockBufferCopyDataBytes` で `CMBlockBufferGetDataLength` 分をコピーする
+  - @voluntas
+- [UPDATE] README にテスト前提を記載し、`DecodingInfo`・`supported_codecs`・`DecodedFrame` / `I420Frame` / `Nv12Frame` の rustdoc を補う
+  - @voluntas
+- [FIX] `Encoder::encode` で `VTCompressionSessionEncodeFrame` 呼び出し前に `CVPixelBuffer` をアンロックする
+  - @voluntas
+- [FIX] エンコード出力で `CMBlockBufferGetDataLength` が防御的上限を超える場合はログして当該フレームを破棄する
+  - @voluntas
+- [FIX] `Encoder::validate_config` で `width` / `height` が `i32::MAX` を超える場合を拒否し、`DecoderCodec::Vp9` / `Av1` の `CMVideoFormatDescriptionCreate` 呼び出し前に同じ寸法範囲を検証する
+  - `Decoder::wrap_unsupported_codec_error` は `VideoToolbox` エラーのみ `UnsupportedCodec` に変換し、`InvalidConfig` はそのまま返す
+  - @voluntas
+- [FIX] `EncoderConfig` の `average_bitrate` が `i64::MAX` を超える `u64` のときに `CFNumber` へ負の値が渡るのを防ぐため、`InvalidConfig` で拒否する
+  - @voluntas
 
 ### misc
 
 - CI の `release/**` ブランチ push でも GitHub Actions を実行する
+  - @voluntas
+- README に VP9 / AV1 デコード初期化時の `UnsupportedCodec` と `InvalidConfig` の違いを追記する
   - @voluntas
 - VP9 デコーダーテストを追加する
   - shiguredo_libvpx でカラーバーをエンコードし Video Toolbox でデコードして PSNR を検証する

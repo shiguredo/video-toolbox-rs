@@ -40,6 +40,12 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - macOS (arm64)
 - Xcode Command Line Tools (ビルド時に Video Toolbox のヘッダーファイルが必要)
 
+## テスト
+
+- CI（`.github/workflows/ci.yml` の `test-video-toolbox`）は **セルフホストランナー**（`labels: self-hosted, macOS, ARM64`）上で `cargo test` を実行する。
+- 上記の動作要件と揃えた環境では、`supported_codecs` 等のテストが **H.264 / HEVC のハードウェア対応**を前提にしている。
+- **Intel Mac**、古い macOS、仮想化・特殊構成でローカル実行した場合、同じテストが **失敗**することがある。
+
 ## ビルド
 
 ```bash
@@ -97,13 +103,13 @@ encoder.encode(&frame, &EncodeOptions {
 })?;
 
 // エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("encoded bytes: {}", encoded.data.len());
 }
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("flushed bytes: {}", encoded.data.len());
 }
 ```
@@ -237,7 +243,11 @@ for info in supported_codecs() {
 | AV1 | `DecoderCodec::Av1 { width, height }` |
 
 VP9 と AV1 はハードウェアサポートに依存するため、環境によっては利用できない場合があります。
-利用できない場合は `Error::UnsupportedCodec` エラーが返されます。
+
+デコード初期化時のエラーは次のように分かれます。
+
+- **環境が VP9 / AV1 デコードに対応していない**など、Video Toolbox が失敗した場合は `Error::UnsupportedCodec` が返されます。
+- **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
 use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
@@ -249,6 +259,9 @@ match Decoder::new(DecoderConfig {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
+    }
+    Err(Error::InvalidConfig { field, .. }) => {
+        eprintln!("invalid decoder config: {field}");
     }
     Err(e) => return Err(e),
 }
@@ -290,7 +303,7 @@ let new_config = EncoderConfig {
 encoder.reconfigure(new_config)?;
 
 // フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame() {
+while let Some(encoded) = encoder.next_frame()? {
     println!("flushed bytes: {}", encoded.data.len());
 }
 ```
