@@ -108,6 +108,8 @@
 
 ### misc
 
+- CI の `release/**` ブランチ push でも GitHub Actions を実行する
+  - @voluntas
 - VP9 デコーダーテストを追加する
   - shiguredo_libvpx でカラーバーをエンコードし Video Toolbox でデコードして PSNR を検証する
   - @voluntas
