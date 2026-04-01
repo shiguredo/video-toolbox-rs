@@ -521,9 +521,9 @@ dependencies = [
 
 [[package]]
 name = "shiguredo_libvpx"
-version = "2026.1.0-canary.3"
+version = "2026.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e5e61d99e0797ec87b5a40efa8ec6bb4f35ad7e6ae9bc1130eeaf7c181c25cb"
+checksum = "e056f7ad0caee584d906681f671f347b306950dc7169e0879cd71941940d5d37"
 dependencies = [
  "bindgen",
  "shiguredo_toml",
@@ -543,7 +543,7 @@ checksum = "f501556feebae970519ffa4afc5edb078c8eb16da4a0a2fbe803d75c0e34a79b"
 
 [[package]]
 name = "shiguredo_video_toolbox"
-version = "2026.1.0-canary.4"
+version = "2026.1.0"
 dependencies = [
  "bindgen",
  "log",
