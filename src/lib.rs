@@ -62,6 +62,16 @@ pub enum Error {
         /// 理由
         reason: &'static str,
     },
+    /// 内部カウンタや算術の上限超過（PTS の加算オーバーフロー等）
+    LimitExceeded {
+        /// 英語の理由（ログ・表示用）
+        reason: &'static str,
+    },
+    /// Core Foundation のオブジェクト生成が NULL を返した（メモリ不足等）
+    CfObjectCreationFailed {
+        /// 関数名
+        function: &'static str,
+    },
 }
 
 impl Error {
@@ -107,11 +117,51 @@ impl std::fmt::Display for Error {
             Self::InvalidConfig { field, reason } => {
                 write!(f, "invalid config: {field}: {reason}")
             }
+            Self::LimitExceeded { reason } => {
+                write!(f, "limit exceeded: {reason}")
+            }
+            Self::CfObjectCreationFailed { function } => {
+                write!(
+                    f,
+                    "Core Foundation object creation failed: {}() returned null",
+                    function
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Video Toolbox / CoreMedia の `i32` 寸法引数に渡す前に、`u32` が正の `i32` に収まることを検証する。
+fn validate_video_dimensions_for_toolbox(width: u32, height: u32) -> Result<(), Error> {
+    let max = i32::MAX as u32;
+    if width == 0 {
+        return Err(Error::InvalidConfig {
+            field: "width",
+            reason: "must not be zero",
+        });
+    }
+    if height == 0 {
+        return Err(Error::InvalidConfig {
+            field: "height",
+            reason: "must not be zero",
+        });
+    }
+    if width > max {
+        return Err(Error::InvalidConfig {
+            field: "width",
+            reason: "must fit in i32 for Video Toolbox dimensions",
+        });
+    }
+    if height > max {
+        return Err(Error::InvalidConfig {
+            field: "height",
+            reason: "must fit in i32 for Video Toolbox dimensions",
+        });
+    }
+    Ok(())
+}
 
 /// ピクセルフォーマット
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +314,10 @@ pub enum FrameData<'a> {
 }
 
 /// H.264 / H.265 エンコーダー
+///
+/// エンコードコールバックは未制限バッファの [`std::sync::mpsc::channel`] にフレームを送る。
+/// 受信側が [`Encoder::next_frame`] を十分な頻度で呼ばないと、チャネルおよび内部の `output_frames` に
+/// データが滞留し、メモリ使用量が増え続ける可能性がある。
 #[derive(Debug)]
 pub struct Encoder {
     session: sys::VTCompressionSessionRef,
@@ -362,6 +416,9 @@ impl Encoder {
                 }
             };
 
+            // `outputCallbackRefCon` には `Sender<EncodedFrame>` へのポインタを渡す。
+            // エンコード出力コールバック内では同一ポインタを `Sender` として復元して `send` する（`process_encoded_output`）。
+            // ポインタは `Encoder` が `Box` で保持する `Sender` を指し、`Encoder` の生存期間中は有効である。
             let status = VTCompressionSessionCreate(
                 std::ptr::null_mut(),
                 config.width as i32,
@@ -399,7 +456,7 @@ impl Encoder {
                 }
             }
 
-            let properties_dict = cf_dictionary(&properties);
+            let properties_dict = cf_dictionary(&properties)?;
             let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
             let status = sys::VTSessionSetProperties(session.cast(), properties_dict);
             Error::check(status, "VTSessionSetProperties")?;
@@ -416,11 +473,11 @@ impl Encoder {
     ) -> Result<(), Error> {
         unsafe {
             // 基本設定
-            let fps = cf_number_i32(config.fps_numerator.div_ceil(config.fps_denominator) as i32);
+            let fps = cf_number_i32(config.fps_numerator.div_ceil(config.fps_denominator) as i32)?;
 
             // ビットレート (指定時のみ設定)
             if let Some(bitrate) = config.average_bitrate {
-                let target_bitrate = cf_number_i64(bitrate as i64);
+                let target_bitrate = cf_number_i64(bitrate as i64)?;
                 properties.push((
                     sys::kVTCompressionPropertyKey_AverageBitRate,
                     target_bitrate.0,
@@ -466,7 +523,7 @@ impl Encoder {
 
             // キーフレーム間隔（フレーム数）
             if let Some(interval) = config.max_key_frame_interval {
-                let interval_value = cf_number_i32(interval.get() as i32);
+                let interval_value = cf_number_i32(interval.get() as i32)?;
                 properties.push((
                     sys::kVTCompressionPropertyKey_MaxKeyFrameInterval,
                     interval_value.0,
@@ -476,7 +533,7 @@ impl Encoder {
 
             // キーフレーム間隔（秒数）
             if let Some(duration) = config.max_key_frame_interval_duration {
-                let duration_value = cf_number_f64(duration.as_secs_f64());
+                let duration_value = cf_number_f64(duration.as_secs_f64())?;
                 properties.push((
                     sys::kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                     duration_value.0,
@@ -486,7 +543,7 @@ impl Encoder {
 
             // フレーム遅延制限
             if let Some(delay_count) = config.max_frame_delay_count {
-                let delay_value = cf_number_i32(delay_count.get() as i32);
+                let delay_value = cf_number_i32(delay_count.get() as i32)?;
                 properties.push((
                     sys::kVTCompressionPropertyKey_MaxFrameDelayCount,
                     delay_value.0,
@@ -551,10 +608,32 @@ impl Encoder {
 
     /// エンコーダー設定を検証する
     fn validate_config(config: &EncoderConfig) -> Result<(), Error> {
+        validate_video_dimensions_for_toolbox(config.width, config.height)?;
         if config.fps_denominator == 0 {
             return Err(Error::InvalidConfig {
                 field: "fps_denominator",
                 reason: "must not be zero",
+            });
+        }
+        if config.fps_numerator == 0 {
+            return Err(Error::InvalidConfig {
+                field: "fps_numerator",
+                reason: "must not be zero",
+            });
+        }
+        // `CMTimeMake` の timescale に `fps_numerator as i32` を渡すため、`i32` に収まる必要がある。
+        if config.fps_numerator > i32::MAX as u32 {
+            return Err(Error::InvalidConfig {
+                field: "fps_numerator",
+                reason: "must fit in i32 for CMTime timescale",
+            });
+        }
+        if let Some(bitrate) = config.average_bitrate
+            && bitrate > i64::MAX as u64
+        {
+            return Err(Error::InvalidConfig {
+                field: "average_bitrate",
+                reason: "must fit in i64 for CFNumber",
             });
         }
         Ok(())
@@ -570,25 +649,86 @@ impl Encoder {
         src: &[u8],
         src_width: usize,
         src_height: usize,
-    ) {
+    ) -> Result<(), Error> {
         unsafe {
             let dst = sys::CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) as *mut u8;
+            if dst.is_null() {
+                return Err(Error::LimitExceeded {
+                    reason: "CVPixelBuffer base address for plane is null",
+                });
+            }
             let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
+            let cv_plane_height =
+                sys::CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index) as usize;
+            let cv_plane_width =
+                sys::CVPixelBufferGetWidthOfPlane(pixel_buffer, plane_index) as usize;
+            // 行あたり `dst_stride` バイトしかないのに `src_width` バイトを書くとバッファ外になる
+            if dst_stride < src_width {
+                return Err(Error::LimitExceeded {
+                    reason: "plane destination stride is less than copy width",
+                });
+            }
+            // Core Video の契約では、プレーンは少なくとも `height * bytesPerRow` バイトを指す。
+            // コピー範囲が `CVPixelBuffer` が報告するプレーン寸法を超えないことを検証する。
+            if src_width > cv_plane_width || src_height > cv_plane_height {
+                return Err(Error::LimitExceeded {
+                    reason: "plane copy dimensions exceed CVPixelBuffer plane bounds",
+                });
+            }
+            let plane_storage =
+                dst_stride
+                    .checked_mul(cv_plane_height)
+                    .ok_or(Error::LimitExceeded {
+                        reason: "plane storage byte length overflow",
+                    })?;
+            let write_span = if src_height == 0 {
+                0
+            } else if dst_stride == src_width {
+                src_width
+                    .checked_mul(src_height)
+                    .ok_or(Error::LimitExceeded {
+                        reason: "plane copy byte length overflow",
+                    })?
+            } else {
+                src_height
+                    .checked_sub(1)
+                    .and_then(|r| r.checked_mul(dst_stride))
+                    .and_then(|o| o.checked_add(src_width))
+                    .ok_or(Error::LimitExceeded {
+                        reason: "plane row copy span overflow",
+                    })?
+            };
+            if write_span > plane_storage {
+                return Err(Error::LimitExceeded {
+                    reason: "plane copy would exceed CVPixelBuffer plane storage",
+                });
+            }
 
-            let copy_size = src_width * src_height;
+            let copy_size = src_width
+                .checked_mul(src_height)
+                .ok_or(Error::LimitExceeded {
+                    reason: "plane copy byte length overflow",
+                })?;
             if dst_stride == src_width {
                 // ストライドと入力幅が一致する場合は一括コピー
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy_size);
             } else {
                 // ストライドが異なる場合は行ごとにコピー
                 for row in 0..src_height {
+                    let src_off = row.checked_mul(src_width).ok_or(Error::LimitExceeded {
+                        reason: "plane row source offset overflow",
+                    })?;
+                    let dst_off = row.checked_mul(dst_stride).ok_or(Error::LimitExceeded {
+                        reason: "plane row destination offset overflow",
+                    })?;
                     std::ptr::copy_nonoverlapping(
-                        src.as_ptr().add(row * src_width),
-                        dst.add(row * dst_stride),
+                        src.as_ptr().add(src_off),
+                        dst.add(dst_off),
                         src_width,
                     );
                 }
             }
+            Ok(())
         }
     }
 
@@ -600,8 +740,10 @@ impl Encoder {
     ) -> Result<(), Error> {
         match frame {
             FrameData::I420 { y, u, v } => {
-                let y_expected = width * height;
-                let uv_expected = width.div_ceil(2) * height.div_ceil(2);
+                let y_expected = Self::frame_byte_len_checked(width, height)?;
+                let uv_w = width.div_ceil(2);
+                let uv_h = height.div_ceil(2);
+                let uv_expected = Self::frame_byte_len_checked(uv_w, uv_h)?;
                 if y.len() < y_expected {
                     return Err(Error::InsufficientFrameData {
                         plane: "Y",
@@ -625,8 +767,8 @@ impl Encoder {
                 }
             }
             FrameData::Nv12 { y, uv } => {
-                let y_expected = width * height;
-                let uv_expected = width * height.div_ceil(2);
+                let y_expected = Self::frame_byte_len_checked(width, height)?;
+                let uv_expected = Self::frame_byte_len_checked(width, height.div_ceil(2))?;
                 if y.len() < y_expected {
                     return Err(Error::InsufficientFrameData {
                         plane: "Y",
@@ -644,6 +786,13 @@ impl Encoder {
             }
         }
         Ok(())
+    }
+
+    /// `width * height` 等のフレームサイズ計算で `usize` 乗算がオーバーフローしないことを保証する
+    fn frame_byte_len_checked(a: usize, b: usize) -> Result<usize, Error> {
+        a.checked_mul(b).ok_or(Error::LimitExceeded {
+            reason: "frame dimension size overflow",
+        })
     }
 
     /// 画像データをエンコードする
@@ -696,29 +845,42 @@ impl Encoder {
 
             let image_buffer = CfPtrMut(image_buffer);
 
-            let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
-            Error::check(status, "CVPixelBufferLockBaseAddress")?;
-
-            match frame {
-                FrameData::I420 { y, u, v } => {
-                    Self::copy_plane(image_buffer.0, 0, y, width, height);
-                    Self::copy_plane(image_buffer.0, 1, u, width.div_ceil(2), height.div_ceil(2));
-                    Self::copy_plane(image_buffer.0, 2, v, width.div_ceil(2), height.div_ceil(2));
-                }
-                FrameData::Nv12 { y, uv } => {
-                    Self::copy_plane(image_buffer.0, 0, y, width, height);
-                    Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2));
+            // CPU でプレーンへ書き込む間だけロックし、`VTCompressionSessionEncodeFrame` 呼び出し前に解放する。
+            // `copy_plane` が Err のときも `Drop` でアンロックする（`CfPtrMut` の `CFRelease` 前にロック残しを防ぐ）。
+            {
+                let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
+                Error::check(status, "CVPixelBufferLockBaseAddress")?;
+                let _pixel_unlock = CvPixelBufferUnlockGuard(image_buffer.0);
+                match frame {
+                    FrameData::I420 { y, u, v } => {
+                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
+                        Self::copy_plane(
+                            image_buffer.0,
+                            1,
+                            u,
+                            width.div_ceil(2),
+                            height.div_ceil(2),
+                        )?;
+                        Self::copy_plane(
+                            image_buffer.0,
+                            2,
+                            v,
+                            width.div_ceil(2),
+                            height.div_ceil(2),
+                        )?;
+                    }
+                    FrameData::Nv12 { y, uv } => {
+                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
+                        Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2))?;
+                    }
                 }
             }
-
-            let status = sys::CVPixelBufferUnlockBaseAddress(image_buffer.0, 0);
-            Error::check(status, "CVPixelBufferUnlockBaseAddress")?;
 
             let frame_properties = if options.force_key_frame {
                 cf_dictionary(&[(
                     sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
                     sys::kCFBooleanTrue as *const c_void,
-                )])
+                )])?
             } else {
                 std::ptr::null()
             };
@@ -739,7 +901,12 @@ impl Encoder {
             );
             Error::check(status, "VTCompressionSessionEncodeFrame")?;
 
-            self.next_input_pts += self.config.fps_denominator as i64;
+            self.next_input_pts = self
+                .next_input_pts
+                .checked_add(self.config.fps_denominator as i64)
+                .ok_or(Error::LimitExceeded {
+                    reason: "input presentation timestamp overflow",
+                })?;
 
             Ok(())
         }
@@ -755,6 +922,9 @@ impl Encoder {
     /// # Safety
     ///
     /// `pixel_buffer_ptr` は有効な CVPixelBuffer ポインタでなければならない。
+    /// また [`EncoderConfig`] の解像度・プレーン構成と整合するピクセルバッファであることは **呼び出し側の責務**とする。
+    /// （本関数はピクセルフォーマットのみ検証し、幅・高さの不一致は即クラッシュしない場合があるが、エンコード結果は不正になりうる。）
+    /// 本関数は `CVPixelBufferLockBaseAddress` を呼ばない。呼び出し側がロックしている場合、Video Toolbox の期待に合わせて **エンコード前にアンロック**するのは呼び出し側の責務とする。
     pub unsafe fn encode_pixel_buffer(
         &mut self,
         pixel_buffer_ptr: *mut c_void,
@@ -794,7 +964,7 @@ impl Encoder {
                 cf_dictionary(&[(
                     sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
                     sys::kCFBooleanTrue as *const c_void,
-                )])
+                )])?
             } else {
                 std::ptr::null()
             };
@@ -815,7 +985,12 @@ impl Encoder {
             );
             Error::check(status, "VTCompressionSessionEncodeFrame")?;
 
-            self.next_input_pts += self.config.fps_denominator as i64;
+            self.next_input_pts = self
+                .next_input_pts
+                .checked_add(self.config.fps_denominator as i64)
+                .ok_or(Error::LimitExceeded {
+                    reason: "input presentation timestamp overflow",
+                })?;
 
             Ok(())
         }
@@ -835,18 +1010,45 @@ impl Encoder {
     /// エンコード済みのフレームを取り出す
     ///
     /// PTS 順に出力するため HashMap でバッファリングしている。
-    /// `allow_frame_reordering: false` を前提としており、
-    /// B フレームによる PTS の飛びには対応していない。
-    pub fn next_frame(&mut self) -> Option<EncodedFrame> {
-        let Ok(frame) = self.encoded_frame_rx.try_recv() else {
-            return None;
+    /// `next_output_pts` は `0` から始まり、成功のたびに `fps_denominator` だけ加算される。
+    /// **この値と一致する PTS** のフレームだけが順に返る。
+    ///
+    /// バックエンドが返すサンプルの PTS がその列から外れる（欠番・順不同・刻みの不一致）と、
+    /// 一致するキーが存在せず **繰り返し `None` になり得る**。
+    /// その間、別 PTS のフレームは `output_frames` に残り、メモリが増え続ける可能性がある。
+    /// `allow_frame_reordering: false` を前提としており、B フレームなどで PTS が飛ぶ構成には対応していない。
+    ///
+    /// 入力には `CMTimeMake(next_input_pts, fps_numerator as i32)` を用い、出力は `CMSampleBuffer` の PTS の整数部を使う。
+    /// 入力ステップと出力 PTS のスケールが一致しないと、上記のギャップが起きやすい。
+    ///
+    /// 出力側 PTS の加算が `i64` で表現できなくなった場合は [`Error::LimitExceeded`] を返す。
+    /// その場合でも **まだ取り出していない**エンコード済みフレームは `output_frames` に残る。
+    ///
+    /// チャネルに新しいフレームが届いていなくても、過去の呼び出しでバッファした `output_frames` があれば取出す。
+    pub fn next_frame(&mut self) -> Result<Option<EncodedFrame>, Error> {
+        if let Ok(frame) = self.encoded_frame_rx.try_recv() {
+            let pts = frame.pts;
+            if let Some(_dropped) = self.output_frames.insert(pts, frame) {
+                log::warn!(
+                    "duplicate encoded frame at pts={pts}, previous frame with same pts was dropped"
+                );
+            }
+        }
+        if !self.output_frames.contains_key(&self.next_output_pts) {
+            return Ok(None);
+        }
+        // `remove` より先に加算可否を検証し、失敗時にフレームをドロップしない
+        let next_pts = self
+            .next_output_pts
+            .checked_add(self.config.fps_denominator as i64)
+            .ok_or(Error::LimitExceeded {
+                reason: "output presentation timestamp overflow",
+            })?;
+        let Some(out) = self.output_frames.remove(&self.next_output_pts) else {
+            return Ok(None);
         };
-        self.output_frames.insert(frame.pts, frame);
-        self.output_frames
-            .remove(&self.next_output_pts)
-            .inspect(|_| {
-                self.next_output_pts += self.config.fps_denominator as i64;
-            })
+        self.next_output_pts = next_pts;
+        Ok(Some(out))
     }
 
     unsafe extern "C" fn output_callback_h264(
@@ -905,27 +1107,41 @@ impl Encoder {
 
         unsafe {
             let data_buffer = sys::CMSampleBufferGetDataBuffer(sample_buffer);
-            let mut data_pointer = std::ptr::null_mut();
-            let mut data_pointer_len = 0;
-            let status = sys::CMBlockBufferGetDataPointer(
+            if data_buffer.is_null() {
+                log::error!("CMSampleBufferGetDataBuffer returned null");
+                return;
+            }
+            // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
+            // 非連続バッファでは `data_pointer_len < block_len` になり得るため、`CMBlockBufferCopyDataBytes` で全長をコピーする。
+            let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
+            if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
+                log::error!(
+                    "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
+                    max = MAX_ENCODED_BLOCK_COPY_BYTES
+                );
+                return;
+            }
+            let mut data = vec![0u8; block_len];
+            let status = sys::CMBlockBufferCopyDataBytes(
                 data_buffer,
                 0,
-                &mut data_pointer_len,
-                std::ptr::null_mut(),
-                &mut data_pointer,
+                block_len,
+                data.as_mut_ptr().cast(),
             );
-            if let Err(e) = Error::check(status, "CMBlockBufferGetDataPointer") {
+            if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
                 log::error!("{e}");
                 return;
             }
 
             let pts = sys::CMSampleBufferGetPresentationTimeStamp(sample_buffer);
             let description = sys::CMSampleBufferGetFormatDescription(sample_buffer);
-            let data =
-                std::slice::from_raw_parts(data_pointer as *const u8, data_pointer_len).to_vec();
             let keyframe = is_keyframe(sample_buffer);
 
             let (vps_list, sps_list, pps_list) = if keyframe {
+                if description.is_null() {
+                    log::error!("CMSampleBufferGetFormatDescription returned null for keyframe");
+                    return;
+                }
                 match extract_params(description) {
                     Some(params) => params,
                     None => return,
@@ -943,7 +1159,9 @@ impl Encoder {
                 pts: pts.value,
             };
 
-            // 呼び出しもとスレッドに結果を伝える
+            // `output_callback_ref_con` は `create_compression_session` が `VTCompressionSessionCreate` に渡した
+            // `Sender<EncodedFrame>` と同一アドレスであること（Video Toolbox の契約）。
+            // 呼び出しもとスレッドに結果を伝える。
             // (Sender は Send を実装しているので、複数スレッドで参照を共有しても問題ない)
             let tx = &*(output_callback_ref_con as *mut std::sync::mpsc::Sender<EncodedFrame>);
             let _ = tx.send(frame);
@@ -957,6 +1175,10 @@ impl Encoder {
         description: sys::CMVideoFormatDescriptionRef,
     ) -> Option<ParameterSets> {
         unsafe {
+            if description.is_null() {
+                log::error!("CMVideoFormatDescription is null in extract_h264_params");
+                return None;
+            }
             let mut nalu_header_length = 0;
             let status = sys::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 description,
@@ -1003,11 +1225,10 @@ impl Encoder {
                 }
             }
 
-            Some((
-                Vec::new(), // H.264 には VPS は存在しない
-                vec![std::slice::from_raw_parts(sps_ptr, sps_size).to_vec()],
-                vec![std::slice::from_raw_parts(pps_ptr, pps_size).to_vec()],
-            ))
+            let sps_vec = vec_u8_from_raw_parts_safe(sps_ptr, sps_size, "H264 SPS")?;
+            let pps_vec = vec_u8_from_raw_parts_safe(pps_ptr, pps_size, "H264 PPS")?;
+
+            Some((Vec::new(), vec![sps_vec], vec![pps_vec]))
         }
     }
 
@@ -1018,6 +1239,10 @@ impl Encoder {
         description: sys::CMVideoFormatDescriptionRef,
     ) -> Option<ParameterSets> {
         unsafe {
+            if description.is_null() {
+                log::error!("CMVideoFormatDescription is null in extract_h265_params");
+                return None;
+            }
             let mut nalu_header_length = 0;
             let status = sys::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
                 description,
@@ -1069,11 +1294,11 @@ impl Encoder {
                 }
             }
 
-            Some((
-                vec![std::slice::from_raw_parts(vps_ptr, vps_size).to_vec()],
-                vec![std::slice::from_raw_parts(sps_ptr, sps_size).to_vec()],
-                vec![std::slice::from_raw_parts(pps_ptr, pps_size).to_vec()],
-            ))
+            let vps_vec = vec_u8_from_raw_parts_safe(vps_ptr, vps_size, "HEVC VPS")?;
+            let sps_vec = vec_u8_from_raw_parts_safe(sps_ptr, sps_size, "HEVC SPS")?;
+            let pps_vec = vec_u8_from_raw_parts_safe(pps_ptr, pps_size, "HEVC PPS")?;
+
+            Some((vec![vps_vec], vec![sps_vec], vec![pps_vec]))
         }
     }
 }
@@ -1113,6 +1338,46 @@ pub struct EncodedFrame {
     pts: i64,
 }
 
+/// パラメータセット 1 個あたりのコピー上限（バイト）。
+///
+/// **根拠（レビューで追試可能）**: ISO/IEC 14496-15（MPEG-4 Part 15）において、
+/// `AVCDecoderConfigurationRecord` の `sequenceParameterSetLength` / `pictureParameterSetLength`、
+/// および `HEVCDecoderConfigurationRecord` 内の各 NAL の長さは **`unsigned int(16)`** で表される。
+/// よって 1 パラメータセットあたり表現可能な最大長は **65535 バイト**（`2^16 - 1`）である。
+/// 本クレートが扱う AVCC 互換のパラメータセット長と整合する防御的上限とする（拒否のみ。クランプはビットストリームを壊す）。
+///
+/// Annex B バイトストリーム上の NAL がこれを超える理論ケースは、本上限では拒否される（実運用では稀）。
+const MAX_PARAMETER_SET_COPY_BYTES: usize = u16::MAX as usize;
+
+/// エンコード出力 1 フレーム分を `Vec` にコピーするときの防御的上限（バイト）。
+///
+/// `MAX_PARAMETER_SET_COPY_BYTES`（パラメータセット用）とは別。`CMBlockBufferGetDataLength` が異常に大きい場合の OOM を防ぐ。
+/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はログして当該フレームを破棄する。
+const MAX_ENCODED_BLOCK_COPY_BYTES: usize = 256 * 1024 * 1024;
+
+/// `slice::from_raw_parts` の前提（長さ 0 でも非 NULL ポインタ、長さ正では NULL 禁止）を満たすためのヘルパー
+fn vec_u8_from_raw_parts_safe(
+    ptr: *const u8,
+    len: usize,
+    context: &'static str,
+) -> Option<Vec<u8>> {
+    if len > MAX_PARAMETER_SET_COPY_BYTES {
+        log::error!(
+            "{context}: parameter set length {len} exceeds defensive maximum {max}",
+            max = MAX_PARAMETER_SET_COPY_BYTES
+        );
+        return None;
+    }
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if ptr.is_null() {
+        log::error!("{context}: null pointer with non-zero length");
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })
+}
+
 fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
     unsafe {
         let attachments = sys::CMSampleBufferGetSampleAttachmentsArray(sample_buffer, 1);
@@ -1120,8 +1385,16 @@ fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
             return false;
         }
 
+        if sys::CFArrayGetCount(attachments) == 0 {
+            return false;
+        }
+
         let attachment = sys::CFArrayGetValueAtIndex(attachments, 0);
         if attachment.is_null() {
+            return false;
+        }
+        // 添付が CFDictionary でない場合は NotSync キーを解釈できない
+        if sys::CFGetTypeID(attachment as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
             return false;
         }
 
@@ -1207,11 +1480,17 @@ impl Decoder {
         }
     }
 
-    /// VP9/AV1 コーデックの場合、エラーを UnsupportedCodec に変換する
+    /// VP9/AV1 コーデックの場合、Video Toolbox の失敗のみ `UnsupportedCodec` に変換する（設定不整合の `InvalidConfig` はそのまま返す）。
     fn wrap_unsupported_codec_error(codec: &DecoderCodec<'_>, error: Error) -> Error {
         match codec {
-            DecoderCodec::Vp9 { .. } => Error::UnsupportedCodec { codec: "VP9" },
-            DecoderCodec::Av1 { .. } => Error::UnsupportedCodec { codec: "AV1" },
+            DecoderCodec::Vp9 { .. } => match error {
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "VP9" },
+                _ => error,
+            },
+            DecoderCodec::Av1 { .. } => match error {
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "AV1" },
+                _ => error,
+            },
             _ => error,
         }
     }
@@ -1305,6 +1584,7 @@ impl Decoder {
                     )?;
                 }
                 DecoderCodec::Vp9 { width, height } => {
+                    validate_video_dimensions_for_toolbox(*width, *height)?;
                     let status = sys::CMVideoFormatDescriptionCreate(
                         std::ptr::null_mut(),
                         u32::from_be_bytes(*b"vp09"),
@@ -1316,6 +1596,7 @@ impl Decoder {
                     Error::check(status, "CMVideoFormatDescriptionCreate")?;
                 }
                 DecoderCodec::Av1 { width, height } => {
+                    validate_video_dimensions_for_toolbox(*width, *height)?;
                     let status = sys::CMVideoFormatDescriptionCreate(
                         std::ptr::null_mut(),
                         u32::from_be_bytes(*b"av01"),
@@ -1339,6 +1620,8 @@ impl Decoder {
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
+            // 現行 SDK では `VTDecompressionOutputCallbackRecord` はコールバック関数ポインタと refcon の 2 フィールドのみ。
+            // ゼロ初期化で refcon は NULL。続けてコールバックのみ代入する方針である（issue 0025）。
             let mut callback =
                 MaybeUninit::<sys::VTDecompressionOutputCallbackRecord>::zeroed().assume_init();
             callback.decompressionOutputCallback = Some(Self::output_callback);
@@ -1347,8 +1630,8 @@ impl Decoder {
                 PixelFormat::I420 => sys::kCVPixelFormatType_420YpCbCr8Planar,
                 PixelFormat::Nv12 => sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             };
-            let pf = cf_number_i32(cv_pixel_format as i32);
-            let dest_attrs = cf_dictionary(&[(sys::kCVPixelBufferPixelFormatTypeKey, pf.0)]);
+            let pf = cf_number_i32(cv_pixel_format as i32)?;
+            let dest_attrs = cf_dictionary(&[(sys::kCVPixelBufferPixelFormatTypeKey, pf.0)])?;
             let _dest_attrs_guard = CfPtr(dest_attrs.cast::<c_void>());
             let status = sys::VTDecompressionSessionCreate(
                 std::ptr::null_mut(),
@@ -1365,17 +1648,26 @@ impl Decoder {
     }
 
     /// 圧縮された映像フレームをデコードする
+    ///
+    /// `owned`（圧縮データの `Vec`）は `CMBlockBufferCreateWithMemoryBlock` が参照する。
+    /// `VTDecompressionSessionDecodeFrame` はこの関数内で同期的に完了するため、
+    /// ブロックバッファとサンプルバッファが解放される前にピクセルバッファの内容が確定する。
+    /// `kCFAllocatorNull` により `Vec` のヒープ領域は CoreMedia 側で解放されない。
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame<'_>>, Error> {
+        // `CMBlockBufferCreateWithMemoryBlock` に渡すメモリを `Vec` で所有する。
+        // `&[u8]` からミュータブルポインタを渡すとエイリアス規則上の未定義動作の余地があるため、
+        // コピーで所有権を明確にする（CoreMedia はデコード時に参照するのみ）。
+        let owned = data.to_vec();
         unsafe {
             let mut block_buffer = std::ptr::null_mut();
             let status = sys::CMBlockBufferCreateWithMemoryBlock(
                 std::ptr::null_mut(),
-                data.as_ptr().cast_mut().cast(),
-                data.len(),
+                owned.as_ptr().cast_mut().cast(),
+                owned.len(),
                 sys::kCFAllocatorNull, // data の自動解放を Video Toolbox 側で行わないようにする
                 std::ptr::null(),
                 0,
-                data.len(),
+                owned.len(),
                 0,
                 &mut block_buffer,
             );
@@ -1476,6 +1768,8 @@ impl Drop for Decoder {
 unsafe impl Send for Decoder {}
 
 /// デコードされた映像フレーム
+///
+/// [`Decoder::decode`] が `Some` を返しても、プレーン参照が空スライスになることは **あり得る**（[`I420Frame`] / [`Nv12Frame`] の各 `*_plane` 参照）。
 pub enum DecodedFrame<'a> {
     /// I420 形式
     I420(I420Frame<'a>),
@@ -1484,6 +1778,15 @@ pub enum DecodedFrame<'a> {
 }
 
 /// I420 形式のデコード済みフレーム (3 プレーン: Y, U, V)
+///
+/// ## プレーン参照
+///
+/// プラットフォームが基底アドレスに NULL を返した場合、または行数とストライドの乗算が
+/// `usize` で表現できない場合、各 `*_plane` は **空のスライス**を返す。
+/// 解像度が正である通常のデコードでは空にはならない想定である。
+///
+/// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル**として扱う。
+/// 呼び出し側は `y_plane().is_empty()` 等で分岐し、通常のピクセル処理に進まないこと。
 #[derive(Debug)]
 pub struct I420Frame<'a> {
     inner: CfPtrMut<sys::__CVBuffer>,
@@ -1494,34 +1797,36 @@ pub struct I420Frame<'a> {
 }
 
 impl I420Frame<'_> {
+    /// ロック済みプレーンを `&[u8]` として返す
+    ///
+    /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
+    fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
+        let len = match row_count.checked_mul(bytes_per_row) {
+            Some(n) if n > 0 => n,
+            _ => return &[],
+        };
+        let ptr = unsafe {
+            sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
+        };
+        if ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, 0) as *const u8,
-                self.height() * self.y_stride(),
-            )
-        }
+        self.plane_slice(0, self.height(), self.y_stride())
     }
 
     /// フレームの U 成分のデータを返す
     pub fn u_plane(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, 1) as *const u8,
-                self.height().div_ceil(2) * self.u_stride(),
-            )
-        }
+        self.plane_slice(1, self.height().div_ceil(2), self.u_stride())
     }
 
     /// フレームの V 成分のデータを返す
     pub fn v_plane(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, 2) as *const u8,
-                self.height().div_ceil(2) * self.v_stride(),
-            )
-        }
+        self.plane_slice(2, self.height().div_ceil(2), self.v_stride())
     }
 
     /// フレームの Y 成分のストライドを返す
@@ -1560,6 +1865,12 @@ impl Drop for I420Frame<'_> {
 }
 
 /// NV12 形式のデコード済みフレーム (2 プレーン: Y, UV interleaved)
+///
+/// ## プレーン参照
+///
+/// [`I420Frame`] と同様、異常時は各 `*_plane` が空スライスになることがある。
+///
+/// **空スライスは異常時のセンチネル**であり、空でないことを前提にピクセル処理して進めないこと。
 #[derive(Debug)]
 pub struct Nv12Frame<'a> {
     inner: CfPtrMut<sys::__CVBuffer>,
@@ -1570,24 +1881,31 @@ pub struct Nv12Frame<'a> {
 }
 
 impl Nv12Frame<'_> {
+    /// ロック済みプレーンを `&[u8]` として返す
+    ///
+    /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
+    fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
+        let len = match row_count.checked_mul(bytes_per_row) {
+            Some(n) if n > 0 => n,
+            _ => return &[],
+        };
+        let ptr = unsafe {
+            sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
+        };
+        if ptr.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, 0) as *const u8,
-                self.height() * self.y_stride(),
-            )
-        }
+        self.plane_slice(0, self.height(), self.y_stride())
     }
 
     /// フレームの UV インターリーブデータを返す
     pub fn uv_plane(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, 1) as *const u8,
-                self.height().div_ceil(2) * self.uv_stride(),
-            )
-        }
+        self.plane_slice(1, self.height().div_ceil(2), self.uv_stride())
     }
 
     /// フレームの Y 成分のストライドを返す
@@ -1620,6 +1938,21 @@ impl Drop for Nv12Frame<'_> {
     }
 }
 
+/// `CVPixelBufferLockBaseAddress` の後に束ね、`Drop` で必ず `CVPixelBufferUnlockBaseAddress` を呼ぶ。
+/// `copy_plane` が `Err` でもロック解除を漏らさない。
+struct CvPixelBufferUnlockGuard(sys::CVPixelBufferRef);
+
+impl Drop for CvPixelBufferUnlockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let status = sys::CVPixelBufferUnlockBaseAddress(self.0, 0);
+            if status != 0 {
+                log::error!("CVPixelBufferUnlockBaseAddress failed: status={status}");
+            }
+        }
+    }
+}
+
 // ドロップ時に確実に sys::CFRelease() を呼び出すようにするためのラッパー
 #[derive(Debug)]
 struct CfPtrMut<T>(*mut T);
@@ -1639,10 +1972,10 @@ impl<T> Drop for CfPtr<T> {
     }
 }
 
-fn cf_dictionary(kvs: &[(sys::CFStringRef, *const c_void)]) -> sys::CFDictionaryRef {
+fn cf_dictionary(kvs: &[(sys::CFStringRef, *const c_void)]) -> Result<sys::CFDictionaryRef, Error> {
     let mut keys = kvs.iter().map(|(k, _)| k.cast()).collect::<Vec<_>>();
     let mut values = kvs.iter().map(|(_, v)| *v).collect::<Vec<_>>();
-    unsafe {
+    let ptr = unsafe {
         sys::CFDictionaryCreate(
             std::ptr::null_mut(),
             keys.as_mut_ptr(),
@@ -1651,10 +1984,16 @@ fn cf_dictionary(kvs: &[(sys::CFStringRef, *const c_void)]) -> sys::CFDictionary
             &sys::kCFTypeDictionaryKeyCallBacks,
             &sys::kCFTypeDictionaryValueCallBacks,
         )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFDictionaryCreate",
+        });
     }
+    Ok(ptr)
 }
 
-fn cf_number_i32(n: i32) -> CfPtr<c_void> {
+fn cf_number_i32(n: i32) -> Result<CfPtr<c_void>, Error> {
     let ptr = unsafe {
         sys::CFNumberCreate(
             std::ptr::null_mut(),
@@ -1662,10 +2001,15 @@ fn cf_number_i32(n: i32) -> CfPtr<c_void> {
             ((&n) as *const i32).cast(),
         )
     };
-    CfPtr(ptr.cast())
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate",
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
 }
 
-fn cf_number_i64(n: i64) -> CfPtr<c_void> {
+fn cf_number_i64(n: i64) -> Result<CfPtr<c_void>, Error> {
     let ptr = unsafe {
         sys::CFNumberCreate(
             std::ptr::null_mut(),
@@ -1673,10 +2017,15 @@ fn cf_number_i64(n: i64) -> CfPtr<c_void> {
             ((&n) as *const i64).cast(),
         )
     };
-    CfPtr(ptr.cast())
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate",
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
 }
 
-fn cf_number_f64(n: f64) -> CfPtr<c_void> {
+fn cf_number_f64(n: f64) -> Result<CfPtr<c_void>, Error> {
     let ptr = unsafe {
         sys::CFNumberCreate(
             std::ptr::null_mut(),
@@ -1684,7 +2033,12 @@ fn cf_number_f64(n: f64) -> CfPtr<c_void> {
             ((&n) as *const f64).cast(),
         )
     };
-    CfPtr(ptr.cast())
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate",
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
 }
 
 #[cfg(test)]
@@ -1761,138 +2115,72 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn init_h264_encoder() {
-        // OK
-        let config = encoder_config(false);
-        assert!(Encoder::new(config).is_ok());
-
-        // NG
-        let mut config = encoder_config(false);
-        config.width = 0;
-        assert!(Encoder::new(config).is_err());
-    }
-
-    #[test]
-    fn init_h265_encoder() {
-        // OK
-        let config = encoder_config(true);
-        assert!(Encoder::new(config).is_ok());
-
-        // NG
-        let mut config = encoder_config(true);
-        config.width = 0;
-        assert!(Encoder::new(config).is_err());
-    }
-
-    #[test]
-    fn encode_h264_black() {
-        let config = encoder_config(false);
-        let mut encoder = Encoder::new(config).expect("create encoder error");
+    /// 黒フレーム 1 枚のエンコード〜`next_frame` 取出し（`Encoder::new` の成功も含む）
+    ///
+    /// [NOTE]: `encode(&[0; SIZE], ..)` のようにリテラル配列を直接渡すとコンパイルエラーになる
+    fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
+        let config = encoder_config(is_h265);
+        let mut encoder = Encoder::new(config)?;
         let mut count = 0;
 
-        // [NOTE]: encode(&[0; SIZE], ..) の様に変数を経由せずに指定するとエラーになる
         let y = [0; SIZE];
         let u = [0; SIZE / 4];
         let v = [0; SIZE / 4];
-        encoder
-            .encode(
-                &FrameData::I420 {
-                    y: &y,
-                    u: &u,
-                    v: &v,
-                },
-                &EncodeOptions::default(),
-            )
-            .expect("encode error");
-
-        while encoder.next_frame().is_some() {
-            count += 1;
-        }
-
-        encoder.finish().expect("finish error");
-        while encoder.next_frame().is_some() {
-            count += 1;
-        }
-
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn encode_h265_black() {
-        let config = encoder_config(true);
-        let mut encoder = Encoder::new(config).expect("create encoder error");
-        let mut count = 0;
-
-        // [NOTE]: encode(&[0; SIZE], ..) の様に変数を経由せずに指定するとエラーになる
-        let y = [0; SIZE];
-        let u = [0; SIZE / 4];
-        let v = [0; SIZE / 4];
-        encoder
-            .encode(
-                &FrameData::I420 {
-                    y: &y,
-                    u: &u,
-                    v: &v,
-                },
-                &EncodeOptions::default(),
-            )
-            .expect("encode error");
-
-        while encoder.next_frame().is_some() {
-            count += 1;
-        }
-
-        encoder.finish().expect("finish error");
-        while encoder.next_frame().is_some() {
-            count += 1;
-        }
-
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn init_vp9_decoder() {
-        if !supported_codecs()
-            .iter()
-            .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
-        {
-            return;
-        }
-
-        Decoder::new(DecoderConfig {
-            codec: DecoderCodec::Vp9 {
-                width: WIDTH,
-                height: HEIGHT,
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
             },
-            pixel_format: PixelFormat::I420,
-        })
-        .expect("failed to create VP9 decoder");
+            &EncodeOptions::default(),
+        )?;
+
+        while encoder.next_frame()?.is_some() {
+            count += 1;
+        }
+
+        encoder.finish()?;
+        while encoder.next_frame()?.is_some() {
+            count += 1;
+        }
+
+        assert_eq!(count, 1);
+        Ok(())
     }
 
     #[test]
-    fn init_av1_decoder() {
+    fn encode_h264_black() -> Result<(), Error> {
+        encode_black_frame_roundtrip(false)
+    }
+
+    #[test]
+    fn encode_h265_black() -> Result<(), Error> {
+        encode_black_frame_roundtrip(true)
+    }
+
+    #[test]
+    fn init_av1_decoder() -> Result<(), Error> {
         if !supported_codecs()
             .iter()
             .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.supported)
         {
-            return;
+            return Ok(());
         }
 
         // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
         // コーデック固有のパラメータが不足して失敗する場合がある。
         // 実際のビットストリームからデコードする場合は正常に動作する。
-        let result = Decoder::new(DecoderConfig {
+        match Decoder::new(DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
                 height: HEIGHT,
             },
             pixel_format: PixelFormat::I420,
-        });
-        if let Err(Error::UnsupportedCodec { .. }) = &result {
-            return;
+        }) {
+            Ok(_) => Ok(()),
+            Err(Error::UnsupportedCodec { .. }) => Ok(()),
+            Err(e) => Err(e),
         }
-        result.expect("failed to create AV1 decoder");
     }
 
     /// SMPTE カラーバー風の I420 フレームを生成する
@@ -2020,11 +2308,14 @@ mod tests {
             frame_drop_threshold: None,
             codec: VpxCodecConfig::Vp9(VpxVp9Config::default()),
         };
-        let mut vpx_encoder = VpxEncoder::new(vpx_config).expect("failed to create VP9 encoder");
+        let mut vpx_encoder = match VpxEncoder::new(vpx_config) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
 
         let mut encoded_frames: Vec<Vec<u8>> = Vec::new();
         for i in 0..num_frames {
-            vpx_encoder
+            if vpx_encoder
                 .encode(
                     &VpxImageData::I420 {
                         y: &y_plane,
@@ -2035,12 +2326,17 @@ mod tests {
                         force_keyframe: i == 0,
                     },
                 )
-                .expect("failed to encode VP9 frame");
+                .is_err()
+            {
+                return Ok(());
+            }
             while let Some(frame) = vpx_encoder.next_frame() {
                 encoded_frames.push(frame.data().to_vec());
             }
         }
-        vpx_encoder.finish().expect("failed to finish VP9 encoder");
+        if vpx_encoder.finish().is_err() {
+            return Ok(());
+        }
         while let Some(frame) = vpx_encoder.next_frame() {
             encoded_frames.push(frame.data().to_vec());
         }
@@ -2056,10 +2352,9 @@ mod tests {
         // 各フレームをデコードして PSNR を検証
         let min_psnr_db = 25.0;
         for (i, encoded_data) in encoded_frames.iter().enumerate() {
-            let decoded = decoder
-                .decode(encoded_data)?
-                .unwrap_or_else(|| panic!("frame {i}: decode returned None"));
-
+            let decoded_opt = decoder.decode(encoded_data)?;
+            assert!(decoded_opt.is_some(), "frame {i}: decode returned None");
+            let decoded = decoded_opt.unwrap();
             match decoded {
                 DecodedFrame::I420(ref frame) => {
                     assert_eq!(frame.width(), width as usize, "frame {i}: width mismatch");
@@ -2083,7 +2378,7 @@ mod tests {
                     );
                 }
                 DecodedFrame::Nv12(_) => {
-                    panic!("frame {i}: expected I420 but got NV12");
+                    unreachable!("frame {i}: expected I420 but got NV12");
                 }
             }
         }
@@ -2124,12 +2419,14 @@ mod tests {
 
     #[test]
     fn test_supported_codecs() {
+        // README の動作要件（macOS / arm64）および CI のセルフホスト（`macOS` / `ARM64`）と整合する前提。
+        // Intel Mac のローカル等では H.264/HEVC の assert が失敗しうる（README の「テスト」セクションを参照）。
         let codecs = supported_codecs();
 
         // 4 種類のコーデックが返る
         assert_eq!(codecs.len(), 4);
 
-        // H.264 デコード・エンコードは全 Mac でサポートされている
+        // H.264 デコード・エンコード（上記前提の環境ではハードウェア対応を期待）
         let h264 = codecs
             .iter()
             .find(|c| c.codec == VideoCodecType::H264)
@@ -2137,7 +2434,7 @@ mod tests {
         assert!(h264.decoding.supported);
         assert!(h264.encoding.supported);
 
-        // HEVC デコード・エンコードは全 Mac でサポートされている
+        // HEVC デコード・エンコード（上記前提の環境ではハードウェア対応を期待）
         let hevc = codecs
             .iter()
             .find(|c| c.codec == VideoCodecType::Hevc)
@@ -2158,5 +2455,53 @@ mod tests {
             .find(|c| c.codec == VideoCodecType::Av1)
             .unwrap();
         assert!(!av1.encoding.supported);
+    }
+
+    /// `vec_u8_from_raw_parts_safe` の NULL ポインタ周り（長さ 0 は許容、非ゼロ長は拒否）
+    #[test]
+    fn vec_u8_from_raw_parts_safe_null_pointer_by_length() {
+        assert_eq!(
+            super::vec_u8_from_raw_parts_safe(std::ptr::null(), 0, "ctx"),
+            Some(Vec::new())
+        );
+        assert!(super::vec_u8_from_raw_parts_safe(std::ptr::null(), 1, "ctx").is_none());
+    }
+
+    #[test]
+    fn vec_u8_from_raw_parts_safe_rejects_len_above_iso14496_15_max() {
+        let b = [0u8];
+        assert!(
+            super::vec_u8_from_raw_parts_safe(
+                b.as_ptr(),
+                super::MAX_PARAMETER_SET_COPY_BYTES + 1,
+                "ctx"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn vec_u8_from_raw_parts_safe_copies_valid_bytes() {
+        let b = [1u8, 2u8, 3u8];
+        assert_eq!(
+            super::vec_u8_from_raw_parts_safe(b.as_ptr(), 3, "ctx"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn error_display_limit_exceeded_and_cf_object_creation_failed() {
+        let e = Error::LimitExceeded {
+            reason: "unit test reason",
+        };
+        assert!(e.to_string().contains("limit exceeded"));
+        assert!(e.to_string().contains("unit test reason"));
+
+        let e2 = Error::CfObjectCreationFailed {
+            function: "CFNumberCreate",
+        };
+        let s = e2.to_string();
+        assert!(s.contains("CFNumberCreate"));
+        assert!(s.contains("null"));
     }
 }

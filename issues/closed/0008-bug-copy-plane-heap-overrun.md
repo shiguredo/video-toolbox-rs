@@ -2,7 +2,7 @@
 
 Created: 2026-03-31
 Completed: 2026-03-31
-Model: Opus 4.6
+Model: Composer 2 Fast
 
 ## 概要
 
