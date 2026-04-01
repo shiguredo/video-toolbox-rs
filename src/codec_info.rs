@@ -46,11 +46,15 @@ pub struct CodecInfo {
 }
 
 /// デコード情報
+///
+/// `supported` は `VTIsHardwareDecodeSupported` に基づく **ハードウェアデコード可否**である。
+/// ソフトウェアデコードのみ利用可能な環境では `false` になり得るが、**システム全体がデコード不能**という意味ではない。
+/// `hardware_accelerated` は現状 `supported` と同じ値になる（内部の `probe_decoding` 実装）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodingInfo {
-    /// デコードが可能か
+    /// ハードウェアデコードが可能か（`VTIsHardwareDecodeSupported`）
     pub supported: bool,
-    /// ハードウェアアクセラレーションが利用可能か
+    /// ハードウェアアクセラレーションが利用可能か（現状 `supported` と同じ）
     pub hardware_accelerated: bool,
 }
 
@@ -110,6 +114,8 @@ pub enum HevcEncodingProfile {
 }
 
 /// このバックエンドで利用可能なコーデック情報の一覧を返す
+///
+/// 各要素の [`CodecInfo::decoding`] は [`DecodingInfo`] を参照する。デコード可否の意味は [`DecodingInfo`] の rustdoc を参照すること。
 #[cfg(target_os = "macos")]
 pub fn supported_codecs() -> Vec<CodecInfo> {
     VideoCodecType::all()
@@ -122,10 +128,9 @@ pub fn supported_codecs() -> Vec<CodecInfo> {
         .collect()
 }
 
-/// VTIsHardwareDecodeSupported でデコード情報を判定する
+/// `VTIsHardwareDecodeSupported` でデコード情報を判定する
 ///
-/// VideoToolbox はハードウェアアクセラレーション前提の API であるため、
-/// supported と hardware_accelerated は同じ値になる。
+/// 返却する `supported` / `hardware_accelerated` は **ハードウェアパス**の可否に対応する。
 #[cfg(target_os = "macos")]
 fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
     let fourcc = codec.to_fourcc();
@@ -163,10 +168,15 @@ fn probe_encoding(codec: VideoCodecType) -> EncodingInfo {
 
         let count = sys::CFArrayGetCount(encoder_list);
         for i in 0..count {
-            let entry = sys::CFArrayGetValueAtIndex(encoder_list, i) as sys::CFDictionaryRef;
+            let entry = sys::CFArrayGetValueAtIndex(encoder_list, i);
             if entry.is_null() {
                 continue;
             }
+            // 配列要素が辞書でない場合はスキップ（NULL チェックだけでは型は保証されない）
+            if sys::CFGetTypeID(entry as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
+                continue;
+            }
+            let entry = entry as sys::CFDictionaryRef;
 
             // kVTVideoEncoderList_CodecType から FourCC を取得する
             let codec_type_value = sys::CFDictionaryGetValue(
@@ -174,6 +184,9 @@ fn probe_encoding(codec: VideoCodecType) -> EncodingInfo {
                 sys::kVTVideoEncoderList_CodecType as *const c_void,
             );
             if codec_type_value.is_null() {
+                continue;
+            }
+            if sys::CFGetTypeID(codec_type_value as sys::CFTypeRef) != sys::CFNumberGetTypeID() {
                 continue;
             }
 
@@ -243,6 +256,9 @@ fn query_encoding_profiles(codec: VideoCodecType, fourcc: u32) -> EncodingProfil
         if status != 0 || props.is_null() {
             return EncodingProfiles::None;
         }
+        if sys::CFGetTypeID(props as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
+            return EncodingProfiles::None;
+        }
         let _props_guard = CfPtr(props as *const c_void);
 
         let profile_entry = sys::CFDictionaryGetValue(
@@ -252,12 +268,18 @@ fn query_encoding_profiles(codec: VideoCodecType, fourcc: u32) -> EncodingProfil
         if profile_entry.is_null() {
             return EncodingProfiles::None;
         }
+        if sys::CFGetTypeID(profile_entry) != sys::CFDictionaryGetTypeID() {
+            return EncodingProfiles::None;
+        }
 
         let value_list = sys::CFDictionaryGetValue(
             profile_entry as sys::CFDictionaryRef,
             sys::kVTPropertySupportedValueListKey as *const c_void,
         );
         if value_list.is_null() {
+            return EncodingProfiles::None;
+        }
+        if sys::CFGetTypeID(value_list as sys::CFTypeRef) != sys::CFArrayGetTypeID() {
             return EncodingProfiles::None;
         }
 
@@ -322,10 +344,14 @@ unsafe fn match_profiles<T: Copy + PartialEq>(
 ) -> Vec<T> {
     let mut profiles = Vec::new();
     for i in 0..count {
-        let value = unsafe { sys::CFArrayGetValueAtIndex(value_array, i) } as sys::CFStringRef;
+        let value = unsafe { sys::CFArrayGetValueAtIndex(value_array, i) };
         if value.is_null() {
             continue;
         }
+        if unsafe { sys::CFGetTypeID(value as sys::CFTypeRef) != sys::CFStringGetTypeID() } {
+            continue;
+        }
+        let value = value as sys::CFStringRef;
         for &(ref_str, profile) in map {
             if unsafe { sys::CFEqual(value as sys::CFTypeRef, ref_str as sys::CFTypeRef) } != 0
                 && !profiles.contains(&profile)

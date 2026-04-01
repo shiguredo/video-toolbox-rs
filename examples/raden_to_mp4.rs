@@ -405,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // エンコード済みフレームを MP4 に書き込む
-        while let Some(encoded) = encoder.next_frame() {
+        while let Some(encoded) = encoder.next_frame()? {
             write_encoded_frame(
                 &encoded,
                 &mut file,
@@ -427,7 +427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 残りのフレームをフラッシュ
     encoder.finish()?;
-    while let Some(encoded) = encoder.next_frame() {
+    while let Some(encoded) = encoder.next_frame()? {
         write_encoded_frame(
             &encoded,
             &mut file,
