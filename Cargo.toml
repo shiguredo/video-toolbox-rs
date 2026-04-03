@@ -21,5 +21,5 @@ bindgen = "0.72"
 [dev-dependencies]
 raden = "2026.1.0-canary.2"
 shiguredo_libvpx = "2026.1.0"
-shiguredo_mp4 = "2026.2.0"
+shiguredo_mp4 = "2026.3.0"
 
