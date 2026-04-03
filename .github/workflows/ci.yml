@@ -31,6 +31,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       - name: Update PATH
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - run: rustup update stable
       - run: cargo fmt --all --check
       - run: cargo check --workspace
       - run: cargo clippy --workspace -- -D warnings
