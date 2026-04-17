@@ -658,10 +658,8 @@ impl Encoder {
                 });
             }
             let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
-            let cv_plane_height =
-                sys::CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index) as usize;
-            let cv_plane_width =
-                sys::CVPixelBufferGetWidthOfPlane(pixel_buffer, plane_index) as usize;
+            let cv_plane_height = sys::CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index);
+            let cv_plane_width = sys::CVPixelBufferGetWidthOfPlane(pixel_buffer, plane_index);
             // 行あたり `dst_stride` バイトしかないのに `src_width` バイトを書くとバッファ外になる
             if dst_stride < src_width {
                 return Err(Error::LimitExceeded {
