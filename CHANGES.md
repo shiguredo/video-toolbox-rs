@@ -11,7 +11,43 @@
 
 ## develop
 
-### misc
+- [ADD] `EncoderState` / `DecoderState` enum を追加する
+  - @voluntas
+- [ADD] `PixelBuffer` / `LockedPixelBuffer` / `I420View` / `Nv12View` 型を追加する
+  - `Decoder` の出力を CVPixelBuffer 所有ラッパーとして公開し、`PixelBuffer::lock()` でプレーン参照を取得する形式に変更
+  - @voluntas
+- [ADD] `Error::InvalidState` バリアントを追加する
+  - @voluntas
+- [ADD] `Encoder` / `Decoder` に `state()` / `reset()` / `close()` を追加する
+  - @voluntas
+- [ADD] `Encoder::encode_queue_size()` を追加する
+  - @voluntas
+- [ADD] `Decoder::flush()` を追加する
+  - @voluntas
+- [CHANGE] `Encoder::new(config)` を `Encoder::new(callback)` + `Encoder::configure(config)` に分割する
+  - コールバックは `FnMut(Result<EncodedFrame, Error>) + 'static` で、`encode()` / `flush()` の呼び出し元スレッドで同期的に実行される
+  - @voluntas
+- [CHANGE] `Encoder::next_frame()` を削除し、結果は登録コールバックで受け取る形式に変更する
+  - @voluntas
+- [CHANGE] `Encoder::finish()` を `Encoder::flush()` にリネームする
+  - @voluntas
+- [CHANGE] `Encoder::reconfigure()` を廃止し、`configure()` の再呼び出しに集約する
+  - 2 回目以降の `configure()` は未出力フレームを破棄するため、必要に応じて事前に `flush()` を呼ぶ
+  - @voluntas
+- [CHANGE] `Decoder::new(config)` を `Decoder::new(callback)` + `Decoder::configure(config)` に分割する
+  - @voluntas
+- [CHANGE] `Decoder::decode()` の戻り値を `Result<(), Error>` に変更し、結果は登録コールバックで受け取る形式に変更する
+  - `decode(data, timestamp)` として `timestamp: i64` 引数を追加し、`DecodedFrame::timestamp` にそのまま転送する
+  - @voluntas
+- [CHANGE] `Decoder::update_format()` を廃止し、`configure()` の再呼び出しに集約する
+  - @voluntas
+- [CHANGE] `DecodedFrame` を `I420Frame` / `Nv12Frame` の借用型 enum から、`PixelBuffer` 所有ラッパーと `timestamp` を持つ struct に変更する
+  - プレーン参照は `pixel_buffer.lock()` で得た `LockedPixelBuffer::{I420,Nv12}(view)` から取得する
+  - @voluntas
+- [CHANGE] `EncodedFrame.timestamp` を公開する（旧 private `pts` を改名）
+  - @voluntas
+- [CHANGE] `allow_frame_reordering: false` 前提の強化として、エンコード出力の `HashMap` + PTS 整列ロジックを削除し、VT からの到着順で即コールバックに通知するように変更する
+  - @voluntas
 
 
 ## 2026.1.1

@@ -6,9 +6,11 @@
 //! cargo run --example raden_to_mp4 -- --codec h264 --width 1920 --height 1080 --fps 60 --duration 10
 //! ```
 
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
+use std::rc::Rc;
 
 use raden::{Circle, CompOp, Context, Image, PipelineRuntime, PixelFormat, Rect, Rgba32};
 use shiguredo_mp4::boxes::{
@@ -327,54 +329,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
     };
-    let mut encoder = Encoder::new(config)?;
-
     // MP4 マルチプレクサーの初期化
-    let mut muxer = Mp4FileMuxer::new()?;
-    let initial_bytes = muxer.initial_boxes_bytes();
+    let muxer = Mp4FileMuxer::new()?;
     let mut file = File::create(&output_path)?;
-    file.write_all(initial_bytes)?;
-    let mut data_offset = initial_bytes.len() as u64;
+    let data_offset: u64;
+    {
+        let initial_bytes = muxer.initial_boxes_bytes();
+        file.write_all(initial_bytes)?;
+        data_offset = initial_bytes.len() as u64;
+    }
 
     let w = width as f64;
     let h = height as f64;
     let dt = 1.0 / fps as f64;
     let timescale = NonZeroU32::new(fps).unwrap();
-    let mut first_keyframe = true;
 
-    // エンコード済みフレームを MP4 に書き込む共通処理
-    let write_encoded_frame = |encoded: &EncodedFrame,
-                               file: &mut File,
-                               muxer: &mut Mp4FileMuxer,
-                               data_offset: &mut u64,
-                               first_keyframe: &mut bool|
-     -> Result<(), Box<dyn std::error::Error>> {
-        let sample_entry = if *first_keyframe && encoded.keyframe {
-            *first_keyframe = false;
-            let entry = match codec {
-                Codec::H264 => build_h264_sample_entry(encoded, width as u16, height as u16),
-                Codec::H265 => build_h265_sample_entry(encoded, width as u16, height as u16),
+    // エンコード結果の MP4 書き込みに必要な状態を集約する
+    struct WriterState {
+        file: File,
+        muxer: Mp4FileMuxer,
+        data_offset: u64,
+        first_keyframe: bool,
+        codec: Codec,
+        width: u32,
+        height: u32,
+        timescale: NonZeroU32,
+        last_error: Option<Box<dyn std::error::Error>>,
+    }
+
+    impl WriterState {
+        fn write(&mut self, encoded: &EncodedFrame) -> Result<(), Box<dyn std::error::Error>> {
+            let sample_entry = if self.first_keyframe && encoded.keyframe {
+                self.first_keyframe = false;
+                let entry = match self.codec {
+                    Codec::H264 => {
+                        build_h264_sample_entry(encoded, self.width as u16, self.height as u16)
+                    }
+                    Codec::H265 => {
+                        build_h265_sample_entry(encoded, self.width as u16, self.height as u16)
+                    }
+                };
+                Some(entry)
+            } else {
+                None
             };
-            Some(entry)
-        } else {
-            None
-        };
 
-        file.write_all(&encoded.data)?;
-        let sample = Sample {
-            track_kind: TrackKind::Video,
-            sample_entry,
-            keyframe: encoded.keyframe,
-            timescale,
-            duration: 1,
-            data_offset: *data_offset,
-            data_size: encoded.data.len(),
-            composition_time_offset: None,
-        };
-        muxer.append_sample(&sample)?;
-        *data_offset += encoded.data.len() as u64;
-        Ok(())
-    };
+            self.file.write_all(&encoded.data)?;
+            let sample = Sample {
+                track_kind: TrackKind::Video,
+                sample_entry,
+                keyframe: encoded.keyframe,
+                timescale: self.timescale,
+                duration: 1,
+                data_offset: self.data_offset,
+                data_size: encoded.data.len(),
+                composition_time_offset: None,
+            };
+            self.muxer.append_sample(&sample)?;
+            self.data_offset += encoded.data.len() as u64;
+            Ok(())
+        }
+    }
+
+    let writer_state = Rc::new(RefCell::new(WriterState {
+        file,
+        muxer,
+        data_offset,
+        first_keyframe: true,
+        codec,
+        width,
+        height,
+        timescale,
+        last_error: None,
+    }));
+
+    // エンコーダーの初期化とコールバック登録
+    let writer_cb = Rc::clone(&writer_state);
+    let mut encoder = Encoder::new(move |result| {
+        let mut writer = writer_cb.borrow_mut();
+        if writer.last_error.is_some() {
+            return;
+        }
+        match result {
+            Ok(encoded) => {
+                if let Err(e) = writer.write(&encoded) {
+                    writer.last_error = Some(e);
+                }
+            }
+            Err(e) => {
+                writer.last_error = Some(Box::new(e));
+            }
+        }
+    });
+    encoder.configure(config)?;
 
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 * dt;
@@ -394,7 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             image.stride(),
         );
 
-        // エンコード
+        // エンコード（結果はコールバックから即座に MP4 に書き込まれる）
         encoder.encode(
             &FrameData::I420 {
                 y: &y,
@@ -404,15 +451,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &EncodeOptions::default(),
         )?;
 
-        // エンコード済みフレームを MP4 に書き込む
-        while let Some(encoded) = encoder.next_frame()? {
-            write_encoded_frame(
-                &encoded,
-                &mut file,
-                &mut muxer,
-                &mut data_offset,
-                &mut first_keyframe,
-            )?;
+        // コールバック内で発生したエラーは writer_state.last_error で共有される
+        if writer_state.borrow().last_error.is_some() {
+            break;
         }
 
         if (frame_idx + 1) % (fps as u64) == 0 {
@@ -425,23 +466,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 残りのフレームをフラッシュ
-    encoder.finish()?;
-    while let Some(encoded) = encoder.next_frame()? {
-        write_encoded_frame(
-            &encoded,
-            &mut file,
-            &mut muxer,
-            &mut data_offset,
-            &mut first_keyframe,
-        )?;
+    // 残りのフレームをフラッシュしてエンコーダーを閉じる
+    encoder.flush()?;
+    encoder.close()?;
+    // writer_state の Rc を 1 に戻すため encoder を明示的に drop する
+    drop(encoder);
+
+    let cell = Rc::try_unwrap(writer_state).map_err(|_| "writer state is still shared")?;
+    let mut writer = cell.into_inner();
+    if let Some(e) = writer.last_error.take() {
+        return Err(e);
     }
 
     // MP4 ファイナライズ
-    let finalized = muxer.finalize()?;
+    let finalized = writer.muxer.finalize()?;
     for (offset, bytes) in finalized.offset_and_bytes_pairs() {
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
+        writer.file.seek(SeekFrom::Start(offset))?;
+        writer.file.write_all(bytes)?;
     }
 
     println!("Done: {}", output_path);

@@ -26,13 +26,13 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 
 - Video Toolbox によるハードウェアエンコード (H.264 / H.265)
 - Video Toolbox によるハードウェアデコード (H.264 / H.265 / VP9 / AV1)
+- W3C WebCodecs 風のコールバックベース API (`Encoder::new(callback)` / `Decoder::new(callback)`)
 - コーデック固有設定を型安全に分離 (`CodecConfig` / `DecoderCodec` enum)
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的解像度変更
-  - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新
+- 動的解像度変更: エンコーダー / デコーダーともに 2 回目以降の `configure()` で設定を反映
+- `CVPixelBuffer` 所有ラッパー (`PixelBuffer`) によりゼロコピーでのパイプライン接続に対応
 - AVCC 形式の入出力
 
 ## 動作要件
@@ -64,9 +64,14 @@ DOCS_RS=1 cargo doc --no-deps
 
 ### エンコード
 
+エンコード結果はコールバック (`FnMut(Result<EncodedFrame, Error>) + 'static`) で非同期に通知されます。コールバックは `encode()` / `flush()` の呼び出し元スレッドで同期的に実行されます。
+
 ```rust
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameData,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, FrameData,
     H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
@@ -91,7 +96,14 @@ let config = EncoderConfig {
     max_frame_delay_count: None,
 };
 
-let mut encoder = Encoder::new(config)?;
+// エンコード結果をコールバックで受け取る
+let encoded: Rc<RefCell<Vec<EncodedFrame>>> = Rc::new(RefCell::new(Vec::new()));
+let sink = Rc::clone(&encoded);
+let mut encoder = Encoder::new(move |result| match result {
+    Ok(frame) => sink.borrow_mut().push(frame),
+    Err(e) => eprintln!("encoder error: {e}"),
+});
+encoder.configure(config)?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
@@ -102,25 +114,37 @@ encoder.encode(&frame, &EncodeOptions {
     force_key_frame: true,
 })?;
 
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("encoded bytes: {}", encoded.data.len());
-}
+// 残りのフレームをフラッシュしてコールバックへ流す
+encoder.flush()?;
+encoder.close()?;
 
-// 残りのフレームをフラッシュ
-encoder.finish()?;
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
+for frame in encoded.borrow().iter() {
+    println!("encoded bytes: {}, ts: {}", frame.data.len(), frame.timestamp);
 }
 ```
 
 ### デコード
 
+デコード結果はコールバック (`FnMut(Result<DecodedFrame, Error>) + 'static`) で受け取ります。プレーン参照は `DecodedFrame::pixel_buffer.lock()` から取得した `LockedPixelBuffer::{I420,Nv12}(view)` で行います。
+
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, PixelFormat};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use shiguredo_video_toolbox::{
+    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, LockedPixelBuffer, PixelFormat,
+};
+
+// デコード結果をコールバックで受け取る
+let decoded: Rc<RefCell<Vec<DecodedFrame>>> = Rc::new(RefCell::new(Vec::new()));
+let sink = Rc::clone(&decoded);
+let mut decoder = Decoder::new(move |result| match result {
+    Ok(frame) => sink.borrow_mut().push(frame),
+    Err(e) => eprintln!("decoder error: {e}"),
+});
 
 // H.264 デコーダー (SPS / PPS が必要)
-let mut decoder = Decoder::new(DecoderConfig {
+decoder.configure(DecoderConfig {
     codec: DecoderCodec::H264 {
         sps: &sps,
         pps: &pps,
@@ -129,19 +153,22 @@ let mut decoder = Decoder::new(DecoderConfig {
     pixel_format: PixelFormat::I420,
 })?;
 
-// AVCC フォーマットのデータをデコード
-if let Some(frame) = decoder.decode(&avcc_data)? {
-    match frame {
-        DecodedFrame::I420(f) => {
-            let y = f.y_plane();
-            let u = f.u_plane();
-            let v = f.v_plane();
-            println!("{}x{}", f.width(), f.height());
+// AVCC フォーマットのデータをデコード (timestamp は呼び出し側で管理する)
+decoder.decode(&avcc_data, 0)?;
+
+for frame in decoded.borrow().iter() {
+    let locked = frame.pixel_buffer.lock()?;
+    match locked {
+        LockedPixelBuffer::I420(view) => {
+            let y = view.y_plane();
+            let u = view.u_plane();
+            let v = view.v_plane();
+            println!("{}x{} (ts={})", view.width(), view.height(), frame.timestamp);
         }
-        DecodedFrame::Nv12(f) => {
-            let y = f.y_plane();
-            let uv = f.uv_plane();
-            println!("{}x{}", f.width(), f.height());
+        LockedPixelBuffer::Nv12(view) => {
+            let y = view.y_plane();
+            let uv = view.uv_plane();
+            println!("{}x{} (ts={})", view.width(), view.height(), frame.timestamp);
         }
     }
 }
@@ -244,7 +271,7 @@ for info in supported_codecs() {
 
 VP9 と AV1 はハードウェアサポートに依存するため、環境によっては利用できない場合があります。
 
-デコード初期化時のエラーは次のように分かれます。
+デコード初期化時（`configure()`）のエラーは次のように分かれます。
 
 - **環境が VP9 / AV1 デコードに対応していない**など、Video Toolbox が失敗した場合は `Error::UnsupportedCodec` が返されます。
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
@@ -252,11 +279,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 ```rust
 use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
 
-match Decoder::new(DecoderConfig {
+let mut decoder = Decoder::new(|_| { /* デコード結果コールバック */ });
+match decoder.configure(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
 }) {
-    Ok(decoder) => { /* デコード処理 */ }
+    Ok(()) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
     }
@@ -273,13 +301,14 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 
 ### エンコーダー
 
-`reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
+2 回目以降の `configure()` を呼び出すことで、新しい設定でエンコーダーセッションを再作成できます。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、`next_frame()` で取得できます。
+Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームを失いたくない場合は、事前に `flush()` を呼んでコールバック経由で取り出してください（2 回目以降の `configure()` は未出力フレームを破棄します）。
 
 ```rust
-// 動的に解像度を変更
-// 未出力フレームは自動的にフラッシュされる
+// 未出力フレームをコールバックに流してから再設定する
+encoder.flush()?;
+
 let new_config = EncoderConfig {
     width: 1280,
     height: 720,
@@ -300,46 +329,33 @@ let new_config = EncoderConfig {
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
 };
-encoder.reconfigure(new_config)?;
-
-// フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
+encoder.configure(new_config)?;
 ```
 
 ### デコーダー
 
-`update_format()` で新しいパラメータセットや解像度を渡してフォーマットを更新できます。H.264 / H.265 / VP9 / AV1 すべてのコーデックに対応しています。
+デコーダーも 2 回目以降の `configure()` を呼び出すことで、新しいパラメータセットや解像度を反映できます。H.264 / H.265 / VP9 / AV1 すべてのコーデックに対応しています。
 
-Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合はセッションを流用、不可能な場合のみセッションを再作成します。
+Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合は `CMVideoFormatDescription` のみ差し替え、不可能な場合はセッションを再作成します。
 
 ```rust
 // H.264: SPS/PPS が更新された場合
-decoder.update_format(DecoderCodec::H264 {
-    sps: &new_sps,
-    pps: &new_pps,
-    nalu_len_bytes: 4,
-})?;
-
-// H.265: VPS/SPS/PPS が更新された場合
-decoder.update_format(DecoderCodec::Hevc {
-    vps: &new_vps,
-    sps: &new_sps,
-    pps: &new_pps,
-    nalu_len_bytes: 4,
+decoder.configure(DecoderConfig {
+    codec: DecoderCodec::H264 {
+        sps: &new_sps,
+        pps: &new_pps,
+        nalu_len_bytes: 4,
+    },
+    pixel_format: PixelFormat::I420,
 })?;
 
 // VP9: 解像度が変更された場合
-decoder.update_format(DecoderCodec::Vp9 {
-    width: 1280,
-    height: 720,
-})?;
-
-// AV1: 解像度が変更された場合
-decoder.update_format(DecoderCodec::Av1 {
-    width: 1280,
-    height: 720,
+decoder.configure(DecoderConfig {
+    codec: DecoderCodec::Vp9 {
+        width: 1280,
+        height: 720,
+    },
+    pixel_format: PixelFormat::I420,
 })?;
 ```
 
@@ -347,9 +363,9 @@ decoder.update_format(DecoderCodec::Av1 {
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| メソッド | `reconfigure()` | `update_format()` |
+| メソッド | 2 回目以降の `configure()` | 2 回目以降の `configure()` |
 | 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
+| 事前処理 | 未出力を失いたくない場合は `flush()` | 特になし |
 
 ## ライセンス
 

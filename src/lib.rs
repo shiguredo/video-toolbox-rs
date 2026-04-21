@@ -9,9 +9,7 @@
 compile_error!("this crate only supports macOS");
 
 use std::{
-    collections::HashMap,
     ffi::{c_int, c_void},
-    marker::PhantomData,
     mem::MaybeUninit,
     num::NonZeroU32,
     time::Duration,
@@ -72,6 +70,13 @@ pub enum Error {
         /// 関数名
         function: &'static str,
     },
+    /// ライフサイクル状態に反する操作（未 configure / close 済みで encode 等）
+    InvalidState {
+        /// 試みた操作名
+        operation: &'static str,
+        /// 現在の状態名（"unconfigured" または "closed"）
+        state: &'static str,
+    },
 }
 
 impl Error {
@@ -127,6 +132,54 @@ impl std::fmt::Display for Error {
                     function
                 )
             }
+            Self::InvalidState { operation, state } => {
+                write!(
+                    f,
+                    "invalid state: {operation}() is not allowed while {state}"
+                )
+            }
+        }
+    }
+}
+
+/// エンコーダーのライフサイクル状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderState {
+    /// `configure()` 未実行
+    Unconfigured,
+    /// `configure()` 済みで `encode()` を受け付ける状態
+    Configured,
+    /// `close()` 済み。以降の操作は `Error::InvalidState` を返す
+    Closed,
+}
+
+impl EncoderState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Configured => "configured",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// デコーダーのライフサイクル状態
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderState {
+    /// `configure()` 未実行
+    Unconfigured,
+    /// `configure()` 済みで `decode()` を受け付ける状態
+    Configured,
+    /// `close()` 済み。以降の操作は `Error::InvalidState` を返す
+    Closed,
+}
+
+impl DecoderState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unconfigured => "unconfigured",
+            Self::Configured => "configured",
+            Self::Closed => "closed",
         }
     }
 }
@@ -315,71 +368,183 @@ pub enum FrameData<'a> {
 
 /// H.264 / H.265 エンコーダー
 ///
-/// エンコードコールバックは未制限バッファの [`std::sync::mpsc::channel`] にフレームを送る。
-/// 受信側が [`Encoder::next_frame`] を十分な頻度で呼ばないと、チャネルおよび内部の `output_frames` に
-/// データが滞留し、メモリ使用量が増え続ける可能性がある。
-#[derive(Debug)]
+/// WebCodecs 風のコールバックベース API を提供する。
+/// [`Encoder::new`] でコールバックを登録し、[`Encoder::configure`] で設定を反映する。
+/// エンコード結果は [`Encoder::encode`] / [`Encoder::flush`] の呼び出し元スレッドで、
+/// 内部 mpsc を drain してからコールバックに `Ok(EncodedFrame)` / `Err(Error)` の形で同期渡しされる。
+///
+/// `allow_frame_reordering: false` 前提のため、VT からの出力は入力順と一致する想定である。
 pub struct Encoder {
-    session: sys::VTCompressionSessionRef,
-    config: EncoderConfig,
+    session: Option<sys::VTCompressionSessionRef>,
+    config: Option<EncoderConfig>,
     next_input_pts: i64,
-    next_output_pts: i64,
-    output_frames: HashMap<i64, EncodedFrame>, // キーは pts
+    input_frame_count: u64,
+    output_frame_count: u64,
     encoded_frame_rx: std::sync::mpsc::Receiver<EncodedFrame>,
-
     encoded_frame_tx: Box<std::sync::mpsc::Sender<EncodedFrame>>,
+    callback: Box<dyn FnMut(Result<EncodedFrame, Error>) + 'static>,
+    state: EncoderState,
+}
+
+impl std::fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Encoder")
+            .field("state", &self.state)
+            .field("config", &self.config)
+            .field("next_input_pts", &self.next_input_pts)
+            .field("input_frame_count", &self.input_frame_count)
+            .field("output_frame_count", &self.output_frame_count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Encoder {
-    /// エンコーダーのインスタンスを生成する
-    pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+    /// エンコード結果を受け取るコールバックを登録してインスタンスを生成する
+    ///
+    /// 戻り値は [`EncoderState::Unconfigured`] 状態。続けて [`Encoder::configure`] を呼ぶと
+    /// [`EncoderState::Configured`] に遷移する。
+    /// コールバックは [`Encoder::encode`] / [`Encoder::flush`] の呼び出し元スレッドで同期的に実行される。
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame, Error>) + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Box::new(tx);
+        Self {
+            session: None,
+            config: None,
+            next_input_pts: 0,
+            input_frame_count: 0,
+            output_frame_count: 0,
+            encoded_frame_rx: rx,
+            encoded_frame_tx: tx,
+            callback: Box::new(callback),
+            state: EncoderState::Unconfigured,
+        }
+    }
+
+    /// 設定を反映してエンコーダーセッションを作成する
+    ///
+    /// - [`EncoderState::Unconfigured`] で呼び出すと新規セッションを作成し Configured に遷移する
+    /// - [`EncoderState::Configured`] で呼び出すと既存セッションを破棄して新しい設定で再作成する
+    ///   このとき未出力フレームは破棄されるため、失いたくない場合は事前に [`Encoder::flush`] を呼ぶこと
+    /// - [`EncoderState::Closed`] で呼び出すと [`Error::InvalidState`] を返す
+    // VT コールバックに渡すポインタは新セッション専用の `Box` を指す必要があるため、
+    // 失敗時の整合性を優先して既存 `Box` の中身を差し替えるのではなく全体を入れ替える
+    #[allow(clippy::replace_box)]
+    pub fn configure(&mut self, config: EncoderConfig) -> Result<(), Error> {
+        if self.state == EncoderState::Closed {
+            return Err(Error::InvalidState {
+                operation: "configure",
+                state: self.state.name(),
+            });
+        }
         Self::validate_config(&config)?;
+
+        // 失敗時に self が不整合にならないよう、既存セッションの破棄より前に新しいセッションを作成する
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Box::new(tx);
         let session = unsafe { Self::create_compression_session(&config, &tx)? };
 
-        Ok(Self {
-            session,
-            config,
-            next_input_pts: 0,
-            next_output_pts: 0,
-            output_frames: HashMap::new(),
-            encoded_frame_tx: tx,
-            encoded_frame_rx: rx,
-        })
-    }
-
-    /// 新しい設定でエンコーダーを再作成する
-    ///
-    /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
-    /// 新しい設定でセッションを再作成する。
-    /// フラッシュされたフレームは `next_frame()` で取得できる。
-    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
-        Self::validate_config(&config)?;
-        // 未出力フレームをフラッシュ
-        self.finish()?;
-
-        unsafe {
-            // チャネルを再作成し、新しいセッションを先に作成する
-            // 失敗時に self が不整合にならないようにする
-            let (tx, rx) = std::sync::mpsc::channel();
-            let tx = Box::new(tx);
-            let session = Self::create_compression_session(&config, &tx)?;
-
-            // 新しいセッションの作成に成功してから既存のセッションを破棄する
-            sys::VTCompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
-
-            self.session = session;
-            self.config = config;
-            self.next_input_pts = 0;
-            self.next_output_pts = 0;
-            self.output_frames.clear();
-            self.encoded_frame_tx = tx;
-            self.encoded_frame_rx = rx;
+        if let Some(old_session) = self.session.take() {
+            unsafe {
+                sys::VTCompressionSessionInvalidate(old_session);
+                sys::CFRelease(old_session as *const c_void);
+            }
         }
 
+        self.session = Some(session);
+        self.config = Some(config);
+        self.next_input_pts = 0;
+        self.input_frame_count = 0;
+        self.output_frame_count = 0;
+        self.encoded_frame_rx = rx;
+        self.encoded_frame_tx = tx;
+        self.state = EncoderState::Configured;
         Ok(())
+    }
+
+    /// 現在の状態を返す
+    pub fn state(&self) -> EncoderState {
+        self.state
+    }
+
+    /// 入力済みフレーム数のうち、まだコールバックに渡していない件数を返す
+    ///
+    /// WebCodecs の `VideoEncoder.encodeQueueSize` 相当。
+    /// `input_frame_count` と `output_frame_count` の差分で表現する。
+    pub fn encode_queue_size(&self) -> usize {
+        self.input_frame_count
+            .saturating_sub(self.output_frame_count)
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// 未処理フレームを破棄し、セッションを破棄して [`EncoderState::Unconfigured`] に戻す
+    ///
+    /// [`EncoderState::Closed`] で呼び出すと [`Error::InvalidState`] を返す。
+    pub fn reset(&mut self) -> Result<(), Error> {
+        if self.state == EncoderState::Closed {
+            return Err(Error::InvalidState {
+                operation: "reset",
+                state: self.state.name(),
+            });
+        }
+        self.teardown_session();
+        // mpsc を空にして滞留を破棄する。既存 `Box` のヒープは使い回す
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.encoded_frame_rx = rx;
+        *self.encoded_frame_tx = tx;
+        self.config = None;
+        self.next_input_pts = 0;
+        self.input_frame_count = 0;
+        self.output_frame_count = 0;
+        self.state = EncoderState::Unconfigured;
+        Ok(())
+    }
+
+    /// エンコーダーを閉じる
+    ///
+    /// 冪等で、[`EncoderState::Closed`] で再度呼ばれても何もしない。
+    /// 以降の [`Encoder::encode`] / [`Encoder::configure`] などは [`Error::InvalidState`] を返す。
+    pub fn close(&mut self) -> Result<(), Error> {
+        if self.state == EncoderState::Closed {
+            return Ok(());
+        }
+        self.teardown_session();
+        self.config = None;
+        self.state = EncoderState::Closed;
+        Ok(())
+    }
+
+    fn teardown_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            unsafe {
+                sys::VTCompressionSessionInvalidate(session);
+                sys::CFRelease(session as *const c_void);
+            }
+        }
+    }
+
+    fn ensure_configured(&self, operation: &'static str) -> Result<(), Error> {
+        if self.state != EncoderState::Configured {
+            return Err(Error::InvalidState {
+                operation,
+                state: self.state.name(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 内部 mpsc を drain してコールバックへ転送する
+    ///
+    /// 呼び出し元スレッドで同期的に `callback` を呼ぶ。B フレーム非対応前提のため並べ替えは行わず、
+    /// VT からの到着順でそのまま通知する。
+    fn drain_output(&mut self) {
+        while let Ok(frame) = self.encoded_frame_rx.try_recv() {
+            self.output_frame_count = self.output_frame_count.saturating_add(1);
+            (self.callback)(Ok(frame));
+        }
     }
 
     /// EncoderConfig と Sender から VTCompressionSession を作成する
@@ -801,22 +966,38 @@ impl Encoder {
     ///
     /// また B フレームは扱わない前提（つまり入力フレームと出力フレームの順番が一致する）
     pub fn encode(&mut self, frame: &FrameData<'_>, options: &EncodeOptions) -> Result<(), Error> {
+        self.ensure_configured("encode")?;
+        let session = self
+            .session
+            .expect("Configured state implies session is Some");
+
         // Video Toolbox は CVPixelBuffer 単位でフォーマットを持つためフレームごとに変更可能だが、
         // このライブラリでは EncoderConfig.pixel_format でセッション全体のフォーマットを固定している。
         // FrameData のバリアントが EncoderConfig.pixel_format と一致しない場合はエラーとする。
+        let (width, height, fps_numerator, fps_denominator, pixel_format) = {
+            let config = self
+                .config
+                .as_ref()
+                .expect("Configured state implies config is Some");
+            (
+                config.width as usize,
+                config.height as usize,
+                config.fps_numerator,
+                config.fps_denominator,
+                config.pixel_format,
+            )
+        };
+
         let actual = match frame {
             FrameData::I420 { .. } => PixelFormat::I420,
             FrameData::Nv12 { .. } => PixelFormat::Nv12,
         };
-        if actual != self.config.pixel_format {
+        if actual != pixel_format {
             return Err(Error::PixelFormatMismatch {
-                expected: self.config.pixel_format,
+                expected: pixel_format,
                 actual,
             });
         }
-
-        let width = self.config.width as usize;
-        let height = self.config.height as usize;
 
         // 入力データの長さを検証
         Self::validate_frame_data(frame, width, height)?;
@@ -889,9 +1070,9 @@ impl Encoder {
             };
 
             let status = sys::VTCompressionSessionEncodeFrame(
-                self.session,
+                session,
                 image_buffer.0,
-                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
+                sys::CMTimeMake(self.next_input_pts, fps_numerator as i32),
                 sys::kCMTimeInvalid,
                 frame_properties,
                 std::ptr::null_mut(),
@@ -901,13 +1082,15 @@ impl Encoder {
 
             self.next_input_pts = self
                 .next_input_pts
-                .checked_add(self.config.fps_denominator as i64)
+                .checked_add(fps_denominator as i64)
                 .ok_or(Error::LimitExceeded {
                     reason: "input presentation timestamp overflow",
                 })?;
-
-            Ok(())
         }
+
+        self.input_frame_count = self.input_frame_count.saturating_add(1);
+        self.drain_output();
+        Ok(())
     }
 
     /// CVPixelBuffer を直接エンコードする（ゼロコピー）
@@ -928,6 +1111,22 @@ impl Encoder {
         pixel_buffer_ptr: *mut c_void,
         options: &EncodeOptions,
     ) -> Result<(), Error> {
+        self.ensure_configured("encode_pixel_buffer")?;
+        let session = self
+            .session
+            .expect("Configured state implies session is Some");
+        let (fps_numerator, fps_denominator, pixel_format) = {
+            let config = self
+                .config
+                .as_ref()
+                .expect("Configured state implies config is Some");
+            (
+                config.fps_numerator,
+                config.fps_denominator,
+                config.pixel_format,
+            )
+        };
+
         unsafe {
             // ピクセルフォーマットの検証
             let format_type = sys::CVPixelBufferGetPixelFormatType(pixel_buffer_ptr.cast());
@@ -937,19 +1136,19 @@ impl Encoder {
                 _ => {
                     // 未知のフォーマットは I420 でも Nv12 でもないので、
                     // どちらを actual にしても不一致になる。期待値の逆を返す。
-                    let actual = match self.config.pixel_format {
+                    let actual = match pixel_format {
                         PixelFormat::I420 => PixelFormat::Nv12,
                         PixelFormat::Nv12 => PixelFormat::I420,
                     };
                     return Err(Error::PixelFormatMismatch {
-                        expected: self.config.pixel_format,
+                        expected: pixel_format,
                         actual,
                     });
                 }
             };
-            if actual != self.config.pixel_format {
+            if actual != pixel_format {
                 return Err(Error::PixelFormatMismatch {
-                    expected: self.config.pixel_format,
+                    expected: pixel_format,
                     actual,
                 });
             }
@@ -973,9 +1172,9 @@ impl Encoder {
             };
 
             let status = sys::VTCompressionSessionEncodeFrame(
-                self.session,
+                session,
                 image_buffer.0,
-                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
+                sys::CMTimeMake(self.next_input_pts, fps_numerator as i32),
                 sys::kCMTimeInvalid,
                 frame_properties,
                 std::ptr::null_mut(),
@@ -985,68 +1184,33 @@ impl Encoder {
 
             self.next_input_pts = self
                 .next_input_pts
-                .checked_add(self.config.fps_denominator as i64)
+                .checked_add(fps_denominator as i64)
                 .ok_or(Error::LimitExceeded {
                     reason: "input presentation timestamp overflow",
                 })?;
-
-            Ok(())
         }
-    }
 
-    /// これ以上データが来ないことをエンコーダーに伝える
-    ///
-    /// 残りのエンコード結果は [`Encoder::next_frame()`] で取得できる
-    pub fn finish(&mut self) -> Result<(), Error> {
-        unsafe {
-            let status = sys::VTCompressionSessionCompleteFrames(self.session, sys::kCMTimeInvalid);
-            Error::check(status, "VTCompressionSessionCompleteFrames")?;
-        }
+        self.input_frame_count = self.input_frame_count.saturating_add(1);
+        self.drain_output();
         Ok(())
     }
 
-    /// エンコード済みのフレームを取り出す
+    /// 保留中のエンコード要求をすべて処理し、結果をコールバックへ転送する
     ///
-    /// PTS 順に出力するため HashMap でバッファリングしている。
-    /// `next_output_pts` は `0` から始まり、成功のたびに `fps_denominator` だけ加算される。
-    /// **この値と一致する PTS** のフレームだけが順に返る。
-    ///
-    /// バックエンドが返すサンプルの PTS がその列から外れる（欠番・順不同・刻みの不一致）と、
-    /// 一致するキーが存在せず **繰り返し `None` になり得る**。
-    /// その間、別 PTS のフレームは `output_frames` に残り、メモリが増え続ける可能性がある。
-    /// `allow_frame_reordering: false` を前提としており、B フレームなどで PTS が飛ぶ構成には対応していない。
-    ///
-    /// 入力には `CMTimeMake(next_input_pts, fps_numerator as i32)` を用い、出力は `CMSampleBuffer` の PTS の整数部を使う。
-    /// 入力ステップと出力 PTS のスケールが一致しないと、上記のギャップが起きやすい。
-    ///
-    /// 出力側 PTS の加算が `i64` で表現できなくなった場合は [`Error::LimitExceeded`] を返す。
-    /// その場合でも **まだ取り出していない**エンコード済みフレームは `output_frames` に残る。
-    ///
-    /// チャネルに新しいフレームが届いていなくても、過去の呼び出しでバッファした `output_frames` があれば取出す。
-    pub fn next_frame(&mut self) -> Result<Option<EncodedFrame>, Error> {
-        if let Ok(frame) = self.encoded_frame_rx.try_recv() {
-            let pts = frame.pts;
-            if let Some(_dropped) = self.output_frames.insert(pts, frame) {
-                log::warn!(
-                    "duplicate encoded frame at pts={pts}, previous frame with same pts was dropped"
-                );
-            }
+    /// `VTCompressionSessionCompleteFrames` を呼んで VT 側の未出力フレームをフラッシュし、
+    /// 続いて内部 mpsc を drain してコールバックへ同期的に渡す。
+    /// [`EncoderState::Configured`] 以外で呼ぶと [`Error::InvalidState`] を返す。
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.ensure_configured("flush")?;
+        let session = self
+            .session
+            .expect("Configured state implies session is Some");
+        unsafe {
+            let status = sys::VTCompressionSessionCompleteFrames(session, sys::kCMTimeInvalid);
+            Error::check(status, "VTCompressionSessionCompleteFrames")?;
         }
-        if !self.output_frames.contains_key(&self.next_output_pts) {
-            return Ok(None);
-        }
-        // `remove` より先に加算可否を検証し、失敗時にフレームをドロップしない
-        let next_pts = self
-            .next_output_pts
-            .checked_add(self.config.fps_denominator as i64)
-            .ok_or(Error::LimitExceeded {
-                reason: "output presentation timestamp overflow",
-            })?;
-        let Some(out) = self.output_frames.remove(&self.next_output_pts) else {
-            return Ok(None);
-        };
-        self.next_output_pts = next_pts;
-        Ok(Some(out))
+        self.drain_output();
+        Ok(())
     }
 
     unsafe extern "C" fn output_callback_h264(
@@ -1154,7 +1318,7 @@ impl Encoder {
                 pps_list,
                 vps_list,
                 data,
-                pts: pts.value,
+                timestamp: pts.value,
             };
 
             // `output_callback_ref_con` は `create_compression_session` が `VTCompressionSessionCreate` に渡した
@@ -1303,9 +1467,11 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        unsafe {
-            sys::VTCompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
+        if let Some(session) = self.session.take() {
+            unsafe {
+                sys::VTCompressionSessionInvalidate(session);
+                sys::CFRelease(session as *const c_void);
+            }
         }
     }
 }
@@ -1333,7 +1499,10 @@ pub struct EncodedFrame {
     /// 圧縮データ
     pub data: Vec<u8>,
 
-    pts: i64,
+    /// `CMSampleBuffer` の Presentation Time Stamp 整数部
+    ///
+    /// エンコーダー入力時の `CMTimeMake(next_input_pts, fps_numerator)` と整合する値が入る。
+    pub timestamp: i64,
 }
 
 /// パラメータセット 1 個あたりのコピー上限（バイト）。
@@ -1451,34 +1620,185 @@ pub struct DecoderConfig<'a> {
 }
 
 /// H.264 / H.265 / VP9 / AV1 デコーダー
-#[derive(Debug)]
+///
+/// WebCodecs 風のコールバックベース API を提供する。
+/// [`Decoder::new`] でコールバックを登録し、[`Decoder::configure`] で設定を反映する。
+/// デコード結果は [`Decoder::decode`] の呼び出し元スレッドで、
+/// コールバックに `Ok(DecodedFrame)` / `Err(Error)` の形で同期渡しされる。
 pub struct Decoder {
-    description: sys::CMVideoFormatDescriptionRef,
-    session: sys::VTDecompressionSessionRef,
-    pixel_format: PixelFormat,
+    description: Option<sys::CMVideoFormatDescriptionRef>,
+    session: Option<sys::VTDecompressionSessionRef>,
+    pixel_format: Option<PixelFormat>,
+    callback: Box<dyn FnMut(Result<DecodedFrame, Error>) + 'static>,
+    state: DecoderState,
+}
+
+impl std::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Decoder")
+            .field("state", &self.state)
+            .field("pixel_format", &self.pixel_format)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Decoder {
-    /// デコーダーのインスタンスを生成する
-    pub fn new(config: DecoderConfig<'_>) -> Result<Self, Error> {
-        unsafe {
-            let description = Self::create_format_description(&config.codec)
-                .map_err(|e| Self::wrap_unsupported_codec_error(&config.codec, e))?;
-            let session = Self::create_decompression_session(description, config.pixel_format)
-                .map_err(|e| {
-                    sys::CFRelease(description as *const c_void);
-                    Self::wrap_unsupported_codec_error(&config.codec, e)
-                })?;
-
-            Ok(Self {
-                description,
-                session,
-                pixel_format: config.pixel_format,
-            })
+    /// デコード結果を受け取るコールバックを登録してインスタンスを生成する
+    ///
+    /// 戻り値は [`DecoderState::Unconfigured`] 状態。続けて [`Decoder::configure`] を呼ぶと
+    /// [`DecoderState::Configured`] に遷移する。
+    /// コールバックは [`Decoder::decode`] / [`Decoder::flush`] の呼び出し元スレッドで同期的に実行される。
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: FnMut(Result<DecodedFrame, Error>) + 'static,
+    {
+        Self {
+            description: None,
+            session: None,
+            pixel_format: None,
+            callback: Box::new(callback),
+            state: DecoderState::Unconfigured,
         }
     }
 
-    /// VP9/AV1 コーデックの場合、Video Toolbox の失敗のみ `UnsupportedCodec` に変換する（設定不整合の `InvalidConfig` はそのまま返す）。
+    /// 設定を反映してデコーダーセッションを作成する
+    ///
+    /// - [`DecoderState::Unconfigured`] で呼び出すと新規セッションを作成し Configured に遷移する
+    /// - [`DecoderState::Configured`] で呼び出した場合、`pixel_format` が一致し、
+    ///   `VTDecompressionSessionCanAcceptFormatDescription()` が受け入れ可能と判定したときは
+    ///   `CMVideoFormatDescription` のみ差し替える。それ以外は既存セッションを破棄して再作成する
+    /// - [`DecoderState::Closed`] で呼び出すと [`Error::InvalidState`] を返す
+    pub fn configure(&mut self, config: DecoderConfig<'_>) -> Result<(), Error> {
+        if self.state == DecoderState::Closed {
+            return Err(Error::InvalidState {
+                operation: "configure",
+                state: self.state.name(),
+            });
+        }
+        unsafe {
+            let new_description = Self::create_format_description(&config.codec)
+                .map_err(|e| Self::wrap_unsupported_codec_error(&config.codec, e))?;
+
+            // 既存セッションを流用できるかを判定する
+            if self.state == DecoderState::Configured
+                && self.pixel_format == Some(config.pixel_format)
+                && let Some(session) = self.session
+            {
+                let can_accept =
+                    sys::VTDecompressionSessionCanAcceptFormatDescription(session, new_description);
+                if can_accept != 0 {
+                    if let Some(old_description) = self.description.take() {
+                        sys::CFRelease(old_description as *const c_void);
+                    }
+                    self.description = Some(new_description);
+                    return Ok(());
+                }
+            }
+
+            // 新セッションを先に作成して、失敗時に self が不整合にならないようにする
+            let new_session =
+                Self::create_decompression_session(new_description, config.pixel_format).map_err(
+                    |e| {
+                        sys::CFRelease(new_description as *const c_void);
+                        Self::wrap_unsupported_codec_error(&config.codec, e)
+                    },
+                )?;
+
+            if let Some(old_session) = self.session.take() {
+                sys::VTDecompressionSessionInvalidate(old_session);
+                sys::CFRelease(old_session as *const c_void);
+            }
+            if let Some(old_description) = self.description.take() {
+                sys::CFRelease(old_description as *const c_void);
+            }
+
+            self.description = Some(new_description);
+            self.session = Some(new_session);
+            self.pixel_format = Some(config.pixel_format);
+            self.state = DecoderState::Configured;
+        }
+        Ok(())
+    }
+
+    /// 現在の状態を返す
+    pub fn state(&self) -> DecoderState {
+        self.state
+    }
+
+    /// VT 側の未処理フレームをフラッシュする
+    ///
+    /// `VTDecompressionSessionFinishDelayedFrames` 相当の処理を呼び、
+    /// 結果のコールバック通知が完了するのを待つ。デコードは同期的に完了するため、
+    /// 現状は呼び出しても追加のコールバック発火は無いが、将来の非同期化や
+    /// ライフサイクル遷移の明示化のために API として提供する。
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.ensure_configured("flush")?;
+        let session = self
+            .session
+            .expect("Configured state implies session is Some");
+        unsafe {
+            let status = sys::VTDecompressionSessionFinishDelayedFrames(session);
+            Error::check(status, "VTDecompressionSessionFinishDelayedFrames")?;
+        }
+        Ok(())
+    }
+
+    /// 未処理フレームを破棄してセッションも破棄し、[`DecoderState::Unconfigured`] に戻す
+    ///
+    /// [`DecoderState::Closed`] で呼び出すと [`Error::InvalidState`] を返す。
+    pub fn reset(&mut self) -> Result<(), Error> {
+        if self.state == DecoderState::Closed {
+            return Err(Error::InvalidState {
+                operation: "reset",
+                state: self.state.name(),
+            });
+        }
+        self.teardown_session();
+        self.pixel_format = None;
+        self.state = DecoderState::Unconfigured;
+        Ok(())
+    }
+
+    /// デコーダーを閉じる
+    ///
+    /// 冪等で、[`DecoderState::Closed`] で再度呼ばれても何もしない。
+    /// 以降の [`Decoder::decode`] / [`Decoder::configure`] などは [`Error::InvalidState`] を返す。
+    pub fn close(&mut self) -> Result<(), Error> {
+        if self.state == DecoderState::Closed {
+            return Ok(());
+        }
+        self.teardown_session();
+        self.pixel_format = None;
+        self.state = DecoderState::Closed;
+        Ok(())
+    }
+
+    fn teardown_session(&mut self) {
+        if let Some(session) = self.session.take() {
+            unsafe {
+                sys::VTDecompressionSessionInvalidate(session);
+                sys::CFRelease(session as *const c_void);
+            }
+        }
+        if let Some(description) = self.description.take() {
+            unsafe {
+                sys::CFRelease(description as *const c_void);
+            }
+        }
+    }
+
+    fn ensure_configured(&self, operation: &'static str) -> Result<(), Error> {
+        if self.state != DecoderState::Configured {
+            return Err(Error::InvalidState {
+                operation,
+                state: self.state.name(),
+            });
+        }
+        Ok(())
+    }
+
+    /// VP9/AV1 コーデックの場合、Video Toolbox の失敗のみ `UnsupportedCodec` に変換する
+    /// （設定不整合の `InvalidConfig` はそのまま返す）。
     fn wrap_unsupported_codec_error(codec: &DecoderCodec<'_>, error: Error) -> Error {
         match codec {
             DecoderCodec::Vp9 { .. } => match error {
@@ -1490,48 +1810,6 @@ impl Decoder {
                 _ => error,
             },
             _ => error,
-        }
-    }
-
-    /// 新しいパラメータセットでデコーダーのフォーマットを更新する
-    ///
-    /// Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で
-    /// 現在のセッションが新しい FormatDescription を受け入れ可能か判定し、
-    /// 受け入れ不可能な場合はセッションを再作成する。
-    /// 受け入れ可能な場合は FormatDescription のみ更新する。
-    pub fn update_format(&mut self, codec: DecoderCodec<'_>) -> Result<(), Error> {
-        unsafe {
-            let new_description = Self::create_format_description(&codec)?;
-
-            let can_accept = sys::VTDecompressionSessionCanAcceptFormatDescription(
-                self.session,
-                new_description,
-            );
-
-            if can_accept != 0 {
-                // 受け入れ可能: description のみ差し替え
-                sys::CFRelease(self.description as *const c_void);
-                self.description = new_description;
-            } else {
-                // 受け入れ不可能: セッションを再作成
-                // 新しいセッションを先に作成し、失敗時に self が不整合にならないようにする
-                let new_session =
-                    match Self::create_decompression_session(new_description, self.pixel_format) {
-                        Ok(session) => session,
-                        Err(e) => {
-                            sys::CFRelease(new_description as *const c_void);
-                            return Err(e);
-                        }
-                    };
-
-                sys::VTDecompressionSessionInvalidate(self.session);
-                sys::CFRelease(self.session as *const c_void);
-                sys::CFRelease(self.description as *const c_void);
-                self.description = new_description;
-                self.session = new_session;
-            }
-
-            Ok(())
         }
     }
 
@@ -1647,22 +1925,35 @@ impl Decoder {
 
     /// 圧縮された映像フレームをデコードする
     ///
-    /// `owned`（圧縮データの `Vec`）は `CMBlockBufferCreateWithMemoryBlock` が参照する。
     /// `VTDecompressionSessionDecodeFrame` はこの関数内で同期的に完了するため、
-    /// ブロックバッファとサンプルバッファが解放される前にピクセルバッファの内容が確定する。
-    /// `kCFAllocatorNull` により `Vec` のヒープ領域は CoreMedia 側で解放されない。
-    pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame<'_>>, Error> {
+    /// 戻り時にはデコード結果が登録コールバックへ `Ok(DecodedFrame)` として渡されている
+    /// （フレームドロップや VT の復帰不可能なエラーでは何も通知しない場合がある）。
+    /// `timestamp` はそのまま `DecodedFrame::timestamp` に転送される（WebCodecs の `EncodedVideoChunk.timestamp` 相当）。
+    /// 呼び出し元で PTS を管理している場合はそれを渡し、不要なら `0` を渡す。
+    /// [`DecoderState::Configured`] 以外で呼ぶと [`Error::InvalidState`] を返す。
+    pub fn decode(&mut self, data: &[u8], timestamp: i64) -> Result<(), Error> {
+        self.ensure_configured("decode")?;
+        let session = self
+            .session
+            .expect("Configured state implies session is Some");
+        let description = self
+            .description
+            .expect("Configured state implies description is Some");
+        let pixel_format = self
+            .pixel_format
+            .expect("Configured state implies pixel_format is Some");
+
         // `CMBlockBufferCreateWithMemoryBlock` に渡すメモリを `Vec` で所有する。
         // `&[u8]` からミュータブルポインタを渡すとエイリアス規則上の未定義動作の余地があるため、
         // コピーで所有権を明確にする（CoreMedia はデコード時に参照するのみ）。
         let owned = data.to_vec();
-        unsafe {
+        let raw_pixel_buffer = unsafe {
             let mut block_buffer = std::ptr::null_mut();
             let status = sys::CMBlockBufferCreateWithMemoryBlock(
                 std::ptr::null_mut(),
                 owned.as_ptr().cast_mut().cast(),
                 owned.len(),
-                sys::kCFAllocatorNull, // data の自動解放を Video Toolbox 側で行わないようにする
+                sys::kCFAllocatorNull,
                 std::ptr::null(),
                 0,
                 owned.len(),
@@ -1676,7 +1967,7 @@ impl Decoder {
             let status = sys::CMSampleBufferCreateReady(
                 std::ptr::null_mut(),
                 block_buffer.0,
-                self.description,
+                description,
                 1,
                 0,
                 [].as_ptr(),
@@ -1691,7 +1982,7 @@ impl Decoder {
             let mut info_flags = 0;
             let mut image_buffer: sys::CVImageBufferRef = std::ptr::null_mut();
             let status = sys::VTDecompressionSessionDecodeFrame(
-                self.session,
+                session,
                 sample_buffer.0,
                 decode_flags,
                 ((&mut image_buffer) as *mut sys::CVImageBufferRef).cast(),
@@ -1699,27 +1990,25 @@ impl Decoder {
             );
             Error::check(status, "VTDecompressionSessionDecodeFrame")?;
 
-            if image_buffer.is_null() {
-                return Ok(None);
-            }
+            image_buffer
+        };
 
-            let image_buffer = CfPtrMut(image_buffer);
-            let flags_readonly = 1;
-            let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly);
-            Error::check(status, "CVPixelBufferLockBaseAddress")?;
-
-            let frame = match self.pixel_format {
-                PixelFormat::I420 => DecodedFrame::I420(I420Frame {
-                    inner: image_buffer,
-                    _lifetime: PhantomData,
-                }),
-                PixelFormat::Nv12 => DecodedFrame::Nv12(Nv12Frame {
-                    inner: image_buffer,
-                    _lifetime: PhantomData,
-                }),
-            };
-            Ok(Some(frame))
+        if raw_pixel_buffer.is_null() {
+            // フレームドロップまたは VT が NULL を返したケース。コールバックは呼ばない。
+            return Ok(());
         }
+
+        // `Decoder::output_callback` が `CFRetain` 済みなので、ここで所有権を `PixelBuffer` に引き継ぐ。
+        let pixel_buffer = PixelBuffer {
+            ptr: raw_pixel_buffer.cast(),
+            format: pixel_format,
+        };
+        let frame = DecodedFrame {
+            pixel_buffer,
+            timestamp,
+        };
+        (self.callback)(Ok(frame));
+        Ok(())
     }
 
     // [NOTE] このコールバック関数は VTDecompressionSessionDecodeFrame() の処理中に呼び出される
@@ -1752,10 +2041,16 @@ impl Decoder {
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        unsafe {
-            sys::VTDecompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
-            sys::CFRelease(self.description as *const c_void);
+        if let Some(session) = self.session.take() {
+            unsafe {
+                sys::VTDecompressionSessionInvalidate(session);
+                sys::CFRelease(session as *const c_void);
+            }
+        }
+        if let Some(description) = self.description.take() {
+            unsafe {
+                sys::CFRelease(description as *const c_void);
+            }
         }
     }
 }
@@ -1767,44 +2062,120 @@ unsafe impl Send for Decoder {}
 
 /// デコードされた映像フレーム
 ///
-/// [`Decoder::decode`] が `Some` を返しても、プレーン参照が空スライスになることは **あり得る**（[`I420Frame`] / [`Nv12Frame`] の各 `*_plane` 参照）。
-pub enum DecodedFrame<'a> {
-    /// I420 形式
-    I420(I420Frame<'a>),
-    /// NV12 形式
-    Nv12(Nv12Frame<'a>),
+/// デコーダーのコールバックが `Ok(DecodedFrame)` として受け取る。
+/// `pixel_buffer` は `CVPixelBuffer` を CFRetain した所有ラッパーで、プレーン参照は
+/// [`PixelBuffer::lock`] で [`LockedPixelBuffer`] を取得してから行う。
+#[derive(Debug)]
+pub struct DecodedFrame {
+    /// CoreVideo の `CVPixelBuffer` の所有ラッパー
+    pub pixel_buffer: PixelBuffer,
+    /// [`Decoder::decode`] に渡された timestamp をそのまま転送する
+    pub timestamp: i64,
 }
 
-/// I420 形式のデコード済みフレーム (3 プレーン: Y, U, V)
+/// `CVPixelBuffer` の所有ラッパー
+///
+/// - 構築時に `CFRetain` 済みで、`Drop` で `CFRelease` する
+/// - `Send` 可能（CoreVideo は参照カウントをスレッドセーフに管理する）
+/// - `video-device-rs` の `PixelBuffer` と同形状の [`PixelBuffer::as_ptr`] を持ち、
+///   [`Encoder::encode_pixel_buffer`] に直接渡せる
+pub struct PixelBuffer {
+    ptr: *mut c_void,
+    format: PixelFormat,
+}
+
+impl std::fmt::Debug for PixelBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PixelBuffer")
+            .field("ptr", &self.ptr)
+            .field("format", &self.format)
+            .finish()
+    }
+}
+
+// SAFETY: CVPixelBuffer は CoreVideo が thread-safe に参照カウントを管理する。
+// プレーン参照用のロックは `PixelBuffer::lock()` で返す RAII ガードが同期を担う。
+unsafe impl Send for PixelBuffer {}
+
+impl PixelBuffer {
+    /// 内部の `CVPixelBuffer` ポインタを返す
+    ///
+    /// 所有権は `PixelBuffer` が保持するため、呼び出し側は `CFRelease` しない。
+    /// `video-device-rs` の `PixelBuffer::as_ptr()` と互換で、
+    /// [`Encoder::encode_pixel_buffer`] などにそのまま渡せる。
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// 画像のピクセルフォーマットを返す
+    pub fn format(&self) -> PixelFormat {
+        self.format
+    }
+
+    /// 画像の幅を返す
+    pub fn width(&self) -> usize {
+        unsafe { sys::CVPixelBufferGetWidth(self.ptr.cast()) }
+    }
+
+    /// 画像の高さを返す
+    pub fn height(&self) -> usize {
+        unsafe { sys::CVPixelBufferGetHeight(self.ptr.cast()) }
+    }
+
+    /// プレーンへの読み取り専用ロックを取得する
+    ///
+    /// 戻り値の `Drop` で `CVPixelBufferUnlockBaseAddress` が呼ばれるため、
+    /// スコープを抜けた時点で自動的にアンロックされる。
+    pub fn lock(&self) -> Result<LockedPixelBuffer<'_>, Error> {
+        let flags_readonly = 1;
+        let status = unsafe { sys::CVPixelBufferLockBaseAddress(self.ptr.cast(), flags_readonly) };
+        Error::check(status, "CVPixelBufferLockBaseAddress")?;
+        let view = match self.format {
+            PixelFormat::I420 => LockedPixelBuffer::I420(I420View { pixel_buffer: self }),
+            PixelFormat::Nv12 => LockedPixelBuffer::Nv12(Nv12View { pixel_buffer: self }),
+        };
+        Ok(view)
+    }
+}
+
+impl Drop for PixelBuffer {
+    fn drop(&mut self) {
+        unsafe { sys::CFRelease(self.ptr.cast()) };
+    }
+}
+
+/// [`PixelBuffer::lock`] が返すロック済みプレーンのビュー
+#[derive(Debug)]
+pub enum LockedPixelBuffer<'a> {
+    /// I420 (3 プレーン: Y, U, V)
+    I420(I420View<'a>),
+    /// NV12 (2 プレーン: Y, UV interleaved)
+    Nv12(Nv12View<'a>),
+}
+
+/// I420 形式のロック済みプレーンビュー
 ///
 /// ## プレーン参照
 ///
 /// プラットフォームが基底アドレスに NULL を返した場合、または行数とストライドの乗算が
-/// `usize` で表現できない場合、各 `*_plane` は **空のスライス**を返す。
+/// `usize` で表現できない場合、各 `*_plane` は **空のスライス** を返す。
 /// 解像度が正である通常のデコードでは空にはならない想定である。
 ///
-/// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル**として扱う。
-/// 呼び出し側は `y_plane().is_empty()` 等で分岐し、通常のピクセル処理に進まないこと。
+/// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル** として扱う。
 #[derive(Debug)]
-pub struct I420Frame<'a> {
-    inner: CfPtrMut<sys::__CVBuffer>,
-
-    // inner の中には Video Toolbox が返した一時的なデータへの参照も含まれているので、
-    // このライフタイムで利用側での使用範囲を制限する。
-    _lifetime: PhantomData<&'a ()>,
+pub struct I420View<'a> {
+    pixel_buffer: &'a PixelBuffer,
 }
 
-impl I420Frame<'_> {
-    /// ロック済みプレーンを `&[u8]` として返す
-    ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
+impl I420View<'_> {
     fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
         let len = match row_count.checked_mul(bytes_per_row) {
             Some(n) if n > 0 => n,
             _ => return &[],
         };
         let ptr = unsafe {
-            sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
+            sys::CVPixelBufferGetBaseAddressOfPlane(self.pixel_buffer.ptr.cast(), plane_index)
+                as *const u8
         };
         if ptr.is_null() {
             return &[];
@@ -1812,83 +2183,73 @@ impl I420Frame<'_> {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
-    /// フレームの Y 成分のデータを返す
+    /// Y プレーンを返す
     pub fn y_plane(&self) -> &[u8] {
         self.plane_slice(0, self.height(), self.y_stride())
     }
 
-    /// フレームの U 成分のデータを返す
+    /// U プレーンを返す
     pub fn u_plane(&self) -> &[u8] {
         self.plane_slice(1, self.height().div_ceil(2), self.u_stride())
     }
 
-    /// フレームの V 成分のデータを返す
+    /// V プレーンを返す
     pub fn v_plane(&self) -> &[u8] {
         self.plane_slice(2, self.height().div_ceil(2), self.v_stride())
     }
 
-    /// フレームの Y 成分のストライドを返す
+    /// Y ストライドを返す
     pub fn y_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 0) }
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.pixel_buffer.ptr.cast(), 0) }
     }
 
-    /// フレームの U 成分のストライドを返す
+    /// U ストライドを返す
     pub fn u_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 1) }
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.pixel_buffer.ptr.cast(), 1) }
     }
 
-    /// フレームの V 成分のストライドを返す
+    /// V ストライドを返す
     pub fn v_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 2) }
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.pixel_buffer.ptr.cast(), 2) }
     }
 
-    /// フレームの幅を返す
+    /// 画像の幅を返す
     pub fn width(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetWidth(self.inner.0) }
+        unsafe { sys::CVPixelBufferGetWidth(self.pixel_buffer.ptr.cast()) }
     }
 
-    /// フレームの高さを返す
+    /// 画像の高さを返す
     pub fn height(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetHeight(self.inner.0) }
+        unsafe { sys::CVPixelBufferGetHeight(self.pixel_buffer.ptr.cast()) }
     }
 }
 
-impl Drop for I420Frame<'_> {
+impl Drop for I420View<'_> {
     fn drop(&mut self) {
         unsafe {
             let flags_readonly = 1;
-            sys::CVPixelBufferUnlockBaseAddress(self.inner.0, flags_readonly);
+            sys::CVPixelBufferUnlockBaseAddress(self.pixel_buffer.ptr.cast(), flags_readonly);
         }
     }
 }
 
-/// NV12 形式のデコード済みフレーム (2 プレーン: Y, UV interleaved)
+/// NV12 形式のロック済みプレーンビュー
 ///
-/// ## プレーン参照
-///
-/// [`I420Frame`] と同様、異常時は各 `*_plane` が空スライスになることがある。
-///
-/// **空スライスは異常時のセンチネル**であり、空でないことを前提にピクセル処理して進めないこと。
+/// [`I420View`] と同じセンチネル挙動（異常時は空スライス）を持つ。
 #[derive(Debug)]
-pub struct Nv12Frame<'a> {
-    inner: CfPtrMut<sys::__CVBuffer>,
-
-    // inner の中には Video Toolbox が返した一時的なデータへの参照も含まれているので、
-    // このライフタイムで利用側での使用範囲を制限する。
-    _lifetime: PhantomData<&'a ()>,
+pub struct Nv12View<'a> {
+    pixel_buffer: &'a PixelBuffer,
 }
 
-impl Nv12Frame<'_> {
-    /// ロック済みプレーンを `&[u8]` として返す
-    ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
+impl Nv12View<'_> {
     fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
         let len = match row_count.checked_mul(bytes_per_row) {
             Some(n) if n > 0 => n,
             _ => return &[],
         };
         let ptr = unsafe {
-            sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
+            sys::CVPixelBufferGetBaseAddressOfPlane(self.pixel_buffer.ptr.cast(), plane_index)
+                as *const u8
         };
         if ptr.is_null() {
             return &[];
@@ -1896,42 +2257,42 @@ impl Nv12Frame<'_> {
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
-    /// フレームの Y 成分のデータを返す
+    /// Y プレーンを返す
     pub fn y_plane(&self) -> &[u8] {
         self.plane_slice(0, self.height(), self.y_stride())
     }
 
-    /// フレームの UV インターリーブデータを返す
+    /// UV インターリーブプレーンを返す
     pub fn uv_plane(&self) -> &[u8] {
         self.plane_slice(1, self.height().div_ceil(2), self.uv_stride())
     }
 
-    /// フレームの Y 成分のストライドを返す
+    /// Y ストライドを返す
     pub fn y_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 0) }
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.pixel_buffer.ptr.cast(), 0) }
     }
 
-    /// フレームの UV インターリーブのストライドを返す
+    /// UV ストライドを返す
     pub fn uv_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 1) }
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.pixel_buffer.ptr.cast(), 1) }
     }
 
-    /// フレームの幅を返す
+    /// 画像の幅を返す
     pub fn width(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetWidth(self.inner.0) }
+        unsafe { sys::CVPixelBufferGetWidth(self.pixel_buffer.ptr.cast()) }
     }
 
-    /// フレームの高さを返す
+    /// 画像の高さを返す
     pub fn height(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetHeight(self.inner.0) }
+        unsafe { sys::CVPixelBufferGetHeight(self.pixel_buffer.ptr.cast()) }
     }
 }
 
-impl Drop for Nv12Frame<'_> {
+impl Drop for Nv12View<'_> {
     fn drop(&mut self) {
         unsafe {
             let flags_readonly = 1;
-            sys::CVPixelBufferUnlockBaseAddress(self.inner.0, flags_readonly);
+            sys::CVPixelBufferUnlockBaseAddress(self.pixel_buffer.ptr.cast(), flags_readonly);
         }
     }
 }
@@ -2041,11 +2402,34 @@ fn cf_number_f64(n: f64) -> Result<CfPtr<c_void>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
 
     const WIDTH: u32 = 960;
     const HEIGHT: u32 = 480;
     const SIZE: usize = WIDTH as usize * HEIGHT as usize;
+
+    type EncoderSink = Rc<RefCell<Vec<Result<EncodedFrame, Error>>>>;
+    type DecoderSink = Rc<RefCell<Vec<Result<DecodedFrame, Error>>>>;
+
+    fn new_encoder_sink() -> EncoderSink {
+        Rc::new(RefCell::new(Vec::new()))
+    }
+
+    fn new_decoder_sink() -> DecoderSink {
+        Rc::new(RefCell::new(Vec::new()))
+    }
+
+    fn encoder_with_sink(sink: &EncoderSink) -> Encoder {
+        let captured = sink.clone();
+        Encoder::new(move |result| captured.borrow_mut().push(result))
+    }
+
+    fn decoder_with_sink(sink: &DecoderSink) -> Decoder {
+        let captured = sink.clone();
+        Decoder::new(move |result| captured.borrow_mut().push(result))
+    }
 
     #[test]
     fn h264_decoder() -> Result<(), Error> {
@@ -2054,7 +2438,9 @@ mod tests {
             45, 150,
         ];
         let pps = [104, 235, 227, 203, 34, 192];
-        let mut decoder = Decoder::new(DecoderConfig {
+        let sink = new_decoder_sink();
+        let mut decoder = decoder_with_sink(&sink);
+        decoder.configure(DecoderConfig {
             codec: DecoderCodec::H264 {
                 sps: &sps,
                 pps: &pps,
@@ -2073,8 +2459,10 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
         data.extend_from_slice(&nal_unit);
-        decoder.decode(&data)?;
+        decoder.decode(&data, 0)?;
 
+        let stored = sink.borrow();
+        assert!(stored.iter().any(|r| r.is_ok()));
         Ok(())
     }
 
@@ -2088,7 +2476,9 @@ mod tests {
             154, 73, 50, 188, 5, 160, 32, 0, 0, 3, 0, 32, 0, 0, 3, 3, 33,
         ];
         let pps = [68, 1, 193, 114, 180, 98, 64];
-        let mut decoder = Decoder::new(DecoderConfig {
+        let sink = new_decoder_sink();
+        let mut decoder = decoder_with_sink(&sink);
+        decoder.configure(DecoderConfig {
             codec: DecoderCodec::Hevc {
                 vps: &vps,
                 sps: &sps,
@@ -2108,18 +2498,21 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
         data.extend_from_slice(&nal_unit);
-        decoder.decode(&data)?;
+        decoder.decode(&data, 0)?;
 
+        let stored = sink.borrow();
+        assert!(stored.iter().any(|r| r.is_ok()));
         Ok(())
     }
 
-    /// 黒フレーム 1 枚のエンコード〜`next_frame` 取出し（`Encoder::new` の成功も含む）
+    /// 黒フレーム 1 枚を入れてコールバックに 1 件届くことを検証する
     ///
     /// [NOTE]: `encode(&[0; SIZE], ..)` のようにリテラル配列を直接渡すとコンパイルエラーになる
     fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
         let config = encoder_config(is_h265);
-        let mut encoder = Encoder::new(config)?;
-        let mut count = 0;
+        let sink = new_encoder_sink();
+        let mut encoder = encoder_with_sink(&sink);
+        encoder.configure(config)?;
 
         let y = [0; SIZE];
         let u = [0; SIZE / 4];
@@ -2132,16 +2525,10 @@ mod tests {
             },
             &EncodeOptions::default(),
         )?;
+        encoder.flush()?;
 
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
-        encoder.finish()?;
-        while encoder.next_frame()?.is_some() {
-            count += 1;
-        }
-
+        let stored = sink.borrow();
+        let count = stored.iter().filter(|r| r.is_ok()).count();
         assert_eq!(count, 1);
         Ok(())
     }
@@ -2165,17 +2552,19 @@ mod tests {
             return Ok(());
         }
 
-        // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
+        // Decoder::configure は最小限の FormatDescription でセッション作成を試行するため、
         // コーデック固有のパラメータが不足して失敗する場合がある。
         // 実際のビットストリームからデコードする場合は正常に動作する。
-        match Decoder::new(DecoderConfig {
+        let sink = new_decoder_sink();
+        let mut decoder = decoder_with_sink(&sink);
+        match decoder.configure(DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
                 height: HEIGHT,
             },
             pixel_format: PixelFormat::I420,
         }) {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(Error::UnsupportedCodec { .. }) => Ok(()),
             Err(e) => Err(e),
         }
@@ -2342,7 +2731,9 @@ mod tests {
         assert!(!encoded_frames.is_empty(), "VP9 encoder produced no frames");
 
         // Video Toolbox VP9 デコーダーを作成
-        let mut decoder = Decoder::new(DecoderConfig {
+        let sink = new_decoder_sink();
+        let mut decoder = decoder_with_sink(&sink);
+        decoder.configure(DecoderConfig {
             codec: DecoderCodec::Vp9 { width, height },
             pixel_format: PixelFormat::I420,
         })?;
@@ -2350,23 +2741,29 @@ mod tests {
         // 各フレームをデコードして PSNR を検証
         let min_psnr_db = 25.0;
         for (i, encoded_data) in encoded_frames.iter().enumerate() {
-            let decoded_opt = decoder.decode(encoded_data)?;
-            assert!(decoded_opt.is_some(), "frame {i}: decode returned None");
-            let decoded = decoded_opt.unwrap();
-            match decoded {
-                DecodedFrame::I420(ref frame) => {
-                    assert_eq!(frame.width(), width as usize, "frame {i}: width mismatch");
-                    assert_eq!(
-                        frame.height(),
-                        height as usize,
-                        "frame {i}: height mismatch"
-                    );
+            decoder.decode(encoded_data, i as i64)?;
+            let mut stored = sink.borrow_mut();
+            let result = stored.pop().unwrap_or_else(|| {
+                panic!("frame {i}: decoder callback was not invoked");
+            });
+            let decoded = result?;
+            assert_eq!(decoded.timestamp, i as i64, "frame {i}: timestamp mismatch");
+            assert_eq!(
+                decoded.pixel_buffer.format(),
+                PixelFormat::I420,
+                "frame {i}: pixel format mismatch"
+            );
+            let locked = decoded.pixel_buffer.lock()?;
+            match locked {
+                LockedPixelBuffer::I420(ref view) => {
+                    assert_eq!(view.width(), width as usize, "frame {i}: width mismatch");
+                    assert_eq!(view.height(), height as usize, "frame {i}: height mismatch");
 
                     let psnr = psnr_y(
                         &y_plane,
                         width as usize,
-                        frame.y_plane(),
-                        frame.y_stride(),
+                        view.y_plane(),
+                        view.y_stride(),
                         width as usize,
                         height as usize,
                     );
@@ -2375,7 +2772,7 @@ mod tests {
                         "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
                     );
                 }
-                DecodedFrame::Nv12(_) => {
+                LockedPixelBuffer::Nv12(_) => {
                     unreachable!("frame {i}: expected I420 but got NV12");
                 }
             }
