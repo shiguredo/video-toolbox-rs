@@ -1,6 +1,7 @@
 # Encoder / Decoder を WebCodecs 風コールバックベース API に変更する
 
 Created: 2026-04-21  
+Completed: 2026-04-21  
 Model: Opus 4.7
 
 ## なぜこの対応が必要か
@@ -119,3 +120,39 @@ pub enum LockedPixelBuffer<'a> { I420(I420View<'a>), Nv12(Nv12View<'a>) }
 - `CHANGES.md` の `## develop` に `[ADD]` / `[CHANGE]` を種別順で追加
 - `README.md` のサンプルを callback スタイルに更新
 - `make fmt` / `make clippy` (警告ゼロ) / `make test` が通る
+
+## 解決方法
+
+### Encoder / Decoder 構造の刷新
+
+- `Encoder::new<F>(callback: F)` / `Decoder::new<F>(callback: F)` を `FnMut(Result<Frame, Error>) + 'static` で受け取る形に変更し、内部で `Box<dyn FnMut(..)>` として保持する
+- セッションと設定を `Option<...>` に変更し、`EncoderState` / `DecoderState` (`Unconfigured` / `Configured` / `Closed`) で状態遷移を管理
+- `Error::InvalidState { operation, state }` を追加し、未設定・close 済みでの操作を明示的にエラーとする
+
+### 出力コールバックの呼び出し規約
+
+- エンコーダーは従来の VT コールバック → `mpsc::Sender` 経路を維持したまま、`encode()` / `flush()` の末尾で `drain_output()` を呼び、呼び出し元スレッドで同期的にユーザーコールバックを実行する
+- デコーダーは `VTDecompressionSessionDecodeFrame` が同期完了するため、戻り直後に `CFRetain` 済みピクセルバッファを `DecodedFrame { pixel_buffer, timestamp }` として構築しコールバックへ渡す
+- 成功・失敗は `Result<Frame, Error>` 一本化して `&mut self` を扱いやすくし、`Send` 境界を前提にせず `FnMut` と `'static` のみ要求する
+
+### ライフサイクル API
+
+- `Encoder::finish()` を `Encoder::flush()` にリネームし、`VTCompressionSessionCompleteFrames` 後に `drain_output()` を呼ぶ
+- `Encoder::reset()` / `Encoder::close()` / `Encoder::state()` / `Encoder::encode_queue_size()` を新設 (WebCodecs の `reset` / `close` / `state` / `encodeQueueSize` 相当)
+- `Encoder::reconfigure()` / `Decoder::update_format()` を廃止し、`configure()` の再呼び出しに集約する (2 回目以降は未出力フレームを破棄する契約)
+- デコーダーは `VTDecompressionSessionCanAcceptFormatDescription` で既存セッション流用可否を判定する既存ロジックを `configure()` 内に集約
+- デコーダーに `flush()` / `reset()` / `close()` / `state()` を追加
+
+### `DecodedFrame` の再設計
+
+- 旧 `DecodedFrame<'a>` enum / `I420Frame<'a>` / `Nv12Frame<'a>` の借用ベース設計を廃止し、`PixelBuffer` (CVPixelBuffer の CFRetain 所有ラッパー、`Send`) + `timestamp: i64` を持つ struct に変更
+- `PixelBuffer::lock()` で `LockedPixelBuffer::{I420, Nv12}(view)` を取得し、プレーン参照は `I420View<'a>` / `Nv12View<'a>` の `Drop` で `CVPixelBufferUnlockBaseAddress` を自動解放する
+- `PixelBuffer::as_ptr()` は video-device-rs の `PixelBuffer` と同形で、`Encoder::encode_pixel_buffer` に直接渡せる
+
+### その他
+
+- `allow_frame_reordering: false` 前提を強化するため、エンコード出力の `HashMap` + PTS 整列ロジックを削除し、VT からの到着順でそのままコールバックへ通知する
+- `EncodedFrame.timestamp` を公開 (旧 private `pts` を改名)
+- `Decoder::decode` のシグネチャを `Result<Option<DecodedFrame<'_>>, Error>` から `Result<(), Error>` に変更し、WebCodecs の `EncodedVideoChunk.timestamp` に対応する `timestamp: i64` 引数を追加
+- `examples/raden_to_mp4.rs` を `Rc<RefCell<WriterState>>` を共有するコールバック形式に書き換え、H.264 / H.265 双方で MP4 生成を確認
+- `tests/test_lib.rs` を新 API に合わせて再構成し、state 遷移・`InvalidState`・`configure` 再呼び出し・`reset` 後の Unconfigured 復帰を追加検証 (合計 24 件)
