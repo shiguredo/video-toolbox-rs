@@ -50,6 +50,14 @@
   - Composer 2 Fast、Opus 4.6、GPT-5.4 など
 - Issue はなぜこの対応が必要なのかの根拠を明確にすること
 
+### git ブランチの命名規則
+
+- Git Flow を使うこと
+- バグ修正は prefix を `feature/fix-` でブランチを切って対応すること
+- 機能追加は prefix を `feature/add-` でブランチを切って対応すること
+- 後方互換のない変更は prefix を `feature/change-` でブランチを切って対応すること
+- ブランチ名に issue の番号を含めないこと
+
 ### issue が実は解決してなかった場合
 
 - reopen の理由を issue に書いて issues/closed から issues/ に移動すること (git mv を使うこと)
