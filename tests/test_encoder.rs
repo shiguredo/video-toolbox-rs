@@ -1,9 +1,13 @@
-//! `src/lib.rs` に対応する単体テスト（設定検証のエラーパス等）
+//! `src/encoder.rs` に対応する単体テスト
 
 use shiguredo_video_toolbox::{
-    CodecConfig, Decoder, DecoderCodec, DecoderConfig, EncodeOptions, Encoder, EncoderConfig,
-    Error, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, EncodeOptions, Encoder, EncoderConfig, Error, FrameData, H264EncoderConfig,
+    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat,
 };
+
+const WIDTH: u32 = 960;
+const HEIGHT: u32 = 480;
+const SIZE: usize = WIDTH as usize * HEIGHT as usize;
 
 fn minimal_encoder_config() -> EncoderConfig {
     EncoderConfig {
@@ -32,6 +36,80 @@ fn minimal_nv12_encoder_config() -> EncoderConfig {
     let mut c = minimal_encoder_config();
     c.pixel_format = PixelFormat::Nv12;
     c
+}
+
+fn encoder_config(is_h265: bool) -> EncoderConfig {
+    let codec = if is_h265 {
+        CodecConfig::Hevc(HevcEncoderConfig {
+            profile: HevcProfile::Main,
+            allow_open_gop: true,
+        })
+    } else {
+        CodecConfig::H264(H264EncoderConfig {
+            profile: H264Profile::Main,
+            entropy_mode: H264EntropyMode::Cabac,
+        })
+    };
+    EncoderConfig {
+        width: WIDTH,
+        height: HEIGHT,
+        codec,
+        pixel_format: PixelFormat::I420,
+        average_bitrate: Some(100_000),
+        fps_numerator: 1,
+        fps_denominator: 1,
+        prioritize_encoding_speed_over_quality: false,
+        real_time: false,
+        maximize_power_efficiency: false,
+        allow_frame_reordering: false,
+        allow_temporal_compression: true,
+        max_key_frame_interval: None,
+        max_key_frame_interval_duration: None,
+        max_frame_delay_count: None,
+    }
+}
+
+/// 黒フレーム 1 枚のエンコード〜`next_frame` 取出し（`Encoder::new` の成功も含む）
+///
+/// [NOTE]: `encode(&[0; SIZE], ..)` のようにリテラル配列を直接渡すとコンパイルエラーになる
+fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
+    let config = encoder_config(is_h265);
+    let mut encoder = Encoder::new(config)?;
+    let mut count = 0;
+
+    let y = [0; SIZE];
+    let u = [0; SIZE / 4];
+    let v = [0; SIZE / 4];
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+    )?;
+
+    while encoder.next_frame()?.is_some() {
+        count += 1;
+    }
+
+    encoder.finish()?;
+    while encoder.next_frame()?.is_some() {
+        count += 1;
+    }
+
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[test]
+fn encode_h264_black() -> Result<(), Error> {
+    encode_black_frame_roundtrip(false)
+}
+
+#[test]
+fn encode_h265_black() -> Result<(), Error> {
+    encode_black_frame_roundtrip(true)
 }
 
 #[test]
@@ -101,39 +179,6 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
         Encoder::new(c),
         Err(Error::InvalidConfig {
             field: "average_bitrate",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn decoder_vp9_rejects_width_above_i32_max() {
-    let r = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Vp9 {
-            width: i32::MAX as u32 + 1,
-            height: 480,
-        },
-        pixel_format: PixelFormat::I420,
-    });
-    assert!(matches!(
-        r,
-        Err(Error::InvalidConfig { field: "width", .. })
-    ));
-}
-
-#[test]
-fn decoder_av1_rejects_height_above_i32_max() {
-    let r = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Av1 {
-            width: 640,
-            height: i32::MAX as u32 + 1,
-        },
-        pixel_format: PixelFormat::I420,
-    });
-    assert!(matches!(
-        r,
-        Err(Error::InvalidConfig {
-            field: "height",
             ..
         })
     ));
