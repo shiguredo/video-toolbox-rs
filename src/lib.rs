@@ -15,9 +15,11 @@ mod error;
 mod sys;
 mod types;
 
+#[cfg(target_os = "macos")]
+pub use codec_info::supported_codecs;
 pub use codec_info::{
     CodecInfo, DecodingInfo, EncodingInfo, EncodingProfiles, H264EncodingProfile,
-    HevcEncodingProfile, VideoCodecType, supported_codecs,
+    HevcEncodingProfile, VideoCodecType,
 };
 pub use decoder::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig, I420Frame, Nv12Frame};
 pub use encoder::{
