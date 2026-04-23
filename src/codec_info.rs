@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 
-use crate::{CfPtr, sys};
+use crate::{sys, types::CfPtr};
 
 /// コーデック種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

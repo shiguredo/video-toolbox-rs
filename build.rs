@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::Command};
 fn main() {
     // build.rs が更新されたら、依存ライブラリを再ビルドする
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-env-changed=DOCS_RS");
 
     // 各種変数やビルドディレクトリのセットアップ
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("infallible"));
@@ -25,6 +26,8 @@ fn main() {
             concat!(
                 "pub struct CFDictionaryRef;",
                 "pub struct CFStringRef;",
+                "pub struct CFArrayRef;",
+                "pub struct CFIndex;",
                 "pub struct __CVBuffer;",
                 "pub struct CMTime;",
                 "pub struct CVImageBufferRef;",
