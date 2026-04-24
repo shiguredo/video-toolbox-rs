@@ -132,24 +132,28 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-})?;
-
-// AVCC フォーマットのデータをデコード
-if let Some(frame) = decoder.decode(&avcc_data)? {
-    match frame {
-        DecodedFrame::I420(f) => {
-            let y = f.y_plane();
-            let u = f.u_plane();
-            let v = f.v_plane();
-            println!("{}x{}", f.width(), f.height());
+}, |result: Result<DecodedFrame<u64>, _>| {
+    match result {
+        Ok(DecodedFrame::I420 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let u = frame.u_plane();
+            let v = frame.v_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
         }
-        DecodedFrame::Nv12(f) => {
-            let y = f.y_plane();
-            let uv = f.uv_plane();
-            println!("{}x{}", f.width(), f.height());
+        Ok(DecodedFrame::Nv12 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let uv = frame.uv_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
+        }
+        Err(e) => {
+            eprintln!("decode callback error: {e}");
         }
     }
-}
+})?;
+
+// AVCC フォーマットのデータを非同期デコード
+decoder.decode(&avcc_data, 42)?;
+decoder.finish()?;
 ```
 
 ## 設定
@@ -257,10 +261,10 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 ```rust
 use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
 
-match Decoder::new(DecoderConfig {
+match Decoder::<()>::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}) {
+}, |_| {}) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");

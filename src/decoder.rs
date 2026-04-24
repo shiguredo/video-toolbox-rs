@@ -1,6 +1,5 @@
 use std::{
     ffi::{c_int, c_void},
-    marker::PhantomData,
     mem::MaybeUninit,
 };
 
@@ -59,30 +58,62 @@ pub struct DecoderConfig<'a> {
     pub pixel_format: PixelFormat,
 }
 
+// デコード完了通知コールバック型
+// `Err` の場合はデコード失敗や出力欠落を表す。
+type DecodeCallback<T> = dyn FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static;
+
+// `decompressionOutputRefCon` で受け渡すコールバック本体。
+// FFI へは `&DecodeCallbackBox<T>` のポインタを渡す。
+type DecodeCallbackBox<T> = Box<DecodeCallback<T>>;
+
+// 1 回の decode 呼び出しに対応するデータ保持領域。
+// 非同期デコード完了コールバックが来るまで圧縮データと CoreMedia オブジェクトを保持する。
+struct PendingDecode<T> {
+    user_data: T,
+    pixel_format: PixelFormat,
+    owned: Vec<u8>,
+    block_buffer: CfPtrMut<c_void>,
+    sample_buffer: CfPtrMut<c_void>,
+}
+
 /// H.264 / H.265 / VP9 / AV1 デコーダー
-#[derive(Debug)]
-pub struct Decoder {
+///
+/// デコード完了時に `FnMut(Result<DecodedFrame<T>, Error>)` を呼び出す。
+/// コールバックは Video Toolbox のコールバックスレッドで実行される。
+pub struct Decoder<T: Send + 'static> {
     description: sys::CMVideoFormatDescriptionRef,
     session: sys::VTDecompressionSessionRef,
     pixel_format: PixelFormat,
+    callback: Box<DecodeCallbackBox<T>>,
 }
 
-impl Decoder {
+impl<T: Send + 'static> Decoder<T> {
     /// デコーダーのインスタンスを生成する
-    pub fn new(config: DecoderConfig<'_>) -> Result<Self, Error> {
+    pub fn new<F>(config: DecoderConfig<'_>, on_decoded: F) -> Result<Self, Error>
+    where
+        F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+    {
+        // `DecodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
+        let callback = Box::new(Box::new(on_decoded) as DecodeCallbackBox<T>);
+
         unsafe {
             let description = Self::create_format_description(&config.codec)
                 .map_err(|e| Self::wrap_unsupported_codec_error(&config.codec, e))?;
-            let session = Self::create_decompression_session(description, config.pixel_format)
-                .map_err(|e| {
-                    sys::CFRelease(description as *const c_void);
-                    Self::wrap_unsupported_codec_error(&config.codec, e)
-                })?;
+            let session = Self::create_decompression_session(
+                description,
+                config.pixel_format,
+                callback.as_ref(),
+            )
+            .map_err(|e| {
+                sys::CFRelease(description as *const c_void);
+                Self::wrap_unsupported_codec_error(&config.codec, e)
+            })?;
 
             Ok(Self {
                 description,
                 session,
                 pixel_format: config.pixel_format,
+                callback,
             })
         }
     }
@@ -109,6 +140,8 @@ impl Decoder {
     /// 受け入れ不可能な場合はセッションを再作成する。
     /// 受け入れ可能な場合は FormatDescription のみ更新する。
     pub fn update_format(&mut self, codec: DecoderCodec<'_>) -> Result<(), Error> {
+        self.finish()?;
+
         unsafe {
             let new_description = Self::create_format_description(&codec)?;
 
@@ -124,14 +157,17 @@ impl Decoder {
             } else {
                 // 受け入れ不可能: セッションを再作成
                 // 新しいセッションを先に作成し、失敗時に self が不整合にならないようにする
-                let new_session =
-                    match Self::create_decompression_session(new_description, self.pixel_format) {
-                        Ok(session) => session,
-                        Err(e) => {
-                            sys::CFRelease(new_description as *const c_void);
-                            return Err(e);
-                        }
-                    };
+                let new_session = match Self::create_decompression_session(
+                    new_description,
+                    self.pixel_format,
+                    self.callback.as_ref(),
+                ) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        sys::CFRelease(new_description as *const c_void);
+                        return Err(e);
+                    }
+                };
 
                 sys::VTDecompressionSessionInvalidate(self.session);
                 sys::CFRelease(self.session as *const c_void);
@@ -142,6 +178,20 @@ impl Decoder {
 
             Ok(())
         }
+    }
+
+    /// これ以上データが来ないことをデコーダーに伝える
+    ///
+    /// 遅延フレームを排出し、非同期コールバック完了まで待機する。
+    pub fn finish(&mut self) -> Result<(), Error> {
+        unsafe {
+            let status = sys::VTDecompressionSessionFinishDelayedFrames(self.session);
+            Error::check(status, "VTDecompressionSessionFinishDelayedFrames")?;
+
+            let status = sys::VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+            Error::check(status, "VTDecompressionSessionWaitForAsynchronousFrames")?;
+        }
+        Ok(())
     }
 
     /// DecoderCodec から CMVideoFormatDescription を作成する
@@ -224,14 +274,18 @@ impl Decoder {
     unsafe fn create_decompression_session(
         description: sys::CMVideoFormatDescriptionRef,
         pixel_format: PixelFormat,
+        callback_ref_con: &DecodeCallbackBox<T>,
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
             // 現行 SDK では `VTDecompressionOutputCallbackRecord` はコールバック関数ポインタと refcon の 2 フィールドのみ。
-            // ゼロ初期化で refcon は NULL。続けてコールバックのみ代入する方針である（issue 0025）。
+            // ゼロ初期化で refcon は NULL。続けてコールバックと refcon を代入する方針である（issue 0025）。
             let mut callback =
                 MaybeUninit::<sys::VTDecompressionOutputCallbackRecord>::zeroed().assume_init();
             callback.decompressionOutputCallback = Some(Self::output_callback);
+            callback.decompressionOutputRefCon = (callback_ref_con as *const DecodeCallbackBox<T>)
+                .cast::<c_void>()
+                .cast_mut();
 
             let cv_pixel_format = match pixel_format {
                 PixelFormat::I420 => sys::kCVPixelFormatType_420YpCbCr8Planar,
@@ -256,17 +310,16 @@ impl Decoder {
 
     /// 圧縮された映像フレームをデコードする
     ///
-    /// `owned`（圧縮データの `Vec`）は `CMBlockBufferCreateWithMemoryBlock` が参照する。
-    /// `VTDecompressionSessionDecodeFrame` はこの関数内で同期的に完了するため、
-    /// ブロックバッファとサンプルバッファが解放される前にピクセルバッファの内容が確定する。
-    /// `kCFAllocatorNull` により `Vec` のヒープ領域は CoreMedia 側で解放されない。
-    pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame<'_>>, Error> {
+    /// `user_data` は対応するデコード完了時に `DecodedFrame<T>` に載せて返す。
+    /// 完了通知は `Decoder::new` で渡したコールバックで受け取る。
+    pub fn decode(&mut self, data: &[u8], user_data: T) -> Result<(), Error> {
         // `CMBlockBufferCreateWithMemoryBlock` に渡すメモリを `Vec` で所有する。
         // `&[u8]` からミュータブルポインタを渡すとエイリアス規則上の未定義動作の余地があるため、
         // コピーで所有権を明確にする（CoreMedia はデコード時に参照するのみ）。
         let owned = data.to_vec();
+
         unsafe {
-            let mut block_buffer = std::ptr::null_mut();
+            let mut block_buffer_ref = std::ptr::null_mut();
             let status = sys::CMBlockBufferCreateWithMemoryBlock(
                 std::ptr::null_mut(),
                 owned.as_ptr().cast_mut().cast(),
@@ -276,65 +329,85 @@ impl Decoder {
                 0,
                 owned.len(),
                 0,
-                &mut block_buffer,
+                &mut block_buffer_ref,
             );
             Error::check(status, "CMBlockBufferCreateWithMemoryBlock")?;
-            let block_buffer = CfPtrMut(block_buffer);
+            let block_buffer = CfPtrMut(block_buffer_ref.cast::<c_void>());
 
-            let mut sample_buffer = std::ptr::null_mut();
+            let mut sample_buffer_ref = std::ptr::null_mut();
             let status = sys::CMSampleBufferCreateReady(
                 std::ptr::null_mut(),
-                block_buffer.0,
+                block_buffer.0.cast(),
                 self.description,
                 1,
                 0,
                 [].as_ptr(),
                 0,
                 [].as_ptr(),
-                &mut sample_buffer,
+                &mut sample_buffer_ref,
             );
             Error::check(status, "CMSampleBufferCreateReady")?;
-            let sample_buffer = CfPtrMut(sample_buffer);
+            let sample_buffer = CfPtrMut(sample_buffer_ref.cast::<c_void>());
 
-            let decode_flags = 0;
+            let pending = Box::new(PendingDecode {
+                user_data,
+                pixel_format: self.pixel_format,
+                owned,
+                block_buffer,
+                sample_buffer,
+            });
+            let source_frame_ref_con = Box::into_raw(pending).cast::<c_void>();
+
+            let decode_flags = sys::kVTDecodeFrame_EnableAsynchronousDecompression;
             let mut info_flags = 0;
-            let mut image_buffer: sys::CVImageBufferRef = std::ptr::null_mut();
             let status = sys::VTDecompressionSessionDecodeFrame(
                 self.session,
-                sample_buffer.0,
+                sample_buffer_ref,
                 decode_flags,
-                ((&mut image_buffer) as *mut sys::CVImageBufferRef).cast(),
+                source_frame_ref_con,
                 &mut info_flags,
             );
-            Error::check(status, "VTDecompressionSessionDecodeFrame")?;
-
-            if image_buffer.is_null() {
-                return Ok(None);
+            if let Err(e) = Error::check(status, "VTDecompressionSessionDecodeFrame") {
+                let _ = Box::from_raw(source_frame_ref_con.cast::<PendingDecode<T>>());
+                return Err(e);
             }
 
-            let image_buffer = CfPtrMut(image_buffer);
-            let flags_readonly = 1;
-            let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly);
-            Error::check(status, "CVPixelBufferLockBaseAddress")?;
-
-            let frame = match self.pixel_format {
-                PixelFormat::I420 => DecodedFrame::I420(I420Frame {
-                    inner: image_buffer,
-                    _lifetime: PhantomData,
-                }),
-                PixelFormat::Nv12 => DecodedFrame::Nv12(Nv12Frame {
-                    inner: image_buffer,
-                    _lifetime: PhantomData,
-                }),
-            };
-            Ok(Some(frame))
+            Ok(())
         }
     }
 
-    // [NOTE] このコールバック関数は VTDecompressionSessionDecodeFrame() の処理中に呼び出される
-    //        (指定したフラグによって挙動は変わるがデフォルトでは）
+    unsafe fn take_pending_decode(
+        source_frame_ref_con: *mut c_void,
+        callback_name: &'static str,
+    ) -> Option<Box<PendingDecode<T>>> {
+        if source_frame_ref_con.is_null() {
+            log::error!("{callback_name}: source_frame_ref_con is null");
+            return None;
+        }
+        Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<T>>()) })
+    }
+
+    unsafe fn callback_from_ref_con<'a>(
+        output_callback_ref_con: *mut c_void,
+        callback_name: &'static str,
+    ) -> Option<&'a mut DecodeCallbackBox<T>> {
+        if output_callback_ref_con.is_null() {
+            log::error!("{callback_name}: output_callback_ref_con is null");
+            return None;
+        }
+        Some(unsafe { &mut *output_callback_ref_con.cast::<DecodeCallbackBox<T>>() })
+    }
+
+    fn invoke_callback(
+        callback: &mut DecodeCallbackBox<T>,
+        result: Result<DecodedFrame<T>, Error>,
+    ) {
+        let callback = callback.as_mut();
+        (callback)(result);
+    }
+
     unsafe extern "C" fn output_callback(
-        _decompression_output_ref_con: *mut c_void,
+        decompression_output_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
         _info_flags: sys::VTDecodeInfoFlags,
@@ -342,25 +415,79 @@ impl Decoder {
         _presentation_time_stamp: sys::CMTime,
         _presentation_duration: sys::CMTime,
     ) {
-        if let Err(e) = Error::check(status, "output_callback") {
+        let callback_name = "output_callback";
+        let Some(pending) =
+            (unsafe { Self::take_pending_decode(source_frame_ref_con, callback_name) })
+        else {
+            return;
+        };
+        let Some(callback) =
+            (unsafe { Self::callback_from_ref_con(decompression_output_ref_con, callback_name) })
+        else {
+            return;
+        };
+
+        let PendingDecode {
+            user_data,
+            pixel_format,
+            owned: _owned,
+            block_buffer: _block_buffer,
+            sample_buffer: _sample_buffer,
+        } = *pending;
+
+        if let Err(e) = Error::check(status, callback_name) {
             log::error!("{e}");
+            Self::invoke_callback(callback, Err(e));
             return;
         }
 
         // フレームドロップ等で image_buffer が NULL になる場合がある
         if image_buffer.is_null() {
+            let e = Error::LimitExceeded {
+                reason: "decoded image buffer is null",
+            };
+            log::error!("{e}");
+            Self::invoke_callback(callback, Err(e));
             return;
         }
 
-        let output = source_frame_ref_con.cast();
-        unsafe {
-            *output = sys::CFRetain(image_buffer.cast());
+        // コールバック引数の image_buffer を利用者コールバックの外でも保持できるように retain する。
+        let retained_image_buffer = unsafe { sys::CFRetain(image_buffer.cast()) };
+        let retained_image_buffer = retained_image_buffer.cast_mut().cast();
+        let image_buffer = CfPtrMut(retained_image_buffer);
+
+        let flags_readonly = 1;
+        let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
+        if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
+            log::error!("{e}");
+            Self::invoke_callback(callback, Err(e));
+            return;
         }
+
+        let frame = match pixel_format {
+            PixelFormat::I420 => DecodedFrame::I420 {
+                frame: I420Frame {
+                    inner: image_buffer,
+                },
+                user_data,
+            },
+            PixelFormat::Nv12 => DecodedFrame::Nv12 {
+                frame: Nv12Frame {
+                    inner: image_buffer,
+                },
+                user_data,
+            },
+        };
+        Self::invoke_callback(callback, Ok(frame));
     }
 }
 
-impl Drop for Decoder {
+impl<T: Send + 'static> Drop for Decoder<T> {
     fn drop(&mut self) {
+        if let Err(e) = self.finish() {
+            log::error!("{e}");
+        }
+
         unsafe {
             sys::VTDecompressionSessionInvalidate(self.session);
             sys::CFRelease(self.session as *const c_void);
@@ -371,17 +498,25 @@ impl Drop for Decoder {
 
 // SAFETY: VTDecompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// デコードコールバックは同期的に呼ばれるため、並行アクセスの問題は発生しない。
-unsafe impl Send for Decoder {}
+// コールバックは別スレッドで実行されるため、`T: Send` 制約を課して所有権を安全に移動させる。
+unsafe impl<T: Send + 'static> Send for Decoder<T> {}
 
 /// デコードされた映像フレーム
-///
-/// [`Decoder::decode`] が `Some` を返しても、プレーン参照が空スライスになることは **あり得る**（[`I420Frame`] / [`Nv12Frame`] の各 `*_plane` 参照）。
-pub enum DecodedFrame<'a> {
+pub enum DecodedFrame<T> {
     /// I420 形式
-    I420(I420Frame<'a>),
+    I420 {
+        /// デコード済みフレーム本体
+        frame: I420Frame,
+        /// 入力時に指定したユーザーデータ
+        user_data: T,
+    },
     /// NV12 形式
-    Nv12(Nv12Frame<'a>),
+    Nv12 {
+        /// デコード済みフレーム本体
+        frame: Nv12Frame,
+        /// 入力時に指定したユーザーデータ
+        user_data: T,
+    },
 }
 
 /// I420 形式のデコード済みフレーム (3 プレーン: Y, U, V)
@@ -395,15 +530,11 @@ pub enum DecodedFrame<'a> {
 /// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル**として扱う。
 /// 呼び出し側は `y_plane().is_empty()` 等で分岐し、通常のピクセル処理に進まないこと。
 #[derive(Debug)]
-pub struct I420Frame<'a> {
+pub struct I420Frame {
     inner: CfPtrMut<sys::__CVBuffer>,
-
-    // inner の中には Video Toolbox が返した一時的なデータへの参照も含まれているので、
-    // このライフタイムで利用側での使用範囲を制限する。
-    _lifetime: PhantomData<&'a ()>,
 }
 
-impl I420Frame<'_> {
+impl I420Frame {
     /// ロック済みプレーンを `&[u8]` として返す
     ///
     /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
@@ -462,7 +593,7 @@ impl I420Frame<'_> {
     }
 }
 
-impl Drop for I420Frame<'_> {
+impl Drop for I420Frame {
     fn drop(&mut self) {
         unsafe {
             let flags_readonly = 1;
@@ -479,15 +610,11 @@ impl Drop for I420Frame<'_> {
 ///
 /// **空スライスは異常時のセンチネル**であり、空でないことを前提にピクセル処理して進めないこと。
 #[derive(Debug)]
-pub struct Nv12Frame<'a> {
+pub struct Nv12Frame {
     inner: CfPtrMut<sys::__CVBuffer>,
-
-    // inner の中には Video Toolbox が返した一時的なデータへの参照も含まれているので、
-    // このライフタイムで利用側での使用範囲を制限する。
-    _lifetime: PhantomData<&'a ()>,
 }
 
-impl Nv12Frame<'_> {
+impl Nv12Frame {
     /// ロック済みプレーンを `&[u8]` として返す
     ///
     /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
@@ -536,7 +663,7 @@ impl Nv12Frame<'_> {
     }
 }
 
-impl Drop for Nv12Frame<'_> {
+impl Drop for Nv12Frame {
     fn drop(&mut self) {
         unsafe {
             let flags_readonly = 1;

@@ -1,22 +1,63 @@
 //! `src/decoder.rs` に対応する単体テスト
 
+use std::sync::{Arc, Mutex};
+
 use shiguredo_video_toolbox::{
     DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat, VideoCodecType,
     supported_codecs,
 };
 
-const WIDTH: u32 = 960;
+const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
+
+enum DecodeEvent {
+    I420 {
+        user_data: u64,
+        width: usize,
+        height: usize,
+        y_plane: Vec<u8>,
+        y_stride: usize,
+    },
+    Nv12 {
+        user_data: u64,
+    },
+    Err(Error),
+}
+
+type SharedDecodeResults = Arc<Mutex<Vec<DecodeEvent>>>;
+
+fn push_decode_event(results: &SharedDecodeResults, result: Result<DecodedFrame<u64>, Error>) {
+    let event = match result {
+        Ok(DecodedFrame::I420 { frame, user_data }) => DecodeEvent::I420 {
+            user_data,
+            width: frame.width(),
+            height: frame.height(),
+            y_plane: frame.y_plane().to_vec(),
+            y_stride: frame.y_stride(),
+        },
+        Ok(DecodedFrame::Nv12 { user_data, .. }) => DecodeEvent::Nv12 { user_data },
+        Err(e) => DecodeEvent::Err(e),
+    };
+    results.lock().expect("results mutex poisoned").push(event);
+}
+
+fn take_results(results: &SharedDecodeResults) -> Vec<DecodeEvent> {
+    let mut guard = results.lock().expect("results mutex poisoned");
+    std::mem::take(&mut *guard)
+}
 
 #[test]
 fn decoder_vp9_rejects_width_above_i32_max() {
-    let r = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Vp9 {
-            width: i32::MAX as u32 + 1,
-            height: 480,
+    let r = Decoder::<()>::new(
+        DecoderConfig {
+            codec: DecoderCodec::Vp9 {
+                width: i32::MAX as u32 + 1,
+                height: 480,
+            },
+            pixel_format: PixelFormat::I420,
         },
-        pixel_format: PixelFormat::I420,
-    });
+        |_| {},
+    );
     assert!(matches!(
         r,
         Err(Error::InvalidConfig { field: "width", .. })
@@ -25,13 +66,16 @@ fn decoder_vp9_rejects_width_above_i32_max() {
 
 #[test]
 fn decoder_av1_rejects_height_above_i32_max() {
-    let r = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Av1 {
-            width: 640,
-            height: i32::MAX as u32 + 1,
+    let r = Decoder::<()>::new(
+        DecoderConfig {
+            codec: DecoderCodec::Av1 {
+                width: 640,
+                height: i32::MAX as u32 + 1,
+            },
+            pixel_format: PixelFormat::I420,
         },
-        pixel_format: PixelFormat::I420,
-    });
+        |_| {},
+    );
     assert!(matches!(
         r,
         Err(Error::InvalidConfig {
@@ -48,14 +92,23 @@ fn h264_decoder() -> Result<(), Error> {
         150,
     ];
     let pps = [104, 235, 227, 203, 34, 192];
-    let mut decoder = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::H264 {
-            sps: &sps,
-            pps: &pps,
-            nalu_len_bytes: 4,
+    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::H264 {
+                sps: &sps,
+                pps: &pps,
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::I420,
         },
-        pixel_format: PixelFormat::I420,
-    })?;
+        {
+            let results = Arc::clone(&results);
+            move |result| {
+                push_decode_event(&results, result);
+            }
+        },
+    )?;
 
     let nal_unit = [
         101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247,
@@ -67,7 +120,27 @@ fn h264_decoder() -> Result<(), Error> {
     let mut data = Vec::new();
     data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
     data.extend_from_slice(&nal_unit);
-    decoder.decode(&data)?;
+    decoder.decode(&data, 7)?;
+    decoder.finish()?;
+
+    let callbacks = take_results(&results);
+    assert_eq!(callbacks.len(), 1);
+    match callbacks.into_iter().next().expect("callback missing") {
+        DecodeEvent::I420 {
+            user_data,
+            width,
+            height,
+            ..
+        } => {
+            assert_eq!(user_data, 7);
+            assert_eq!(width, WIDTH as usize);
+            assert_eq!(height, HEIGHT as usize);
+        }
+        DecodeEvent::Nv12 { .. } => {
+            unreachable!("expected I420 but got NV12");
+        }
+        DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+    }
 
     Ok(())
 }
@@ -82,15 +155,24 @@ fn h265_decoder() -> Result<(), Error> {
         154, 73, 50, 188, 5, 160, 32, 0, 0, 3, 0, 32, 0, 0, 3, 3, 33,
     ];
     let pps = [68, 1, 193, 114, 180, 98, 64];
-    let mut decoder = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Hevc {
-            vps: &vps,
-            sps: &sps,
-            pps: &pps,
-            nalu_len_bytes: 4,
+    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::Hevc {
+                vps: &vps,
+                sps: &sps,
+                pps: &pps,
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::I420,
         },
-        pixel_format: PixelFormat::I420,
-    })?;
+        {
+            let results = Arc::clone(&results);
+            move |result| {
+                push_decode_event(&results, result);
+            }
+        },
+    )?;
 
     let nal_unit = [
         40, 1, 175, 29, 16, 90, 181, 140, 90, 213, 247, 1, 91, 255, 242, 78, 254, 199, 0, 31, 209,
@@ -102,7 +184,27 @@ fn h265_decoder() -> Result<(), Error> {
     let mut data = Vec::new();
     data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
     data.extend_from_slice(&nal_unit);
-    decoder.decode(&data)?;
+    decoder.decode(&data, 11)?;
+    decoder.finish()?;
+
+    let callbacks = take_results(&results);
+    assert_eq!(callbacks.len(), 1);
+    match callbacks.into_iter().next().expect("callback missing") {
+        DecodeEvent::I420 {
+            user_data,
+            width,
+            height,
+            ..
+        } => {
+            assert_eq!(user_data, 11);
+            assert_eq!(width, WIDTH as usize);
+            assert_eq!(height, HEIGHT as usize);
+        }
+        DecodeEvent::Nv12 { .. } => {
+            unreachable!("expected I420 but got NV12");
+        }
+        DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+    }
 
     Ok(())
 }
@@ -119,13 +221,16 @@ fn init_av1_decoder() -> Result<(), Error> {
     // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
     // コーデック固有のパラメータが不足して失敗する場合がある。
     // 実際のビットストリームからデコードする場合は正常に動作する。
-    match Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Av1 {
-            width: WIDTH,
-            height: HEIGHT,
+    match Decoder::<()>::new(
+        DecoderConfig {
+            codec: DecoderCodec::Av1 {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+            pixel_format: PixelFormat::I420,
         },
-        pixel_format: PixelFormat::I420,
-    }) {
+        |_| {},
+    ) {
         Ok(_) => Ok(()),
         Err(Error::UnsupportedCodec { .. }) => Ok(()),
         Err(e) => Err(e),
@@ -228,16 +333,17 @@ fn vp9_decoder() -> Result<(), Error> {
         RateControlMode as VpxRateControlMode, Vp9Config as VpxVp9Config,
     };
 
-    let width: u32 = 320;
-    let height: u32 = 240;
+    let frame_width: u32 = 320;
+    let frame_height: u32 = 240;
     let num_frames: usize = 10;
 
-    let (y_plane, u_plane, v_plane) = generate_colorbar_i420(width as usize, height as usize);
+    let (source_y_plane, source_u_plane, source_v_plane) =
+        generate_colorbar_i420(frame_width as usize, frame_height as usize);
 
     // shiguredo_libvpx で VP9 エンコード
     let vpx_config = VpxEncoderConfig {
-        width: width as usize,
-        height: height as usize,
+        width: frame_width as usize,
+        height: frame_height as usize,
         image_format: VpxImageFormat::I420,
         fps_numerator: 30,
         fps_denominator: 1,
@@ -265,9 +371,9 @@ fn vp9_decoder() -> Result<(), Error> {
         if vpx_encoder
             .encode(
                 &VpxImageData::I420 {
-                    y: &y_plane,
-                    u: &u_plane,
-                    v: &v_plane,
+                    y: &source_y_plane,
+                    u: &source_u_plane,
+                    v: &source_v_plane,
                 },
                 &VpxEncodeOptions {
                     force_keyframe: i == 0,
@@ -290,45 +396,79 @@ fn vp9_decoder() -> Result<(), Error> {
 
     assert!(!encoded_frames.is_empty(), "VP9 encoder produced no frames");
 
-    // Video Toolbox VP9 デコーダーを作成
-    let mut decoder = Decoder::new(DecoderConfig {
-        codec: DecoderCodec::Vp9 { width, height },
-        pixel_format: PixelFormat::I420,
-    })?;
+    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::Vp9 {
+                width: frame_width,
+                height: frame_height,
+            },
+            pixel_format: PixelFormat::I420,
+        },
+        {
+            let results = Arc::clone(&results);
+            move |result| {
+                push_decode_event(&results, result);
+            }
+        },
+    )?;
 
-    // 各フレームをデコードして PSNR を検証
-    let min_psnr_db = 25.0;
     for (i, encoded_data) in encoded_frames.iter().enumerate() {
-        let decoded_opt = decoder.decode(encoded_data)?;
-        assert!(decoded_opt.is_some(), "frame {i}: decode returned None");
-        let decoded = decoded_opt.unwrap();
-        match decoded {
-            DecodedFrame::I420(ref frame) => {
-                assert_eq!(frame.width(), width as usize, "frame {i}: width mismatch");
+        decoder.decode(encoded_data, i as u64)?;
+    }
+    decoder.finish()?;
+
+    let callbacks = take_results(&results);
+    assert_eq!(callbacks.len(), encoded_frames.len());
+
+    let min_psnr_db = 25.0;
+    let mut seen = vec![false; encoded_frames.len()];
+    for callback in callbacks {
+        match callback {
+            DecodeEvent::I420 {
+                user_data,
+                width: decoded_width,
+                height: decoded_height,
+                y_plane: decoded_y_plane,
+                y_stride,
+            } => {
+                let i = user_data as usize;
+                assert!(
+                    i < encoded_frames.len(),
+                    "user_data out of range: {user_data}"
+                );
+                assert!(!seen[i], "duplicate callback user_data: {user_data}");
+                seen[i] = true;
+
                 assert_eq!(
-                    frame.height(),
-                    height as usize,
+                    decoded_width, frame_width as usize,
+                    "frame {i}: width mismatch"
+                );
+                assert_eq!(
+                    decoded_height, frame_height as usize,
                     "frame {i}: height mismatch"
                 );
 
                 let psnr = psnr_y(
-                    &y_plane,
-                    width as usize,
-                    frame.y_plane(),
-                    frame.y_stride(),
-                    width as usize,
-                    height as usize,
+                    &source_y_plane,
+                    frame_width as usize,
+                    &decoded_y_plane,
+                    y_stride,
+                    frame_width as usize,
+                    frame_height as usize,
                 );
                 assert!(
                     psnr >= min_psnr_db,
                     "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
                 );
             }
-            DecodedFrame::Nv12(_) => {
-                unreachable!("frame {i}: expected I420 but got NV12");
+            DecodeEvent::Nv12 { user_data, .. } => {
+                unreachable!("frame {user_data}: expected I420 but got NV12");
             }
+            DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
         }
     }
+    assert!(seen.iter().all(|v| *v), "some callbacks are missing");
 
     Ok(())
 }
