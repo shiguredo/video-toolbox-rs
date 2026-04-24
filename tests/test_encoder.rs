@@ -1,13 +1,21 @@
 //! `src/encoder.rs` に対応する単体テスト
 
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, Error, FrameData, H264EncoderConfig,
-    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FrameData,
+    H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat,
 };
 
 const WIDTH: u32 = 960;
 const HEIGHT: u32 = 480;
 const SIZE: usize = WIDTH as usize * HEIGHT as usize;
+type EncodeResult<T> = Result<EncodedFrame<T>, Error>;
+type SharedEncodeResults<T> = Arc<Mutex<Vec<EncodeResult<T>>>>;
 
 fn minimal_encoder_config() -> EncoderConfig {
     EncoderConfig {
@@ -69,17 +77,40 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
     }
 }
 
-/// 黒フレーム 1 枚のエンコード〜`next_frame` 取出し（`Encoder::new` の成功も含む）
-///
-/// [NOTE]: `encode(&[0; SIZE], ..)` のようにリテラル配列を直接渡すとコンパイルエラーになる
+fn build_i420_black_frame() -> ([u8; SIZE], [u8; SIZE / 4], [u8; SIZE / 4]) {
+    ([0; SIZE], [0; SIZE / 4], [0; SIZE / 4])
+}
+
+fn wait_and_take_results<T>(
+    results: &SharedEncodeResults<T>,
+    min_count: usize,
+) -> Vec<EncodeResult<T>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if results.lock().expect("results mutex poisoned").len() >= min_count {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut guard = results.lock().expect("results mutex poisoned");
+    std::mem::take(&mut *guard)
+}
+
 fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
     let config = encoder_config(is_h265);
-    let mut encoder = Encoder::new(config)?;
-    let mut count = 0;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
 
-    let y = [0; SIZE];
-    let u = [0; SIZE / 4];
-    let v = [0; SIZE / 4];
+    let (y, u, v) = build_i420_black_frame();
     encoder.encode(
         &FrameData::I420 {
             y: &y,
@@ -87,18 +118,20 @@ fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
             v: &v,
         },
         &EncodeOptions::default(),
+        7,
     )?;
-
-    while encoder.next_frame()?.is_some() {
-        count += 1;
-    }
-
     encoder.finish()?;
-    while encoder.next_frame()?.is_some() {
-        count += 1;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match callbacks.into_iter().next().expect("callback missing") {
+        Ok(frame) => {
+            assert_eq!(frame.user_data, 7);
+            assert!(!frame.data.is_empty());
+        }
+        Err(e) => panic!("unexpected encode callback error: {e}"),
     }
 
-    assert_eq!(count, 1);
     Ok(())
 }
 
@@ -113,11 +146,59 @@ fn encode_h265_black() -> Result<(), Error> {
 }
 
 #[test]
+fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
+
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        10,
+    )?;
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        20,
+    )?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 2);
+    assert_eq!(callbacks.len(), 2);
+
+    let mut user_data = callbacks
+        .into_iter()
+        .map(|r| match r {
+            Ok(frame) => frame.user_data,
+            Err(e) => panic!("unexpected encode callback error: {e}"),
+        })
+        .collect::<Vec<_>>();
+    user_data.sort_unstable();
+    assert_eq!(user_data, vec![10, 20]);
+
+    Ok(())
+}
+
+#[test]
 fn encoder_rejects_zero_width() {
     let mut c = minimal_encoder_config();
     c.width = 0;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -127,7 +208,7 @@ fn encoder_rejects_zero_height() {
     let mut c = minimal_encoder_config();
     c.height = 0;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -140,7 +221,7 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             ..
@@ -153,7 +234,7 @@ fn encoder_rejects_width_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.width = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -163,7 +244,7 @@ fn encoder_rejects_height_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.height = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -176,7 +257,7 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     let mut c = minimal_encoder_config();
     c.average_bitrate = Some(i64::MAX as u64 + 1);
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "average_bitrate",
             ..
@@ -189,7 +270,7 @@ fn encoder_rejects_zero_fps_denominator() {
     let mut c = minimal_encoder_config();
     c.fps_denominator = 0;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "fps_denominator",
             ..
@@ -202,7 +283,7 @@ fn encoder_rejects_zero_fps_numerator() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = 0;
     assert!(matches!(
-        Encoder::new(c),
+        Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             reason: "must not be zero"
@@ -212,7 +293,13 @@ fn encoder_rejects_zero_fps_numerator() {
 
 #[test]
 fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
-    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = Encoder::new(minimal_encoder_config(), {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     let y = [0u8; 1];
     let u = [0u8; 160_000];
     let v = [0u8; 160_000];
@@ -223,17 +310,25 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
             v: &v,
         },
         &EncodeOptions::default(),
+        1,
     );
     assert!(matches!(
         r,
         Err(Error::InsufficientFrameData { plane: "Y", .. })
     ));
+    assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
 }
 
 #[test]
 fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
-    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = Encoder::new(minimal_encoder_config(), {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     let y = vec![0u8; 640 * 480];
     let u = [0u8; 1];
     let v = vec![0u8; 160 * 120];
@@ -244,22 +339,31 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
             v: &v,
         },
         &EncodeOptions::default(),
+        1,
     );
     assert!(matches!(
         r,
         Err(Error::InsufficientFrameData { plane: "U", .. })
     ));
+    assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
 }
 
 #[test]
 fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result<(), Error> {
-    let mut enc = Encoder::new(minimal_encoder_config())?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = Encoder::new(minimal_encoder_config(), {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     let y = vec![0u8; 640 * 480];
     let uv = vec![0u8; 640 * 240];
     let r = enc.encode(
         &FrameData::Nv12 { y: &y, uv: &uv },
         &EncodeOptions::default(),
+        1,
     );
     assert!(matches!(
         r,
@@ -268,21 +372,30 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
             actual: PixelFormat::Nv12,
         })
     ));
+    assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
 }
 
 #[test]
 fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
-    let mut enc = Encoder::new(minimal_nv12_encoder_config())?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = Encoder::new(minimal_nv12_encoder_config(), {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     let y = vec![0u8; 640 * 480];
     let uv = [0u8; 1];
     let r = enc.encode(
         &FrameData::Nv12 { y: &y, uv: &uv },
         &EncodeOptions::default(),
+        1,
     );
     assert!(matches!(
         r,
         Err(Error::InsufficientFrameData { plane: "UV", .. })
     ));
+    assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
 }

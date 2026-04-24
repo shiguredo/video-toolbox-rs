@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
 
 use raden::{Circle, CompOp, Context, Image, PipelineRuntime, PixelFormat, Rect, Rgba32};
 use shiguredo_mp4::boxes::{
@@ -17,14 +18,17 @@ use shiguredo_mp4::boxes::{
 use shiguredo_mp4::mux::{Mp4FileMuxer, Sample};
 use shiguredo_mp4::{TrackKind, Uint};
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, FrameData, H264EncoderConfig,
-    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat as VideoPixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error as VideoToolboxError,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
+    PixelFormat as VideoPixelFormat,
 };
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DURATION_SECS: f64 = 5.0;
+type EncodedResult = Result<EncodedFrame<u64>, VideoToolboxError>;
+type SharedEncodedResults = Arc<Mutex<Vec<EncodedResult>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -169,7 +173,7 @@ fn render_frame(ctx: &mut Context, t: f64, w: f64, h: f64) {
 }
 
 /// H.264 用の SampleEntry を構築する
-fn build_h264_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> SampleEntry {
+fn build_h264_sample_entry<T>(frame: &EncodedFrame<T>, width: u16, height: u16) -> SampleEntry {
     SampleEntry::Avc1(Avc1Box {
         visual: visual_sample_entry_fields(width, height),
         avcc_box: AvccBox {
@@ -189,7 +193,7 @@ fn build_h264_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> Sam
 }
 
 /// H.265 用の SampleEntry を構築する
-fn build_h265_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> SampleEntry {
+fn build_h265_sample_entry<T>(frame: &EncodedFrame<T>, width: u16, height: u16) -> SampleEntry {
     // HEVC NAL unit type: VPS=32, SPS=33, PPS=34
     let mut nalu_arrays = Vec::new();
     if !frame.vps_list.is_empty() {
@@ -327,7 +331,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
     };
-    let mut encoder = Encoder::new(config)?;
+    let encoded_results: SharedEncodedResults = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let encoded_results = Arc::clone(&encoded_results);
+        move |result| {
+            if let Ok(mut guard) = encoded_results.lock() {
+                guard.push(result);
+            } else {
+                eprintln!("encoded results mutex is poisoned");
+            }
+        }
+    })?;
 
     // MP4 マルチプレクサーの初期化
     let mut muxer = Mp4FileMuxer::new()?;
@@ -343,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut first_keyframe = true;
 
     // エンコード済みフレームを MP4 に書き込む共通処理
-    let write_encoded_frame = |encoded: &EncodedFrame,
+    let write_encoded_frame = |encoded: &EncodedFrame<u64>,
                                file: &mut File,
                                muxer: &mut Mp4FileMuxer,
                                data_offset: &mut u64,
@@ -402,10 +416,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 v: &v,
             },
             &EncodeOptions::default(),
+            frame_idx,
         )?;
 
         // エンコード済みフレームを MP4 に書き込む
-        while let Some(encoded) = encoder.next_frame()? {
+        let mut guard = encoded_results
+            .lock()
+            .map_err(|_| std::io::Error::other("encoded results mutex is poisoned"))?;
+        let results = std::mem::take(&mut *guard);
+        drop(guard);
+        for result in results {
+            let encoded = result?;
             write_encoded_frame(
                 &encoded,
                 &mut file,
@@ -427,7 +448,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 残りのフレームをフラッシュ
     encoder.finish()?;
-    while let Some(encoded) = encoder.next_frame()? {
+    let mut guard = encoded_results
+        .lock()
+        .map_err(|_| std::io::Error::other("encoded results mutex is poisoned"))?;
+    let results = std::mem::take(&mut *guard);
+    drop(guard);
+    for result in results {
+        let encoded = result?;
         write_encoded_frame(
             &encoded,
             &mut file,

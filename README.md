@@ -66,7 +66,7 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameData,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FrameData,
     H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
@@ -91,27 +91,32 @@ let config = EncoderConfig {
     max_frame_delay_count: None,
 };
 
-let mut encoder = Encoder::new(config)?;
+let mut encoder = Encoder::new(config, |result: Result<EncodedFrame<u64>, Error>| {
+    match result {
+        Ok(encoded) => {
+            println!(
+                "encoded bytes: {} (user_data={})",
+                encoded.data.len(),
+                encoded.user_data
+            );
+        }
+        Err(e) => {
+            eprintln!("encode callback error: {e}");
+        }
+    }
+})?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
-encoder.encode(&frame, &EncodeOptions::default())?;
+encoder.encode(&frame, &EncodeOptions::default(), 0)?;
 
 // キーフレームを強制的に生成する
 encoder.encode(&frame, &EncodeOptions {
     force_key_frame: true,
-})?;
-
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("encoded bytes: {}", encoded.data.len());
-}
+}, 1)?;
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
 ```
 
 ### デコード
@@ -275,7 +280,7 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 
 `reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、`next_frame()` で取得できます。
+Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、エンコード完了コールバックで通知されます。
 
 ```rust
 // 動的に解像度を変更
@@ -301,11 +306,6 @@ let new_config = EncoderConfig {
     max_frame_delay_count: None,
 };
 encoder.reconfigure(new_config)?;
-
-// フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
 ```
 
 ### デコーダー
