@@ -701,10 +701,7 @@ fn h265_nal_unit_type(nalu: &[u8]) -> Option<u8> {
 
 // AVCC ストリーム内で最後に出現した H.264 SPS / PPS を抽出する。
 // 戻り値は (sps, pps) で、見つからないものは None。
-fn extract_h264_param_sets(
-    data: &[u8],
-    nalu_len_bytes: u32,
-) -> (Option<&[u8]>, Option<&[u8]>) {
+fn extract_h264_param_sets(data: &[u8], nalu_len_bytes: u32) -> (Option<&[u8]>, Option<&[u8]>) {
     let mut last_sps: Option<&[u8]> = None;
     let mut last_pps: Option<&[u8]> = None;
     let Some(iter) = AvccNaluIter::new(data, nalu_len_bytes) else {
@@ -765,7 +762,7 @@ fn detect_h264_change(
     }
     let sps = new_sps.unwrap_or(current_sps).to_vec();
     let pps = new_pps.unwrap_or(current_pps).to_vec();
-    log::info!("H.264 parameter set change detected, applying new format");
+    log::debug!("H.264 parameter set change detected, applying new format");
     Some(FormatState::H264 {
         sps,
         pps,
@@ -792,7 +789,7 @@ fn detect_hevc_change(
     let vps = new_vps.unwrap_or(current_vps).to_vec();
     let sps = new_sps.unwrap_or(current_sps).to_vec();
     let pps = new_pps.unwrap_or(current_pps).to_vec();
-    log::info!("H.265 parameter set change detected, applying new format");
+    log::debug!("H.265 parameter set change detected, applying new format");
     Some(FormatState::Hevc {
         vps,
         sps,
@@ -849,6 +846,36 @@ mod tests {
     }
 
     #[test]
+    fn iter_walks_all_nalus_len1() {
+        // 1 バイト長プレフィックスで複数 NAL ユニットを取り出せる
+        let mut data = Vec::new();
+        data.push(3u8);
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+        data.push(2u8);
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        let collected: Vec<&[u8]> = AvccNaluIter::new(&data, 1).unwrap().collect();
+        assert_eq!(collected, vec![&[0x01, 0x02, 0x03][..], &[0xAA, 0xBB][..]]);
+    }
+
+    #[test]
+    fn iter_walks_all_nalus_len2_big_endian() {
+        // 2 バイト長プレフィックスはビッグエンディアンとして解釈される
+        let mut data = Vec::new();
+        // 長さ 3 を 2 バイトビッグエンディアンで書き込む (0x00, 0x03)
+        data.extend_from_slice(&3u16.to_be_bytes());
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+        // 長さ 256 を 2 バイトビッグエンディアンで書き込む (0x01, 0x00)
+        // バイト順序が逆だと 0x0001 = 1 と誤解釈される
+        data.extend_from_slice(&256u16.to_be_bytes());
+        data.extend_from_slice(&[0xAA; 256]);
+        let collected: Vec<&[u8]> = AvccNaluIter::new(&data, 2).unwrap().collect();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0], &[0x01, 0x02, 0x03]);
+        assert_eq!(collected[1].len(), 256);
+        assert!(collected[1].iter().all(|b| *b == 0xAA));
+    }
+
+    #[test]
     fn detect_h264_change_no_change_returns_none() {
         let sps = vec![0x67, 0x42, 0x00, 0x1E];
         let pps = vec![0x68, 0xCE, 0x3C, 0x80];
@@ -888,9 +915,7 @@ mod tests {
         let state = detect_h264_change(&data, 4, &sps, &old_pps).expect("change expected");
         match state {
             FormatState::H264 {
-                sps: sps_out,
-                pps,
-                ..
+                sps: sps_out, pps, ..
             } => {
                 assert_eq!(sps_out, sps);
                 assert_eq!(pps, new_pps);

@@ -775,7 +775,7 @@ impl<T: Send + 'static> Encoder<T> {
             // ピクセルフォーマットの検証
             let format_type = sys::CVPixelBufferGetPixelFormatType(pixel_buffer_ptr.cast());
             let actual = match format_type {
-                x if x == u32::from_be_bytes(*b"y420") => PixelFormat::I420,
+                x if x == sys::kCVPixelFormatType_420YpCbCr8Planar => PixelFormat::I420,
                 x if x == sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => PixelFormat::Nv12,
                 _ => {
                     // 未知のフォーマットは I420 でも Nv12 でもないので、
@@ -1169,6 +1169,12 @@ impl<T: Send + 'static> Encoder<T> {
 
 impl<T: Send + 'static> Drop for Encoder<T> {
     fn drop(&mut self) {
+        // 未出力フレームをフラッシュしてコールバックを発火させる。
+        // フラッシュしないと sourceFrameRefCon で渡した Box<T> が永久に解放されない。
+        if let Err(e) = self.finish() {
+            log::error!("{e}");
+        }
+
         unsafe {
             sys::VTCompressionSessionInvalidate(self.session);
             sys::CFRelease(self.session as *const c_void);
