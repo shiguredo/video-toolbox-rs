@@ -1,6 +1,7 @@
 # `Decoder::decode` 内でビットストリームを解析し、SPS/PPS/シーケンスヘッダ変更を自動検出して `update_format` を呼ぶ
 
 Created: 2026-05-10
+Completed: 2026-05-10
 Model: Opus 4.7 (claude-opus-4-7[1m])
 
 ## 概要
@@ -83,3 +84,22 @@ VP9 / AV1 が未対応の段階では、該当コーデックでフォーマッ�
 
 `AnnexB` 形式の入力サポートはこの issue のスコープ外。本ライブラリは現状 AVCC を前提とする。
 将来、AnnexB のままデコードしたい要件が出た場合は別 issue とする。
+
+## 解決方法
+
+### 実装した変更
+
+1. `Decoder` 内部に `FormatState` (現在保持中の SPS / PPS / VPS / 解像度をコーデック別に持つ enum) を追加し、`Decoder::new` で `DecoderConfig::codec` から初期化する
+2. AVCC 走査用イテレータ `AvccNaluIter` を追加した。`nalu_len_bytes` は 1 / 2 / 4 のみ対応し、長さ 0 や残バイト超過の不正な長さフィールドに当たった時点で停止する (フェイルオープン)
+3. H.264 (NAL type 7 / 8) と H.265 (NAL type 32 / 33 / 34) のパラメータセット抽出関数 `extract_h264_param_sets` / `extract_h265_param_sets` を追加した。最後に出現したものを採用する
+4. `detect_h264_change` / `detect_hevc_change` を追加し、現在保持中のバイト列とパース結果を比較。差分があるときだけ新しい `FormatState` を返す。SPS のみ含まれる入力で PPS は現状維持できるよう、不在側は現値を引き継ぐ
+5. `Decoder::decode` の冒頭に `auto_detect_format_change` を呼び出す処理を追加した。差分検出時は `apply_format_change` 経由で `finish()` → 新 `CMVideoFormatDescription` 作成 → `VTDecompressionSessionCanAcceptFormatDescription` 判定 → 流用 or セッション再作成という従来の `update_format` 相当の処理を行う。再作成失敗時は `decode()` の戻り値で `Err` を返す
+6. 公開 API `Decoder::update_format` を削除した (破壊的変更)。内部処理は private な `apply_format_change` として残している
+7. `src/decoder.rs` の `#[cfg(test)] mod tests` にパーサー / 検出ロジックの単体テスト 11 件を追加した (NAL イテレータの境界条件、SPS / PPS / VPS の差分検出、不正バイト列でのフェイルオープン)
+8. `tests/test_decoder.rs` に `h264_decoder_inline_param_sets_no_change` を追加し、AVCC 入力に既存と同じ SPS / PPS が含まれるケースで自動検出が「変化なし」と判定してデコードを継続することを確認した
+9. `README.md` のデコーダー側「動的設定変更」セクションを「`decode()` だけで自動的に追従する」に書き換え、旧 `update_format` のサンプルを削除した
+10. `CHANGES.md` に `[CHANGE] Decoder::update_format を削除し、Decoder::decode で SPS / PPS / VPS 変更を自動検出する` を追記した
+
+### 含めなかった項目
+
+- VP9 / AV1 のビットストリームパーサーは未実装 (issue 本文の段階 2 / 3)。VP9 / AV1 の解像度変更が発生するストリームでは別途 `Decoder` を作り直す必要がある

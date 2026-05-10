@@ -30,9 +30,9 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的解像度変更
+- 動的設定変更
   - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新
+  - デコーダー: `Decoder::decode()` 呼び出しだけで H.264 / H.265 の SPS / PPS / VPS 変更を自動検出して追従
 - AVCC 形式の入出力
 
 ## 動作要件
@@ -314,46 +314,25 @@ encoder.reconfigure(new_config)?;
 
 ### デコーダー
 
-`update_format()` で新しいパラメータセットや解像度を渡してフォーマットを更新できます。H.264 / H.265 / VP9 / AV1 すべてのコーデックに対応しています。
+`Decoder::decode()` を呼ぶだけで、H.264 / H.265 の入力 (AVCC 形式) から SPS / PPS / VPS の変更を自動的に検出してフォーマットを追従します。利用側で明示的にフォーマット更新を呼ぶ必要はありません。
 
-Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合はセッションを流用、不可能な場合のみセッションを再作成します。
+内部では Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合はセッションを流用、不可能な場合のみセッションを再作成します。再作成時は未出力フレームを `finish()` でフラッシュしてから新セッションを作る順序で動作します。
 
 ```rust
-// H.264: SPS/PPS が更新された場合
-decoder.update_format(DecoderCodec::H264 {
-    sps: &new_sps,
-    pps: &new_pps,
-    nalu_len_bytes: 4,
-})?;
-
-// H.265: VPS/SPS/PPS が更新された場合
-decoder.update_format(DecoderCodec::Hevc {
-    vps: &new_vps,
-    sps: &new_sps,
-    pps: &new_pps,
-    nalu_len_bytes: 4,
-})?;
-
-// VP9: 解像度が変更された場合
-decoder.update_format(DecoderCodec::Vp9 {
-    width: 1280,
-    height: 720,
-})?;
-
-// AV1: 解像度が変更された場合
-decoder.update_format(DecoderCodec::Av1 {
-    width: 1280,
-    height: 720,
-})?;
+// H.264 / H.265 とも、入力ストリームに新しい SPS / PPS / VPS が現れれば
+// 次の decode() で自動的に検出され、内部でフォーマットが更新される。
+decoder.decode(&avcc_data, user_data)?;
 ```
+
+VP9 / AV1 はビットストリームパーサーを持たないため、自動検出は行いません。解像度変更が発生する VP9 / AV1 ストリームについては、現状は `Decoder` を作り直してください。
 
 ### まとめ
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| メソッド | `reconfigure()` | `update_format()` |
-| 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
+| メソッド | `reconfigure()` | (自動検出) |
+| 仕組み | 常にセッション破棄 + 再作成 | `decode()` 内で SPS / PPS / VPS を走査し、変化時のみ流用判定の上で再作成 |
+| 利用側の操作 | `EncoderConfig` を渡して呼ぶ | 通常通り `decode()` を呼ぶだけ |
 
 ## ライセンス
 

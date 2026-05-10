@@ -13,6 +13,11 @@
 
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
   - @melpon
+- [CHANGE] `Decoder::update_format` を削除し、`Decoder::decode` で SPS / PPS / VPS 変更を自動検出する
+  - H.264 / H.265 の入力 (AVCC 形式) を内部で走査し、SPS / PPS / VPS が変化したときのみ `CMVideoFormatDescription` を再構築する
+  - VP9 / AV1 は内部にビットストリームパーサーを持たないため自動検出は行わない (将来 issue で対応する)
+  - パース失敗時は既存セッションでデコードを続行する (フェイルオープン)
+  - @voluntas
 
 ### misc
 

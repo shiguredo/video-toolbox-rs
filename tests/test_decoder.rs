@@ -85,6 +85,63 @@ fn decoder_av1_rejects_height_above_i32_max() {
     ));
 }
 
+/// 同一の SPS/PPS が NAL に含まれていても自動検出は変化なしと判定し、デコードが成功する
+#[test]
+fn h264_decoder_inline_param_sets_no_change() -> Result<(), Error> {
+    let sps = [
+        103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22, 45,
+        150,
+    ];
+    let pps = [104, 235, 227, 203, 34, 192];
+    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::H264 {
+                sps: &sps,
+                pps: &pps,
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::I420,
+        },
+        {
+            let results = Arc::clone(&results);
+            move |result| {
+                push_decode_event(&results, result);
+            }
+        },
+    )?;
+
+    // 既存と同じ SPS/PPS を入力ストリームの先頭に含めても検出は変化なしになり、
+    // 続く IDR スライスを通常通りデコードできる。
+    let nal_unit = [
+        101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247,
+        102, 163, 229, 208, 146, 229, 251, 16, 96, 250, 208, 0, 0, 3, 0, 0, 3, 0, 0, 16, 15, 210,
+        222, 245, 204, 98, 91, 229, 32, 0, 0, 9, 216, 2, 56, 13, 16, 118, 133, 116, 69, 196, 32,
+        71, 6, 120, 150, 16, 161, 210, 50, 128, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0,
+        3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 37, 225,
+    ];
+    let mut data = Vec::new();
+    data.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+    data.extend_from_slice(&sps);
+    data.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+    data.extend_from_slice(&pps);
+    data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
+    data.extend_from_slice(&nal_unit);
+    decoder.decode(&data, 13)?;
+    decoder.finish()?;
+
+    let callbacks = take_results(&results);
+    assert_eq!(callbacks.len(), 1);
+    match callbacks.into_iter().next().expect("callback missing") {
+        DecodeEvent::I420 { user_data, .. } => {
+            assert_eq!(user_data, 13);
+        }
+        DecodeEvent::Nv12 { .. } => unreachable!("expected I420 but got NV12"),
+        DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+    }
+    Ok(())
+}
+
 #[test]
 fn h264_decoder() -> Result<(), Error> {
     let sps = [
