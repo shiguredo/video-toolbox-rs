@@ -21,7 +21,7 @@
 
 ### misc
 
-- README をコールバックベース API と `ReconfigureParams` / `Decoder::decode` 自動検出に合わせて更新する
+- README をコールバックベース API と `Decoder::decode` 自動検出に合わせて更新する
   - @voluntas
 - `examples/raden_to_mp4.rs` をコールバックベース API に追従する
   - @voluntas
