@@ -1,7 +1,4 @@
-use std::{
-    ffi::{c_int, c_void},
-    mem::MaybeUninit,
-};
+use std::ffi::{c_int, c_void};
 
 use crate::{
     error::Error,
@@ -278,14 +275,12 @@ impl<T: Send + 'static> Decoder<T> {
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
-            // 現行 SDK では `VTDecompressionOutputCallbackRecord` はコールバック関数ポインタと refcon の 2 フィールドのみ。
-            // ゼロ初期化で refcon は NULL。続けてコールバックと refcon を代入する方針である（issue 0025）。
-            let mut callback =
-                MaybeUninit::<sys::VTDecompressionOutputCallbackRecord>::zeroed().assume_init();
-            callback.decompressionOutputCallback = Some(Self::output_callback);
-            callback.decompressionOutputRefCon = (callback_ref_con as *const BoxDecodeCallback<T>)
-                .cast::<c_void>()
-                .cast_mut();
+            let callback = sys::VTDecompressionOutputCallbackRecord {
+                decompressionOutputCallback: Some(Self::output_callback),
+                decompressionOutputRefCon: (callback_ref_con as *const BoxDecodeCallback<T>)
+                    .cast::<c_void>()
+                    .cast_mut(),
+            };
 
             let cv_pixel_format = match pixel_format {
                 PixelFormat::I420 => sys::kCVPixelFormatType_420YpCbCr8Planar,
