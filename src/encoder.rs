@@ -130,8 +130,36 @@ pub struct EncodeOptions {
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
+/// エンコード完了通知ハンドラー
+///
+/// `Encoder::new()` に渡すコールバックを trait 化したもの。
+/// クロージャで実装する場合は [`FnEncodeHandler`] を使う。
+pub trait EncodeHandler<T>: Send + 'static {
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, Error>);
+}
+
+/// `FnMut(Result<EncodedFrame<T>, Error>)` を [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<F>(F);
+
+impl<F> FnEncodeHandler<F> {
+    /// `FnMut(Result<EncodedFrame<T>, Error>)` から [`EncodeHandler`] を構築する
+    pub fn new(f: F) -> Self {
+        Self(f)
+    }
+}
+
+impl<T, F> EncodeHandler<T> for FnEncodeHandler<F>
+where
+    F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+{
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, Error>) {
+        (self.0)(result);
+    }
+}
+
 // エンコード完了通知コールバック型
-type EncodeCallback<T> = dyn FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static;
+type EncodeCallback<T> = dyn EncodeHandler<T> + Send + 'static;
 
 // `outputCallbackRefCon` で受け渡すコールバック本体。
 // FFI へは `&BoxEncodedCallback<T>` のポインタを渡す。
@@ -159,7 +187,7 @@ pub enum FrameData<'a> {
 
 /// H.264 / H.265 エンコーダー
 ///
-/// エンコード完了時に `FnMut(Result<EncodedFrame<T>, Error>)` を呼び出す。
+/// エンコード完了時に [`EncodeHandler`] を呼び出す。
 /// コールバックは Video Toolbox のコールバックスレッドで実行される。
 pub struct Encoder<T: Send + 'static> {
     session: sys::VTCompressionSessionRef,
@@ -170,9 +198,9 @@ pub struct Encoder<T: Send + 'static> {
 
 impl<T: Send + 'static> Encoder<T> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new<F>(config: EncoderConfig, on_encoded: F) -> Result<Self, Error>
+    pub fn new<H>(config: EncoderConfig, on_encoded: H) -> Result<Self, Error>
     where
-        F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
+        H: EncodeHandler<T>,
     {
         Self::validate_config(&config)?;
         // EncodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
@@ -876,8 +904,7 @@ impl<T: Send + 'static> Encoder<T> {
         callback: &mut BoxEncodedCallback<T>,
         result: Result<EncodedFrame<T>, Error>,
     ) {
-        let callback = callback.as_mut();
-        (callback)(result);
+        callback.on_encoded(result);
     }
 
     unsafe extern "C" fn output_callback_h264(

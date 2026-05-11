@@ -66,8 +66,8 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FrameData,
-    H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
 let config = EncoderConfig {
@@ -91,20 +91,22 @@ let config = EncoderConfig {
     max_frame_delay_count: None,
 };
 
-let mut encoder = Encoder::new(config, |result: Result<EncodedFrame<u64>, Error>| {
-    match result {
-        Ok(encoded) => {
-            println!(
-                "encoded bytes: {} (user_data={})",
-                encoded.data.len(),
-                encoded.user_data
-            );
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(
+    |result: Result<EncodedFrame<u64>, Error>| {
+        match result {
+            Ok(encoded) => {
+                println!(
+                    "encoded bytes: {} (user_data={})",
+                    encoded.data.len(),
+                    encoded.user_data
+                );
+            }
+            Err(e) => {
+                eprintln!("encode callback error: {e}");
+            }
         }
-        Err(e) => {
-            eprintln!("encode callback error: {e}");
-        }
-    }
-})?;
+    },
+))?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
@@ -122,7 +124,7 @@ encoder.finish()?;
 ### デコード
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, FnDecodeHandler, PixelFormat};
 
 // H.264 デコーダー (SPS / PPS が必要)
 let mut decoder = Decoder::new(DecoderConfig {
@@ -132,7 +134,7 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-}, |result: Result<DecodedFrame<u64>, _>| {
+}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, _>| {
     match result {
         Ok(DecodedFrame::I420 { frame, user_data }) => {
             let y = frame.y_plane();
@@ -149,7 +151,7 @@ let mut decoder = Decoder::new(DecoderConfig {
             eprintln!("decode callback error: {e}");
         }
     }
-})?;
+}))?;
 
 // AVCC フォーマットのデータを非同期デコード
 decoder.decode(&avcc_data, 42)?;
@@ -259,12 +261,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat};
 
 match Decoder::<()>::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}, |_| {}) {
+}, FnDecodeHandler::new(|_| {})) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");

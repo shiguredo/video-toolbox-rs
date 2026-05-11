@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use shiguredo_video_toolbox::{
-    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat, VideoCodecType,
-    supported_codecs,
+    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat,
+    VideoCodecType, supported_codecs,
 };
 
 const WIDTH: u32 = 640;
@@ -56,7 +56,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_| {}),
     );
     assert!(matches!(
         r,
@@ -74,7 +74,7 @@ fn decoder_av1_rejects_height_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_| {}),
     );
     assert!(matches!(
         r,
@@ -102,12 +102,12 @@ fn h264_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
             move |result| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     let nal_unit = [
@@ -166,12 +166,12 @@ fn h265_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
             move |result| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     let nal_unit = [
@@ -229,7 +229,7 @@ fn init_av1_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_| {}),
     ) {
         Ok(_) => Ok(()),
         Err(Error::UnsupportedCodec { .. }) => Ok(()),
@@ -405,12 +405,12 @@ fn vp9_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
             move |result| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     for (i, encoded_data) in encoded_frames.iter().enumerate() {

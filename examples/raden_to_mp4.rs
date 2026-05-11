@@ -19,8 +19,8 @@ use shiguredo_mp4::mux::{Mp4FileMuxer, Sample};
 use shiguredo_mp4::{TrackKind, Uint};
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error as VideoToolboxError,
-    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
-    PixelFormat as VideoPixelFormat,
+    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
+    HevcProfile, PixelFormat as VideoPixelFormat,
 };
 
 const DEFAULT_WIDTH: u32 = 1280;
@@ -331,13 +331,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_frame_delay_count: None,
     };
     let (encoded_result_tx, encoded_result_rx) = mpsc::channel::<EncodedResult>();
-    let mut encoder = Encoder::new(config, {
-        move |result| {
-            if encoded_result_tx.send(result).is_err() {
-                eprintln!("encoded results receiver is dropped");
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            move |result| {
+                if encoded_result_tx.send(result).is_err() {
+                    eprintln!("encoded results receiver is dropped");
+                }
             }
-        }
-    })?;
+        }),
+    )?;
 
     // MP4 マルチプレクサーの初期化
     let mut muxer = Mp4FileMuxer::new()?;

@@ -55,9 +55,37 @@ pub struct DecoderConfig<'a> {
     pub pixel_format: PixelFormat,
 }
 
+/// デコード完了通知ハンドラー
+///
+/// `Decoder::new()` に渡すコールバックを trait 化したもの。
+/// クロージャで実装する場合は [`FnDecodeHandler`] を使う。
+pub trait DecodeHandler<T>: Send + 'static {
+    /// デコード完了時に呼ばれる
+    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, Error>);
+}
+
+/// `FnMut(Result<DecodedFrame<T>, Error>)` を [`DecodeHandler`] にするラッパー
+pub struct FnDecodeHandler<F>(F);
+
+impl<F> FnDecodeHandler<F> {
+    /// `FnMut(Result<DecodedFrame<T>, Error>)` から [`DecodeHandler`] を構築する
+    pub fn new(f: F) -> Self {
+        Self(f)
+    }
+}
+
+impl<T, F> DecodeHandler<T> for FnDecodeHandler<F>
+where
+    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+{
+    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, Error>) {
+        (self.0)(result);
+    }
+}
+
 // デコード完了通知コールバック型
 // `Err` の場合はデコード失敗や出力欠落を表す。
-type DecodeCallback<T> = dyn FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static;
+type DecodeCallback<T> = dyn DecodeHandler<T> + Send + 'static;
 
 // `decompressionOutputRefCon` で受け渡すコールバック本体。
 // FFI へは `&BoxDecodeCallback<T>` のポインタを渡す。
@@ -79,7 +107,7 @@ struct PendingDecode<T> {
 
 /// H.264 / H.265 / VP9 / AV1 デコーダー
 ///
-/// デコード完了時に `FnMut(Result<DecodedFrame<T>, Error>)` を呼び出す。
+/// デコード完了時に [`DecodeHandler`] を呼び出す。
 /// コールバックは Video Toolbox のコールバックスレッドで実行される。
 pub struct Decoder<T: Send + 'static> {
     description: sys::CMVideoFormatDescriptionRef,
@@ -90,9 +118,9 @@ pub struct Decoder<T: Send + 'static> {
 
 impl<T: Send + 'static> Decoder<T> {
     /// デコーダーのインスタンスを生成する
-    pub fn new<F>(config: DecoderConfig<'_>, on_decoded: F) -> Result<Self, Error>
+    pub fn new<H>(config: DecoderConfig<'_>, on_decoded: H) -> Result<Self, Error>
     where
-        F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+        H: DecodeHandler<T>,
     {
         // `DecodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
         let callback = Box::new(Box::new(on_decoded) as BoxDecodeCallback<T>);
@@ -401,8 +429,7 @@ impl<T: Send + 'static> Decoder<T> {
         callback: &mut BoxDecodeCallback<T>,
         result: Result<DecodedFrame<T>, Error>,
     ) {
-        let callback = callback.as_mut();
-        (callback)(result);
+        callback.on_decoded(result);
     }
 
     unsafe extern "C" fn output_callback(
