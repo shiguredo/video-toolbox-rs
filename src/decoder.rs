@@ -68,8 +68,12 @@ type BoxDecodeCallback<T> = Box<DecodeCallback<T>>;
 struct PendingDecode<T> {
     user_data: T,
     pixel_format: PixelFormat,
+    // 以下はデコード中の寿命が切れないようにするために必要
+    #[expect(dead_code)]
     owned: Vec<u8>,
+    #[expect(dead_code)]
     block_buffer: CfPtrMut<OpaqueCMBlockBuffer>,
+    #[expect(dead_code)]
     sample_buffer: CfPtrMut<opaqueCMSampleBuffer>,
 }
 
@@ -425,9 +429,7 @@ impl<T: Send + 'static> Decoder<T> {
         let PendingDecode {
             user_data,
             pixel_format,
-            owned: _owned,
-            block_buffer: _block_buffer,
-            sample_buffer: _sample_buffer,
+            ..
         } = *pending;
 
         if let Err(e) = Error::check(status, callback_name) {
