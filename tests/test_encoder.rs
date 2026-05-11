@@ -9,6 +9,7 @@ use std::{
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FrameData,
     H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat,
+    ReconfigureParams,
 };
 
 const WIDTH: u32 = 960;
@@ -373,6 +374,187 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
         })
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
+    Ok(())
+}
+
+#[test]
+fn reconfigure_no_op_when_all_none() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
+
+    let before_bitrate = encoder.config().average_bitrate;
+    let before_fps_num = encoder.config().fps_numerator;
+    let before_fps_den = encoder.config().fps_denominator;
+
+    encoder.reconfigure(ReconfigureParams::default())?;
+
+    // 全項目 None なら設定は変化しない
+    assert_eq!(encoder.config().average_bitrate, before_bitrate);
+    assert_eq!(encoder.config().fps_numerator, before_fps_num);
+    assert_eq!(encoder.config().fps_denominator, before_fps_den);
+
+    // 後続の encode が成功することを確認
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.finish()?;
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].is_ok());
+    Ok(())
+}
+
+#[test]
+fn reconfigure_updates_average_bitrate() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(500_000),
+        expected_frame_rate: None,
+    })?;
+
+    assert_eq!(encoder.config().average_bitrate, Some(500_000));
+    Ok(())
+}
+
+#[test]
+fn reconfigure_updates_expected_frame_rate() -> Result<(), Error> {
+    let mut config = encoder_config(false);
+    // 分数 fps を初期値にしておき、reconfigure 後に分母が 1 に正規化されることを確認する
+    config.fps_numerator = 30_000;
+    config.fps_denominator = 1_001;
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: None,
+        expected_frame_rate: Some(60),
+    })?;
+
+    assert_eq!(encoder.config().fps_numerator, 60);
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_zero_expected_frame_rate() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let r = encoder.reconfigure(ReconfigureParams {
+        average_bitrate: None,
+        expected_frame_rate: Some(0),
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must not be zero"
+        })
+    ));
+    // 失敗時には設定が変更されていないこと
+    assert_eq!(encoder.config().fps_numerator, 1);
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_expected_frame_rate_above_i32_max() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let r = encoder.reconfigure(ReconfigureParams {
+        average_bitrate: None,
+        expected_frame_rate: Some(i32::MAX as u32 + 1),
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must fit in i32 for CFNumber"
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_average_bitrate_above_i64_max() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let before = encoder.config().average_bitrate;
+    let r = encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(i64::MAX as u64 + 1),
+        expected_frame_rate: None,
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must fit in i64 for CFNumber"
+        })
+    ));
+    // 失敗時には設定が変更されていないこと
+    assert_eq!(encoder.config().average_bitrate, before);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_preserves_encode_after_update() -> Result<(), Error> {
+    // セッションが継続することを確認する: reconfigure 前後で同じセッションを使ってエンコードが連続できる
+    let config = encoder_config(false);
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    encoder.encode(&frame, &EncodeOptions::default(), 1)?;
+    encoder.encode(&frame, &EncodeOptions::default(), 2)?;
+
+    // 動的更新ではセッションを再作成しないため、未出力フレームのフラッシュもしない
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(750_000),
+        expected_frame_rate: Some(15),
+    })?;
+
+    encoder.encode(&frame, &EncodeOptions::default(), 3)?;
+    encoder.encode(&frame, &EncodeOptions::default(), 4)?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 4);
+    assert_eq!(callbacks.len(), 4);
+
+    // 受け取った user_data が入力順に並ぶことを確認する (B フレーム未使用のため順序維持される)
+    let user_data = callbacks
+        .into_iter()
+        .map(|r| match r {
+            Ok(frame) => frame.user_data,
+            Err(e) => panic!("unexpected encode callback error: {e}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(user_data, vec![1, 2, 3, 4]);
     Ok(())
 }
 

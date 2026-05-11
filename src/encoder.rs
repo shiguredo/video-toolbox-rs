@@ -127,6 +127,26 @@ pub struct EncodeOptions {
     pub force_key_frame: bool,
 }
 
+/// `Encoder::reconfigure` で動的に更新可能なエンコードパラメータ
+///
+/// `None` のフィールドは現在値を維持する。全項目 `None` の場合は no-op となる。
+///
+/// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
+/// 項目はここに含まれていない。これらを変更する場合は `Encoder` を作り直す。
+#[derive(Debug, Clone, Default)]
+pub struct ReconfigureParams {
+    /// kVTCompressionPropertyKey_AverageBitRate (bps 単位)
+    pub average_bitrate: Option<u64>,
+
+    /// kVTCompressionPropertyKey_ExpectedFrameRate (整数 fps)
+    ///
+    /// VideoToolbox の `ExpectedFrameRate` が単一整数しか受け付けないため、
+    /// `reconfigure` 経由で更新すると `EncoderConfig::fps_denominator` は `1` に正規化される。
+    /// 29.97 fps (30000/1001) など分数フレームレートを維持したい場合は `reconfigure` を使わず
+    /// `Encoder` を作り直すこと。
+    pub expected_frame_rate: Option<u32>,
+}
+
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
@@ -165,6 +185,12 @@ pub struct Encoder<T: Send + 'static> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
+    // VTCompressionSessionCreate の outputCallbackRefCon に
+    // `&EncodeCallbackBox<T>` のポインタを渡しているため、
+    // Encoder の生存期間中はこの Box の参照先を維持する必要がある。
+    // Rust コードから直接参照することは無いが、Video Toolbox のコールバックスレッドが
+    // このポインタ越しに Box の中身を呼び出す。
+    #[allow(dead_code)]
     callback: Box<EncodeCallbackBox<T>>,
 }
 
@@ -187,28 +213,68 @@ impl<T: Send + 'static> Encoder<T> {
         })
     }
 
-    /// 新しい設定でエンコーダーを再作成する
+    /// 現在エンコーダーが保持している設定を返す
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
+    /// 動的に変更可能なエンコードパラメータを更新する
     ///
-    /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
-    /// 新しい設定でセッションを再作成する。
-    /// フラッシュされたフレームはエンコード完了コールバックで通知される。
-    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
-        Self::validate_config(&config)?;
-        // 未出力フレームをフラッシュ（完了通知はコールバックで受け取る）
-        self.finish()?;
+    /// `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。
+    /// セッション再作成は行わないため、未出力フレームのフラッシュや `next_input_pts` のリセットも行わない。
+    ///
+    /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
+    /// `VTSessionSetProperties` が失敗した場合は `self.config` は更新せず、セッションも生かしたままエラーを返す。
+    ///
+    /// 解像度・コーデック・ピクセルフォーマットを変更したい場合はこの API では対応できないため
+    /// `Encoder` を作り直すこと。これは libwebrtc の `RTCVideoEncoderH264.mm` `setBitrate:framerate:` と
+    /// 同じ方針である。
+    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+        // 全項目 `None` のときは API 呼び出し自体を省略する
+        if params.average_bitrate.is_none() && params.expected_frame_rate.is_none() {
+            return Ok(());
+        }
+
+        Self::validate_reconfigure_params(&params)?;
 
         unsafe {
-            // 新しいセッションを先に作成する
-            // 失敗時に self が不整合にならないようにする
-            let session = Self::create_compression_session(&config, self.callback.as_ref())?;
+            let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
+            let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
 
-            // 新しいセッションの作成に成功してから既存のセッションを破棄する
-            sys::VTCompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
+            if let Some(bitrate) = params.average_bitrate {
+                let value = cf_number_i64(bitrate as i64)?;
+                properties.push((
+                    sys::kVTCompressionPropertyKey_AverageBitRate,
+                    value.0,
+                ));
+                cf_objects.push(value);
+            }
+            if let Some(fps) = params.expected_frame_rate {
+                let value = cf_number_i32(fps as i32)?;
+                properties.push((
+                    sys::kVTCompressionPropertyKey_ExpectedFrameRate,
+                    value.0,
+                ));
+                cf_objects.push(value);
+            }
 
-            self.session = session;
-            self.config = config;
-            self.next_input_pts = 0;
+            let properties_dict = cf_dictionary(&properties)?;
+            let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
+            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
+            Error::check(status, "VTSessionSetProperties")?;
+        }
+
+        // VTSessionSetProperties が成功した後だけ self.config を更新する。
+        // 失敗時はこの行に到達しないため、設定の不整合は発生しない。
+        if let Some(bitrate) = params.average_bitrate {
+            self.config.average_bitrate = Some(bitrate);
+        }
+        if let Some(fps) = params.expected_frame_rate {
+            // VideoToolbox の `ExpectedFrameRate` は単一整数しか受け付けないため、
+            // 分子に値を入れて分母を 1 に正規化する。
+            // `CMTimeMake` の timescale は `fps_numerator` を参照するため、PTS 計算もこれで整合する。
+            self.config.fps_numerator = fps;
+            self.config.fps_denominator = 1;
         }
 
         Ok(())
@@ -467,6 +533,33 @@ impl<T: Send + 'static> Encoder<T> {
                 field: "average_bitrate",
                 reason: "must fit in i64 for CFNumber",
             });
+        }
+        Ok(())
+    }
+
+    /// `reconfigure` に渡された `ReconfigureParams` を検証する
+    fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
+        if let Some(bitrate) = params.average_bitrate
+            && bitrate > i64::MAX as u64
+        {
+            return Err(Error::InvalidConfig {
+                field: "average_bitrate",
+                reason: "must fit in i64 for CFNumber",
+            });
+        }
+        if let Some(fps) = params.expected_frame_rate {
+            if fps == 0 {
+                return Err(Error::InvalidConfig {
+                    field: "expected_frame_rate",
+                    reason: "must not be zero",
+                });
+            }
+            if fps > i32::MAX as u32 {
+                return Err(Error::InvalidConfig {
+                    field: "expected_frame_rate",
+                    reason: "must fit in i32 for CFNumber",
+                });
+            }
         }
         Ok(())
     }

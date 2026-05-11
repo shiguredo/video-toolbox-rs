@@ -276,41 +276,36 @@ match Decoder::<()>::new(DecoderConfig {
 }
 ```
 
-## 動的解像度変更
+## 動的フォーマット変更
 
-WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に解像度が変わるユースケースに対応しています。
+WebRTC やアダプティブビットレートストリーミングなど、ストリーム中にビットレート・フレームレートやフォーマットが変わるユースケースに対応しています。
 
 ### エンコーダー
 
-`reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
+`reconfigure()` で `ReconfigureParams` を渡し、`VTSessionSetProperties` ベースで動的プロパティを更新します。セッションは再作成されないため、未出力フレームのフラッシュや `next_input_pts` のリセットは行われません。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、エンコード完了コールバックで通知されます。
+Video Toolbox の `VTCompressionSession` は解像度・コーデック・ピクセルフォーマットの動的変更を仕様上サポートしないため、これらを変更する場合は `Encoder` を作り直してください。
 
 ```rust
-// 動的に解像度を変更
-// 未出力フレームは自動的にフラッシュされる
-let new_config = EncoderConfig {
-    width: 1280,
-    height: 720,
-    codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
-    }),
-    pixel_format: PixelFormat::I420,
+// 動的に bitrate と framerate を更新
+// `None` のフィールドは現在値を維持する
+encoder.reconfigure(ReconfigureParams {
     average_bitrate: Some(2_000_000),
-    fps_numerator: 30,
-    fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
-    max_key_frame_interval: None,
-    max_key_frame_interval_duration: None,
-    max_frame_delay_count: None,
-};
-encoder.reconfigure(new_config)?;
+    expected_frame_rate: Some(30),
+})?;
 ```
+
+`ReconfigureParams::default()` は全項目 `None` で初期化されるため、更新したい項目だけを指定できます。
+
+```rust
+// bitrate のみ更新する
+encoder.reconfigure(ReconfigureParams {
+    average_bitrate: Some(1_500_000),
+    ..ReconfigureParams::default()
+})?;
+```
+
+`expected_frame_rate` は `EncoderConfig` の `fps_numerator` / `fps_denominator` ペアではなく単一整数で受け取ります。これは VideoToolbox の `kVTCompressionPropertyKey_ExpectedFrameRate` が単一数値しか受け付けないためです。`reconfigure` 経由で更新すると `fps_denominator` は `1` に正規化されるため、29.97 fps (30000/1001) など分数フレームレートを維持したい場合は `Encoder` を作り直してください。
 
 ### デコーダー
 
@@ -352,8 +347,9 @@ decoder.update_format(DecoderCodec::Av1 {
 | | エンコーダー | デコーダー |
 |---|---|---|
 | メソッド | `reconfigure()` | `update_format()` |
-| 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
+| 仕組み | `VTSessionSetProperties` で動的プロパティ更新 (セッション再作成なし) | セッション流用を判定し、不可能な場合のみ再作成 |
+| 引数 | `ReconfigureParams` (動的更新可能な項目のみ) | `DecoderCodec` (パラメータセットのみ) |
+| 解像度・コーデック変更 | 非対応 (`Encoder` を作り直す) | 対応 |
 
 ## ライセンス
 

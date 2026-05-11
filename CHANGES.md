@@ -11,8 +11,19 @@
 
 ## develop
 
+- [ADD] `ReconfigureParams` 構造体を追加する
+  - `average_bitrate` / `expected_frame_rate` を動的に変更可能にする
+  - @voluntas
+- [ADD] `Encoder::config()` ゲッターを追加する
+  - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
   - @melpon
+- [CHANGE] `Encoder::reconfigure` を動的プロパティ更新専用 API に変更する
+  - 引数を `EncoderConfig` から `ReconfigureParams` (所有権渡し) に変更する
+  - `VTSessionSetProperties` ベースの実装に置き換え、セッション再作成を行わない
+  - 動的に変更可能な項目を `average_bitrate` / `expected_frame_rate` に限定する
+  - 解像度・コーデック・ピクセルフォーマットの変更は `Encoder` 再生成で対応する
+  - @voluntas
 
 ### misc
 

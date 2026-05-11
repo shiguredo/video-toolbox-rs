@@ -24,7 +24,7 @@ pub use codec_info::{
 pub use decoder::{DecodedFrame, Decoder, DecoderCodec, DecoderConfig, I420Frame, Nv12Frame};
 pub use encoder::{
     CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, FrameData, H264EncoderConfig,
-    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
+    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, ReconfigureParams,
 };
 pub use error::Error;
 pub use types::PixelFormat;
