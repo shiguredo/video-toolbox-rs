@@ -2,7 +2,7 @@ use std::ffi::{c_int, c_void};
 
 use crate::{
     error::Error,
-    sys,
+    sys::{self, OpaqueCMBlockBuffer, opaqueCMSampleBuffer},
     types::{
         CfPtr, CfPtrMut, PixelFormat, cf_dictionary, cf_number_i32,
         validate_video_dimensions_for_toolbox,
@@ -69,8 +69,8 @@ struct PendingDecode<T> {
     user_data: T,
     pixel_format: PixelFormat,
     owned: Vec<u8>,
-    block_buffer: CfPtrMut<c_void>,
-    sample_buffer: CfPtrMut<c_void>,
+    block_buffer: CfPtrMut<OpaqueCMBlockBuffer>,
+    sample_buffer: CfPtrMut<opaqueCMSampleBuffer>,
 }
 
 /// H.264 / H.265 / VP9 / AV1 デコーダー
@@ -327,12 +327,12 @@ impl<T: Send + 'static> Decoder<T> {
                 &mut block_buffer_ref,
             );
             Error::check(status, "CMBlockBufferCreateWithMemoryBlock")?;
-            let block_buffer = CfPtrMut(block_buffer_ref.cast::<c_void>());
+            let block_buffer = CfPtrMut(block_buffer_ref);
 
             let mut sample_buffer_ref = std::ptr::null_mut();
             let status = sys::CMSampleBufferCreateReady(
                 std::ptr::null_mut(),
-                block_buffer.0.cast(),
+                block_buffer.0,
                 self.description,
                 1,
                 0,
@@ -342,7 +342,7 @@ impl<T: Send + 'static> Decoder<T> {
                 &mut sample_buffer_ref,
             );
             Error::check(status, "CMSampleBufferCreateReady")?;
-            let sample_buffer = CfPtrMut(sample_buffer_ref.cast::<c_void>());
+            let sample_buffer = CfPtrMut(sample_buffer_ref);
 
             let pending = Box::new(PendingDecode {
                 user_data,
