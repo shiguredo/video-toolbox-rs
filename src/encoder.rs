@@ -243,18 +243,12 @@ impl<T: Send + 'static> Encoder<T> {
 
             if let Some(bitrate) = params.average_bitrate {
                 let value = cf_number_i64(bitrate as i64)?;
-                properties.push((
-                    sys::kVTCompressionPropertyKey_AverageBitRate,
-                    value.0,
-                ));
+                properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
                 cf_objects.push(value);
             }
             if let Some(fps) = params.expected_frame_rate {
                 let value = cf_number_i32(fps as i32)?;
-                properties.push((
-                    sys::kVTCompressionPropertyKey_ExpectedFrameRate,
-                    value.0,
-                ));
+                properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
                 cf_objects.push(value);
             }
 
