@@ -276,15 +276,15 @@ match Decoder::<()>::new(DecoderConfig {
 }
 ```
 
-## 動的フォーマット変更
+## 動的設定変更
 
-WebRTC やアダプティブビットレートストリーミングなど、ストリーム中にビットレート・フレームレートやフォーマットが変わるユースケースに対応しています。
+WebRTC やアダプティブビットレートストリーミングなど、ストリーム中にビットレートやフレームレートを変更したり、デコーダー側のフォーマットが変わったりするユースケースに対応しています。
 
 ### エンコーダー
 
-`reconfigure()` で `ReconfigureParams` を渡し、`VTSessionSetProperties` ベースで動的プロパティを更新します。セッションは再作成されないため、未出力フレームのフラッシュや `next_input_pts` のリセットは行われません。
+エンコーダーで動的に変更できるのはビットレートとフレームレートのみです。解像度・コーデック・ピクセルフォーマットを変更する場合は `Encoder` を作り直してください（Video Toolbox の `VTCompressionSession` が仕様上これらの動的変更をサポートしないため）。
 
-Video Toolbox の `VTCompressionSession` は解像度・コーデック・ピクセルフォーマットの動的変更を仕様上サポートしないため、これらを変更する場合は `Encoder` を作り直してください。
+`reconfigure()` で `ReconfigureParams` を渡し、`VTSessionSetProperties` ベースで動的プロパティを更新します。セッション再作成は行わないため、未出力フレームのフラッシュは行われません。`expected_frame_rate` を更新した場合は、内部の PTS カウンタを新しい timescale に再スケールして物理時間が連続するようにします。
 
 ```rust
 // 動的に bitrate と framerate を更新

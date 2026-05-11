@@ -144,6 +144,9 @@ pub struct ReconfigureParams {
     /// `reconfigure` 経由で更新すると `EncoderConfig::fps_denominator` は `1` に正規化される。
     /// 29.97 fps (30000/1001) など分数フレームレートを維持したい場合は `reconfigure` を使わず
     /// `Encoder` を作り直すこと。
+    ///
+    /// なお更新時には内部の `next_input_pts` も新しい timescale に合わせて再スケールするため、
+    /// 出力 CMSampleBuffer の PTS は物理時間として連続する。
     pub expected_frame_rate: Option<u32>,
 }
 
@@ -214,6 +217,13 @@ impl<T: Send + 'static> Encoder<T> {
     }
 
     /// 現在エンコーダーが保持している設定を返す
+    ///
+    /// 戻り値はユーザーが要求した最新の設定値であり、`VTSessionSetProperties` が
+    /// バックエンドで丸めた実効値とは異なる可能性がある点に注意。
+    ///
+    /// また [`Encoder::reconfigure`] 経由で `expected_frame_rate` を更新すると、
+    /// 戻り値の `fps_numerator` / `fps_denominator` は新しい値 / `1` に正規化される
+    /// （[`ReconfigureParams::expected_frame_rate`] のドキュメント参照）。
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -221,10 +231,13 @@ impl<T: Send + 'static> Encoder<T> {
     /// 動的に変更可能なエンコードパラメータを更新する
     ///
     /// `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。
-    /// セッション再作成は行わないため、未出力フレームのフラッシュや `next_input_pts` のリセットも行わない。
+    /// セッション再作成は行わないため、未出力フレームのフラッシュは行わない。
     ///
-    /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
+    /// 全項目 `None` の場合は no-op として `Ok(())` を返す（意図的な挙動）。
     /// `VTSessionSetProperties` が失敗した場合は `self.config` は更新せず、セッションも生かしたままエラーを返す。
+    ///
+    /// `expected_frame_rate` を更新した場合は、内部の `next_input_pts` を新しい timescale に再スケールして
+    /// PTS の物理時間が連続するようにする（再スケール結果が `i64` を超えた場合は [`Error::LimitExceeded`]）。
     ///
     /// 解像度・コーデック・ピクセルフォーマットを変更したい場合はこの API では対応できないため
     /// `Encoder` を作り直すこと。これは libwebrtc の `RTCVideoEncoderH264.mm` `setBitrate:framerate:` と
@@ -236,6 +249,24 @@ impl<T: Send + 'static> Encoder<T> {
         }
 
         Self::validate_reconfigure_params(&params)?;
+
+        // VTSessionSetProperties 実行前に `next_input_pts` の再スケール値を確定させる。
+        // ここで失敗すればセッション側は一切変更されない。
+        let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
+            // 物理時間を保つために `new_pts = old_pts * new_timescale / old_timescale` で再スケールする。
+            // `i128` 中間表現でオーバーフローを避ける（`old_pts: i64`、`new_timescale: u32` の積）。
+            let old_timescale = self.config.fps_numerator as i128;
+            let new_timescale = fps as i128;
+            let rescaled = self.next_input_pts as i128 * new_timescale / old_timescale;
+            if !(i64::MIN as i128..=i64::MAX as i128).contains(&rescaled) {
+                return Err(Error::LimitExceeded {
+                    reason: "rescaled presentation timestamp overflow",
+                });
+            }
+            Some(rescaled as i64)
+        } else {
+            None
+        };
 
         unsafe {
             let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
@@ -258,7 +289,7 @@ impl<T: Send + 'static> Encoder<T> {
             Error::check(status, "VTSessionSetProperties")?;
         }
 
-        // VTSessionSetProperties が成功した後だけ self.config を更新する。
+        // VTSessionSetProperties が成功した後だけ self.config と next_input_pts を更新する。
         // 失敗時はこの行に到達しないため、設定の不整合は発生しない。
         if let Some(bitrate) = params.average_bitrate {
             self.config.average_bitrate = Some(bitrate);
@@ -266,12 +297,29 @@ impl<T: Send + 'static> Encoder<T> {
         if let Some(fps) = params.expected_frame_rate {
             // VideoToolbox の `ExpectedFrameRate` は単一整数しか受け付けないため、
             // 分子に値を入れて分母を 1 に正規化する。
-            // `CMTimeMake` の timescale は `fps_numerator` を参照するため、PTS 計算もこれで整合する。
             self.config.fps_numerator = fps;
             self.config.fps_denominator = 1;
         }
+        if let Some(new_pts) = rescaled_next_input_pts {
+            self.next_input_pts = new_pts;
+        }
+
+        log::debug!(
+            "Encoder::reconfigure: average_bitrate={:?}, expected_frame_rate={:?}",
+            params.average_bitrate,
+            params.expected_frame_rate
+        );
 
         Ok(())
+    }
+
+    /// 内部の入力 PTS カウンタを返す（テスト・診断用）
+    ///
+    /// `encode` を 1 回呼ぶごとに `fps_denominator` だけ進む値。
+    /// `reconfigure(expected_frame_rate=Some(...))` で新 timescale に再スケールされる。
+    #[doc(hidden)]
+    pub fn next_input_pts(&self) -> i64 {
+        self.next_input_pts
     }
 
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
@@ -533,13 +581,19 @@ impl<T: Send + 'static> Encoder<T> {
 
     /// `reconfigure` に渡された `ReconfigureParams` を検証する
     fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
-        if let Some(bitrate) = params.average_bitrate
-            && bitrate > i64::MAX as u64
-        {
-            return Err(Error::InvalidConfig {
-                field: "average_bitrate",
-                reason: "must fit in i64 for CFNumber",
-            });
+        if let Some(bitrate) = params.average_bitrate {
+            if bitrate == 0 {
+                return Err(Error::InvalidConfig {
+                    field: "average_bitrate",
+                    reason: "must not be zero",
+                });
+            }
+            if bitrate > i64::MAX as u64 {
+                return Err(Error::InvalidConfig {
+                    field: "average_bitrate",
+                    reason: "must fit in i64 for CFNumber",
+                });
+            }
         }
         if let Some(fps) = params.expected_frame_rate {
             if fps == 0 {

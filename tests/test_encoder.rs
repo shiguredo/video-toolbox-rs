@@ -181,14 +181,14 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
     let callbacks = wait_and_take_results(&results, 2);
     assert_eq!(callbacks.len(), 2);
 
-    let mut user_data = callbacks
+    // `allow_frame_reordering: false` なので、入力順がそのままコールバック順として観測される
+    let user_data = callbacks
         .into_iter()
         .map(|r| match r {
             Ok(frame) => frame.user_data,
             Err(e) => panic!("unexpected encode callback error: {e}"),
         })
         .collect::<Vec<_>>();
-    user_data.sort_unstable();
     assert_eq!(user_data, vec![10, 20]);
 
     Ok(())
@@ -509,6 +509,86 @@ fn reconfigure_rejects_average_bitrate_above_i64_max() -> Result<(), Error> {
     ));
     // 失敗時には設定が変更されていないこと
     assert_eq!(encoder.config().average_bitrate, before);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_zero_average_bitrate() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let before = encoder.config().average_bitrate;
+    let r = encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(0),
+        expected_frame_rate: None,
+    });
+    assert!(matches!(
+        r,
+        Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero"
+        })
+    ));
+    // 失敗時には設定が変更されていないこと
+    assert_eq!(encoder.config().average_bitrate, before);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
+    // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
+    // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
+    let mut config = encoder_config(false);
+    config.fps_numerator = 30_000;
+    config.fps_denominator = 1_001;
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
+    encoder.encode(&frame, &EncodeOptions::default(), ())?;
+    encoder.encode(&frame, &EncodeOptions::default(), ())?;
+    assert_eq!(encoder.next_input_pts(), 2 * 1001);
+
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: None,
+        expected_frame_rate: Some(60),
+    })?;
+
+    // 物理時間 2002/30000 = 2/30 秒に対応する新 timescale 60 での PTS は
+    // 2002 * 60 / 30000 = 4 (整数除算)。
+    assert_eq!(encoder.config().fps_numerator, 60);
+    assert_eq!(encoder.config().fps_denominator, 1);
+    assert_eq!(encoder.next_input_pts(), 2002i64 * 60 / 30000);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
+    // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    encoder.encode(&frame, &EncodeOptions::default(), ())?;
+    encoder.encode(&frame, &EncodeOptions::default(), ())?;
+    let before = encoder.next_input_pts();
+
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(500_000),
+        expected_frame_rate: None,
+    })?;
+
+    assert_eq!(encoder.next_input_pts(), before);
     Ok(())
 }
 

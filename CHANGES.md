@@ -22,6 +22,8 @@
   - 引数を `EncoderConfig` から `ReconfigureParams` (所有権渡し) に変更する
   - `VTSessionSetProperties` ベースの実装に置き換え、セッション再作成を行わない
   - 動的に変更可能な項目を `average_bitrate` / `expected_frame_rate` に限定する
+  - `expected_frame_rate` 更新時は内部の `next_input_pts` を新 timescale に再スケールし、出力 PTS の物理時間を連続させる
+  - `average_bitrate` / `expected_frame_rate` の `Some(0)` を `InvalidConfig` で拒否する
   - 解像度・コーデック・ピクセルフォーマットの変更は `Encoder` 再生成で対応する
   - @voluntas
 
