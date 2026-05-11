@@ -30,9 +30,9 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的解像度変更
-  - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新
+- 動的設定変更
+  - エンコーダー: `Encoder::reconfigure()` でビットレート / フレームレートを動的に更新 (セッション再作成なし)
+  - デコーダー: `Decoder::update_format()` でフォーマットを更新 (セッション流用を判定し、不可能な場合のみ再作成)
 - AVCC 形式の入出力
 
 ## 動作要件

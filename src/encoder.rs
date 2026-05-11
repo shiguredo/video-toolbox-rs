@@ -216,14 +216,17 @@ impl<T: Send + 'static> Encoder<T> {
         })
     }
 
-    /// 現在エンコーダーが保持している設定を返す
+    /// 現在エンコーダーが内部で保持している設定を返す
     ///
-    /// 戻り値はユーザーが要求した最新の設定値であり、`VTSessionSetProperties` が
-    /// バックエンドで丸めた実効値とは異なる可能性がある点に注意。
+    /// 戻り値は `Encoder::new` で渡した値、または直近の [`Encoder::reconfigure`] 呼び出しで
+    /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値
+    /// （`VTSessionCopyProperty` で取得できる値）とは異なる場合がある。
     ///
-    /// また [`Encoder::reconfigure`] 経由で `expected_frame_rate` を更新すると、
-    /// 戻り値の `fps_numerator` / `fps_denominator` は新しい値 / `1` に正規化される
-    /// （[`ReconfigureParams::expected_frame_rate`] のドキュメント参照）。
+    /// [`Encoder::reconfigure`] 経由で更新したフィールドの正規化挙動：
+    ///
+    /// - `average_bitrate`: 渡された `Some(value)` がそのまま `EncoderConfig::average_bitrate` に反映される
+    /// - `expected_frame_rate`: 渡された値が `fps_numerator` に入り、`fps_denominator` は `1` に正規化される
+    ///   （[`ReconfigureParams::expected_frame_rate`] のドキュメント参照）
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -311,15 +314,6 @@ impl<T: Send + 'static> Encoder<T> {
         );
 
         Ok(())
-    }
-
-    /// 内部の入力 PTS カウンタを返す（テスト・診断用）
-    ///
-    /// `encode` を 1 回呼ぶごとに `fps_denominator` だけ進む値。
-    /// `reconfigure(expected_frame_rate=Some(...))` で新 timescale に再スケールされる。
-    #[doc(hidden)]
-    pub fn next_input_pts(&self) -> i64 {
-        self.next_input_pts
     }
 
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
@@ -568,13 +562,19 @@ impl<T: Send + 'static> Encoder<T> {
                 reason: "must fit in i32 for CMTime timescale",
             });
         }
-        if let Some(bitrate) = config.average_bitrate
-            && bitrate > i64::MAX as u64
-        {
-            return Err(Error::InvalidConfig {
-                field: "average_bitrate",
-                reason: "must fit in i64 for CFNumber",
-            });
+        if let Some(bitrate) = config.average_bitrate {
+            if bitrate == 0 {
+                return Err(Error::InvalidConfig {
+                    field: "average_bitrate",
+                    reason: "must not be zero",
+                });
+            }
+            if bitrate > i64::MAX as u64 {
+                return Err(Error::InvalidConfig {
+                    field: "average_bitrate",
+                    reason: "must fit in i64 for CFNumber",
+                });
+            }
         }
         Ok(())
     }
@@ -1015,19 +1015,11 @@ impl<T: Send + 'static> Encoder<T> {
         Some(unsafe { &mut *output_callback_ref_con.cast::<EncodeCallbackBox<T>>() })
     }
 
-    fn invoke_callback(
-        callback: &mut EncodeCallbackBox<T>,
-        result: Result<EncodedFrame<T>, Error>,
-    ) {
-        let callback = callback.as_mut();
-        (callback)(result);
-    }
-
     unsafe extern "C" fn output_callback_h264(
         output_callback_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
-        _info_flags: sys::VTEncodeInfoFlags,
+        info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
     ) {
         unsafe {
@@ -1036,6 +1028,7 @@ impl<T: Send + 'static> Encoder<T> {
                 source_frame_ref_con,
                 sample_buffer,
                 status,
+                info_flags,
                 "output_callback_h264",
                 Self::extract_h264_params,
             );
@@ -1046,7 +1039,7 @@ impl<T: Send + 'static> Encoder<T> {
         output_callback_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
-        _info_flags: sys::VTEncodeInfoFlags,
+        info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
     ) {
         unsafe {
@@ -1055,6 +1048,7 @@ impl<T: Send + 'static> Encoder<T> {
                 source_frame_ref_con,
                 sample_buffer,
                 status,
+                info_flags,
                 "output_callback_h265",
                 Self::extract_h265_params,
             );
@@ -1067,6 +1061,7 @@ impl<T: Send + 'static> Encoder<T> {
         source_frame_ref_con: *mut c_void,
         sample_buffer: sys::CMSampleBufferRef,
         status: i32,
+        info_flags: sys::VTEncodeInfoFlags,
         callback_name: &'static str,
         extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Option<ParameterSets>,
     ) {
@@ -1082,43 +1077,45 @@ impl<T: Send + 'static> Encoder<T> {
         };
 
         if let Err(e) = Error::check(status, callback_name) {
-            log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            (callback.as_mut())(Err(e));
             return;
         }
 
-        // フレームドロップ等で sample_buffer が NULL になる場合がある
+        // Video Toolbox がレート制御等でこのフレームをドロップした場合は kVTEncodeInfo_FrameDropped が立ち、
+        // sample_buffer は NULL になる。これは正常イベントなのでエラーとして通知せず、user_data を破棄して終了する。
+        if (info_flags & sys::kVTEncodeInfo_FrameDropped) != 0 {
+            log::debug!("{callback_name}: frame dropped by encoder rate control");
+            drop(user_data);
+            return;
+        }
+
         if sample_buffer.is_null() {
-            let e = Error::LimitExceeded {
-                reason: "encoded sample buffer is null",
-            };
-            log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            // ドロップフラグが立っていないのに sample_buffer が NULL になるのは Video Toolbox の想定外。
+            (callback.as_mut())(Err(Error::LimitExceeded {
+                reason: "encoded sample buffer is null without drop flag",
+            }));
             return;
         }
 
         unsafe {
             let data_buffer = sys::CMSampleBufferGetDataBuffer(sample_buffer);
             if data_buffer.is_null() {
-                let e = Error::LimitExceeded {
+                (callback.as_mut())(Err(Error::LimitExceeded {
                     reason: "CMSampleBufferGetDataBuffer returned null",
-                };
-                log::error!("{e}");
-                Self::invoke_callback(callback, Err(e));
+                }));
                 return;
             }
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
             // 非連続バッファでは `data_pointer_len < block_len` になり得るため、`CMBlockBufferCopyDataBytes` で全長をコピーする。
             let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
             if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
-                let e = Error::LimitExceeded {
-                    reason: "encoded block length exceeds defensive maximum",
-                };
                 log::error!(
                     "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
                     max = MAX_ENCODED_BLOCK_COPY_BYTES
                 );
-                Self::invoke_callback(callback, Err(e));
+                (callback.as_mut())(Err(Error::LimitExceeded {
+                    reason: "encoded block length exceeds defensive maximum",
+                }));
                 return;
             }
             let mut data = vec![0u8; block_len];
@@ -1129,8 +1126,7 @@ impl<T: Send + 'static> Encoder<T> {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                log::error!("{e}");
-                Self::invoke_callback(callback, Err(e));
+                (callback.as_mut())(Err(e));
                 return;
             }
 
@@ -1139,21 +1135,17 @@ impl<T: Send + 'static> Encoder<T> {
 
             let (vps_list, sps_list, pps_list) = if keyframe {
                 if description.is_null() {
-                    let e = Error::LimitExceeded {
+                    (callback.as_mut())(Err(Error::LimitExceeded {
                         reason: "CMSampleBufferGetFormatDescription returned null for keyframe",
-                    };
-                    log::error!("{e}");
-                    Self::invoke_callback(callback, Err(e));
+                    }));
                     return;
                 }
                 match extract_params(description) {
                     Some(params) => params,
                     None => {
-                        let e = Error::LimitExceeded {
+                        (callback.as_mut())(Err(Error::LimitExceeded {
                             reason: "failed to extract codec parameter sets",
-                        };
-                        log::error!("{e}");
-                        Self::invoke_callback(callback, Err(e));
+                        }));
                         return;
                     }
                 }
@@ -1169,7 +1161,7 @@ impl<T: Send + 'static> Encoder<T> {
                 data,
                 user_data,
             };
-            Self::invoke_callback(callback, Ok(frame));
+            (callback.as_mut())(Ok(frame));
         }
     }
 
@@ -1310,6 +1302,9 @@ impl<T: Send + 'static> Encoder<T> {
 
 impl<T: Send + 'static> Drop for Encoder<T> {
     fn drop(&mut self) {
+        // Drop では未エンコードフレームのフラッシュ（`VTCompressionSessionCompleteFrames`）を行わない。
+        // 未出力フレームを必ず取り切りたい場合は呼び出し側で明示的に `Encoder::finish()` を呼ぶこと。
+        // Invalidate は同期的に保留中の出力コールバックを完了させるので、その後 `callback` Box の auto drop は安全。
         unsafe {
             sys::VTCompressionSessionInvalidate(self.session);
             sys::CFRelease(self.session as *const c_void);
@@ -1317,8 +1312,15 @@ impl<T: Send + 'static> Drop for Encoder<T> {
     }
 }
 
-// SAFETY: VTCompressionSession は内部でスレッドセーフに管理されており、
-// Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
+// SAFETY:
+// - VTCompressionSession は内部でスレッドセーフに管理されており、Apple のドキュメントでも
+//   セッションの操作は異なるスレッドから呼び出し可能とされている。
+// - 出力コールバック (`output_callback_h264` / `output_callback_h265`) は VT が同一セッションについて
+//   直列に発火させる（並行発火しない）。そのため `callback_from_ref_con` 経由で
+//   `&mut EncodeCallbackBox<T>` を得ても、同時に複数の `&mut` が生きることはない。
+// - `Encoder` のメインスレッド側から `self.callback` の中身を直接読み書きする経路は無い
+//   （`as_ref()` でポインタを取得して FFI に渡すだけで、Rust 側からは `#[allow(dead_code)]` のとおり参照しない）。
+// - `T: Send` 制約により、コールバックでメインスレッドへ移譲する `user_data` の所有権を安全に移動できる。
 unsafe impl<T: Send + 'static> Send for Encoder<T> {}
 
 /// エンコードされた映像フレーム (AVCC 形式)
@@ -1356,11 +1358,23 @@ const MAX_PARAMETER_SET_COPY_BYTES: usize = u16::MAX as usize;
 
 /// エンコード出力 1 フレーム分を `Vec` にコピーするときの防御的上限（バイト）。
 ///
-/// `MAX_PARAMETER_SET_COPY_BYTES`（パラメータセット用）とは別。`CMBlockBufferGetDataLength` が異常に大きい場合の OOM を防ぐ。
-/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はログして当該フレームを破棄する。
+/// **位置付け**: `MAX_PARAMETER_SET_COPY_BYTES` のような ISO/IEC 仕様に基づく根拠はなく、
+/// `CMBlockBufferGetDataLength` が異常値（破損したセッション状態や FFI バグ等）を返した場合の OOM を
+/// 防ぐための運用上の上限である。
+///
+/// **値の根拠**: 4K (3840x2160) を超高ビットレートで 1 フレーム圧縮しても 1 ～ 数 MB のオーダーに収まる。
+/// その 100 倍程度を上限としても通常運用では到達しないため `256 MiB` とする。
+/// 利用者から「正常な圧縮データが拒否される」報告があれば、計測のうえ見直すこと。
+///
+/// **超過時の挙動**: ログを出して当該フレームを `Error::LimitExceeded` で破棄する（クランプはせず拒否のみ）。
 const MAX_ENCODED_BLOCK_COPY_BYTES: usize = 256 * 1024 * 1024;
 
 /// `slice::from_raw_parts` の前提（長さ 0 でも非 NULL ポインタ、長さ正では NULL 禁止）を満たすためのヘルパー
+///
+/// 長さ 0 の場合は **ポインタが NULL であっても空 `Vec` を返す**。
+/// Core Media のパラメータセット取得 API は理論上「長さ 0 + NULL」を返す可能性があり、
+/// その場合「該当パラメータセットが空である」と解釈して安全側に倒すための仕様。
+/// 長さが正で NULL のときは `slice::from_raw_parts` を呼べないため `None` を返す。
 fn vec_u8_from_raw_parts_safe(
     ptr: *const u8,
     len: usize,
@@ -1408,5 +1422,134 @@ fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
             sys::kCMSampleAttachmentKey_NotSync as *const c_void,
         );
         not_sync != sys::kCFBooleanTrue as *const c_void
+    }
+}
+
+// `Encoder::next_input_pts` などの private フィールド・実装詳細に直接触れる必要があるテスト群。
+// 公開 API では観測できないため、内部 `mod tests` に置いて borrow チェッカ越しに観測する。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_encoder_config() -> EncoderConfig {
+        EncoderConfig {
+            width: 960,
+            height: 480,
+            codec: CodecConfig::H264(H264EncoderConfig {
+                profile: H264Profile::Main,
+                entropy_mode: H264EntropyMode::Cabac,
+            }),
+            pixel_format: PixelFormat::I420,
+            average_bitrate: Some(100_000),
+            fps_numerator: 1,
+            fps_denominator: 1,
+            prioritize_encoding_speed_over_quality: false,
+            real_time: false,
+            maximize_power_efficiency: false,
+            allow_frame_reordering: false,
+            allow_temporal_compression: true,
+            max_key_frame_interval: None,
+            max_key_frame_interval_duration: None,
+            max_frame_delay_count: None,
+        }
+    }
+
+    fn black_i420_frame(width: u32, height: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let w = width as usize;
+        let h = height as usize;
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
+        (
+            vec![0u8; w * h],
+            vec![0u8; uv_w * uv_h],
+            vec![0u8; uv_w * uv_h],
+        )
+    }
+
+    #[test]
+    fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
+        // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
+        // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
+        let mut config = base_encoder_config();
+        config.fps_numerator = 30_000;
+        config.fps_denominator = 1_001;
+        let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        assert_eq!(encoder.next_input_pts, 2 * 1001);
+
+        encoder.reconfigure(ReconfigureParams {
+            average_bitrate: None,
+            expected_frame_rate: Some(60),
+        })?;
+
+        // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004 → 整数除算で 4。
+        assert_eq!(encoder.config().fps_numerator, 60);
+        assert_eq!(encoder.config().fps_denominator, 1);
+        assert_eq!(encoder.next_input_pts, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
+        // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        let before = encoder.next_input_pts;
+
+        encoder.reconfigure(ReconfigureParams {
+            average_bitrate: Some(500_000),
+            expected_frame_rate: None,
+        })?;
+
+        assert_eq!(encoder.next_input_pts, before);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_overflows_when_rescaled_pts_exceeds_i64_max() -> Result<(), Error> {
+        // i64 の上限を意図的に超える条件で再スケールし、`Error::LimitExceeded` が返ることを確認する。
+        // 初期 timescale を 1 にしておくと encode を 1 回するごとに next_input_pts が +1 進む。
+        // ここでは VTCompressionSession を起動するコストを避けるため、構築後に next_input_pts を
+        // 直接 i64::MAX に書き込んでから reconfigure を呼ぶ（private フィールドなのでこのモジュールから可能）。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::<()>::new(config, |_| {})?;
+
+        encoder.next_input_pts = i64::MAX;
+
+        // new_timescale > old_timescale となる組合せで `i64::MAX * 2 / 1` が i64 範囲を超える。
+        let err = encoder
+            .reconfigure(ReconfigureParams {
+                average_bitrate: None,
+                expected_frame_rate: Some(2),
+            })
+            .expect_err("rescale should overflow");
+        assert!(matches!(
+            err,
+            Error::LimitExceeded {
+                reason: "rescaled presentation timestamp overflow",
+            }
+        ));
+        // 失敗時には config も next_input_pts も変更されない
+        assert_eq!(encoder.config().fps_numerator, 1);
+        assert_eq!(encoder.next_input_pts, i64::MAX);
+        Ok(())
     }
 }

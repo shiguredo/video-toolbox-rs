@@ -18,9 +18,6 @@ enum DecodeEvent {
         y_plane: Vec<u8>,
         y_stride: usize,
     },
-    Nv12 {
-        user_data: u64,
-    },
     Err(Error),
 }
 
@@ -35,7 +32,9 @@ fn push_decode_event(results: &SharedDecodeResults, result: Result<DecodedFrame<
             y_plane: frame.y_plane().to_vec(),
             y_stride: frame.y_stride(),
         },
-        Ok(DecodedFrame::Nv12 { user_data, .. }) => DecodeEvent::Nv12 { user_data },
+        Ok(DecodedFrame::Nv12 { user_data, .. }) => {
+            panic!("unexpected NV12 frame in I420-only tests: user_data={user_data}")
+        }
         Err(e) => DecodeEvent::Err(e),
     };
     results.lock().expect("results mutex poisoned").push(event);
@@ -136,9 +135,6 @@ fn h264_decoder() -> Result<(), Error> {
             assert_eq!(width, WIDTH as usize);
             assert_eq!(height, HEIGHT as usize);
         }
-        DecodeEvent::Nv12 { .. } => {
-            unreachable!("expected I420 but got NV12");
-        }
         DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
     }
 
@@ -199,9 +195,6 @@ fn h265_decoder() -> Result<(), Error> {
             assert_eq!(user_data, 11);
             assert_eq!(width, WIDTH as usize);
             assert_eq!(height, HEIGHT as usize);
-        }
-        DecodeEvent::Nv12 { .. } => {
-            unreachable!("expected I420 but got NV12");
         }
         DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
     }
@@ -461,9 +454,6 @@ fn vp9_decoder() -> Result<(), Error> {
                     psnr >= min_psnr_db,
                     "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
                 );
-            }
-            DecodeEvent::Nv12 { user_data, .. } => {
-                unreachable!("frame {user_data}: expected I420 but got NV12");
             }
             DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
         }

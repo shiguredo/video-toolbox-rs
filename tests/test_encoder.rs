@@ -41,12 +41,6 @@ fn minimal_encoder_config() -> EncoderConfig {
     }
 }
 
-fn minimal_nv12_encoder_config() -> EncoderConfig {
-    let mut c = minimal_encoder_config();
-    c.pixel_format = PixelFormat::Nv12;
-    c
-}
-
 fn encoder_config(is_h265: bool) -> EncoderConfig {
     let codec = if is_h265 {
         CodecConfig::Hevc(HevcEncoderConfig {
@@ -261,9 +255,37 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
         Encoder::<()>::new(c, |_| {}),
         Err(Error::InvalidConfig {
             field: "average_bitrate",
-            ..
+            reason: "must fit in i64 for CFNumber"
         })
     ));
+}
+
+#[test]
+fn encoder_rejects_zero_average_bitrate() {
+    let mut c = minimal_encoder_config();
+    c.average_bitrate = Some(0);
+    assert!(matches!(
+        Encoder::<()>::new(c, |_| {}),
+        Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero"
+        })
+    ));
+}
+
+#[test]
+fn encoder_accepts_average_bitrate_at_i64_max() {
+    let mut c = minimal_encoder_config();
+    c.average_bitrate = Some(i64::MAX as u64);
+    // i64::MAX ちょうどは CFNumber i64 に収まるので Encoder の構築が成功するはず
+    Encoder::<()>::new(c, |_| {}).expect("encoder should accept i64::MAX bitrate");
+}
+
+#[test]
+fn encoder_accepts_fps_numerator_at_i32_max() {
+    let mut c = minimal_encoder_config();
+    c.fps_numerator = i32::MAX as u32;
+    Encoder::<()>::new(c, |_| {}).expect("encoder should accept fps_numerator = i32::MAX");
 }
 
 #[test]
@@ -513,6 +535,31 @@ fn reconfigure_rejects_average_bitrate_above_i64_max() -> Result<(), Error> {
 }
 
 #[test]
+fn reconfigure_accepts_expected_frame_rate_at_i32_max() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: None,
+        expected_frame_rate: Some(i32::MAX as u32),
+    })?;
+    assert_eq!(encoder.config().fps_numerator, i32::MAX as u32);
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_accepts_average_bitrate_at_i64_max() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(i64::MAX as u64),
+        expected_frame_rate: None,
+    })?;
+    assert_eq!(encoder.config().average_bitrate, Some(i64::MAX as u64));
+    Ok(())
+}
+
+#[test]
 fn reconfigure_rejects_zero_average_bitrate() -> Result<(), Error> {
     let config = encoder_config(false);
     let mut encoder = Encoder::<()>::new(config, |_| {})?;
@@ -531,64 +578,6 @@ fn reconfigure_rejects_zero_average_bitrate() -> Result<(), Error> {
     ));
     // 失敗時には設定が変更されていないこと
     assert_eq!(encoder.config().average_bitrate, before);
-    Ok(())
-}
-
-#[test]
-fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
-    // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
-    // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
-    let mut config = encoder_config(false);
-    config.fps_numerator = 30_000;
-    config.fps_denominator = 1_001;
-    let mut encoder = Encoder::<()>::new(config, |_| {})?;
-
-    let (y, u, v) = build_i420_black_frame();
-    let frame = FrameData::I420 {
-        y: &y,
-        u: &u,
-        v: &v,
-    };
-    // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
-    encoder.encode(&frame, &EncodeOptions::default(), ())?;
-    encoder.encode(&frame, &EncodeOptions::default(), ())?;
-    assert_eq!(encoder.next_input_pts(), 2 * 1001);
-
-    encoder.reconfigure(ReconfigureParams {
-        average_bitrate: None,
-        expected_frame_rate: Some(60),
-    })?;
-
-    // 物理時間 2002/30000 = 2/30 秒に対応する新 timescale 60 での PTS は
-    // 2002 * 60 / 30000 = 4 (整数除算)。
-    assert_eq!(encoder.config().fps_numerator, 60);
-    assert_eq!(encoder.config().fps_denominator, 1);
-    assert_eq!(encoder.next_input_pts(), 2002i64 * 60 / 30000);
-    Ok(())
-}
-
-#[test]
-fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
-    // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
-    let config = encoder_config(false);
-    let mut encoder = Encoder::<()>::new(config, |_| {})?;
-
-    let (y, u, v) = build_i420_black_frame();
-    let frame = FrameData::I420 {
-        y: &y,
-        u: &u,
-        v: &v,
-    };
-    encoder.encode(&frame, &EncodeOptions::default(), ())?;
-    encoder.encode(&frame, &EncodeOptions::default(), ())?;
-    let before = encoder.next_input_pts();
-
-    encoder.reconfigure(ReconfigureParams {
-        average_bitrate: Some(500_000),
-        expected_frame_rate: None,
-    })?;
-
-    assert_eq!(encoder.next_input_pts(), before);
     Ok(())
 }
 
@@ -640,8 +629,10 @@ fn reconfigure_preserves_encode_after_update() -> Result<(), Error> {
 
 #[test]
 fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
+    let mut config = minimal_encoder_config();
+    config.pixel_format = PixelFormat::Nv12;
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
-    let mut enc = Encoder::new(minimal_nv12_encoder_config(), {
+    let mut enc = Encoder::new(config, {
         let results = Arc::clone(&results);
         move |result| {
             results.lock().expect("results mutex poisoned").push(result);

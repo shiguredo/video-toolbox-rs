@@ -68,6 +68,17 @@ type DecodeCallbackBox<T> = Box<DecodeCallback<T>>;
 
 // 1 回の decode 呼び出しに対応するデータ保持領域。
 // 非同期デコード完了コールバックが来るまで圧縮データと CoreMedia オブジェクトを保持する。
+//
+// フィールド宣言順は意図的にこの並びになっている。
+// Rust は構造体のフィールドを「宣言順」で drop するため、drop は
+// `user_data` → `pixel_format` → `owned` → `block_buffer` → `sample_buffer` の順で起こる。
+// `block_buffer` は `kCFAllocatorNull` で `owned` の生メモリを参照しているが、
+// この `PendingDecode` は **コールバックが返ってきた後にしか drop されない**（`decode()` 失敗の早期 return か、
+// `output_callback` の `take_pending_decode` 経由のいずれか）。
+// コールバック完了時点で CoreMedia は当該 CMBlockBuffer の中身を読み終えているため、`owned` が
+// `block_buffer` の `CFRelease` より先に drop されても安全である。
+// `_` プレフィックスの destructure (`output_callback` 内) は名前付き bind なのでスコープ末尾で drop される。
+// もし将来 `_` 単独 (即時 drop) や `..` に書き換えると壊れるため注意。
 struct PendingDecode<T> {
     user_data: T,
     pixel_format: PixelFormat,
@@ -278,8 +289,8 @@ impl<T: Send + 'static> Decoder<T> {
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
-            // 現行 SDK では `VTDecompressionOutputCallbackRecord` はコールバック関数ポインタと refcon の 2 フィールドのみ。
-            // ゼロ初期化で refcon は NULL。続けてコールバックと refcon を代入する方針である（issue 0025）。
+            // `VTDecompressionOutputCallbackRecord` をゼロ初期化したうえで、
+            // コールバック関数ポインタと refcon を代入する。
             let mut callback =
                 MaybeUninit::<sys::VTDecompressionOutputCallbackRecord>::zeroed().assume_init();
             callback.decompressionOutputCallback = Some(Self::output_callback);
@@ -398,19 +409,11 @@ impl<T: Send + 'static> Decoder<T> {
         Some(unsafe { &mut *output_callback_ref_con.cast::<DecodeCallbackBox<T>>() })
     }
 
-    fn invoke_callback(
-        callback: &mut DecodeCallbackBox<T>,
-        result: Result<DecodedFrame<T>, Error>,
-    ) {
-        let callback = callback.as_mut();
-        (callback)(result);
-    }
-
     unsafe extern "C" fn output_callback(
         decompression_output_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
-        _info_flags: sys::VTDecodeInfoFlags,
+        info_flags: sys::VTDecodeInfoFlags,
         image_buffer: sys::CVImageBufferRef,
         _presentation_time_stamp: sys::CMTime,
         _presentation_duration: sys::CMTime,
@@ -436,18 +439,23 @@ impl<T: Send + 'static> Decoder<T> {
         } = *pending;
 
         if let Err(e) = Error::check(status, callback_name) {
-            log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            (callback.as_mut())(Err(e));
             return;
         }
 
-        // フレームドロップ等で image_buffer が NULL になる場合がある
+        // Video Toolbox が当該フレームをドロップした場合は kVTDecodeInfo_FrameDropped が立ち、
+        // image_buffer は NULL になる。これは正常イベントなのでエラーとして通知せず、user_data を破棄して終了する。
+        if (info_flags & sys::kVTDecodeInfo_FrameDropped) != 0 {
+            log::debug!("{callback_name}: frame dropped by decoder");
+            drop(user_data);
+            return;
+        }
+
         if image_buffer.is_null() {
-            let e = Error::LimitExceeded {
-                reason: "decoded image buffer is null",
-            };
-            log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            // ドロップフラグが立っていないのに image_buffer が NULL になるのは Video Toolbox の想定外。
+            (callback.as_mut())(Err(Error::LimitExceeded {
+                reason: "decoded image buffer is null without drop flag",
+            }));
             return;
         }
 
@@ -459,8 +467,7 @@ impl<T: Send + 'static> Decoder<T> {
         let flags_readonly = 1;
         let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
         if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
-            log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            (callback.as_mut())(Err(e));
             return;
         }
 
@@ -478,17 +485,26 @@ impl<T: Send + 'static> Decoder<T> {
                 user_data,
             },
         };
-        Self::invoke_callback(callback, Ok(frame));
+        (callback.as_mut())(Ok(frame));
     }
 }
 
 impl<T: Send + 'static> Drop for Decoder<T> {
     fn drop(&mut self) {
-        if let Err(e) = self.finish() {
-            log::error!("{e}");
-        }
-
+        // Drop 経路では `finish()` が途中で失敗した場合でも `WaitForAsynchronousFrames` を必ず呼ぶ。
+        // wait をスキップしたまま `Invalidate` → `CFRelease(session)` → `callback` Box の auto drop と進むと、
+        // VT が in-flight コールバックを後から発火させたときに解放済みの callback Box にアクセスして UB になる。
         unsafe {
+            let status = sys::VTDecompressionSessionFinishDelayedFrames(self.session);
+            if let Err(e) = Error::check(status, "VTDecompressionSessionFinishDelayedFrames") {
+                log::error!("{e}");
+            }
+            let status = sys::VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+            if let Err(e) = Error::check(status, "VTDecompressionSessionWaitForAsynchronousFrames")
+            {
+                log::error!("{e}");
+            }
+
             sys::VTDecompressionSessionInvalidate(self.session);
             sys::CFRelease(self.session as *const c_void);
             sys::CFRelease(self.description as *const c_void);
@@ -496,9 +512,15 @@ impl<T: Send + 'static> Drop for Decoder<T> {
     }
 }
 
-// SAFETY: VTDecompressionSession は内部でスレッドセーフに管理されており、
-// Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// コールバックは別スレッドで実行されるため、`T: Send` 制約を課して所有権を安全に移動させる。
+// SAFETY:
+// - VTDecompressionSession は内部でスレッドセーフに管理されており、Apple のドキュメントでも
+//   セッションの操作は異なるスレッドから呼び出し可能とされている。
+// - 出力コールバック (`output_callback`) は VT が同一セッションについて直列に発火させる（並行発火しない）。
+//   そのため `callback_from_ref_con` 経由で `&mut DecodeCallbackBox<T>` を得ても、
+//   同時に複数の `&mut` が生きることはない。
+// - `Decoder` のメインスレッド側から `self.callback` の中身を直接読み書きする経路は無い
+//   （`as_ref()` でポインタを取得して FFI に渡すだけ）。
+// - `T: Send` 制約により、コールバックでメインスレッドへ移譲する `user_data` の所有権を安全に移動できる。
 unsafe impl<T: Send + 'static> Send for Decoder<T> {}
 
 /// デコードされた映像フレーム

@@ -15,8 +15,16 @@
   - `average_bitrate` / `expected_frame_rate` を動的に変更可能にする
   - @voluntas
 - [ADD] `Encoder::config()` ゲッターを追加する
+  - 戻り値は `&EncoderConfig` で、`reconfigure` 経由で更新した場合は内部の正規化値 (例: `fps_denominator = 1`) が観測される
   - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
+  - `Encoder<T>` / `Decoder<T>` ジェネリクスを導入し、コールバックに渡すユーザーデータの型を `T` で表現する
+  - `Encoder::new` / `Decoder::new` の第 2 引数に `FnMut(Result<..., Error>) + Send + 'static` のコールバックを取るように変更する
+  - `Encoder::encode` / `Encoder::encode_pixel_buffer` / `Decoder::decode` の引数に `user_data: T` を追加する
+  - `EncodedFrame<T>` に `user_data: T` フィールドを追加する
+  - `DecodedFrame` を `I420 { frame, user_data }` / `Nv12 { frame, user_data }` の構造体バリアントに変更する
+  - `Decoder::finish()` を追加し、遅延フレームの排出と非同期コールバック完了待ちを行う
+  - `Encoder::next_frame()` を廃止する
   - @melpon
 - [CHANGE] `Encoder::reconfigure` を動的プロパティ更新専用 API に変更する
   - 引数を `EncoderConfig` から `ReconfigureParams` (所有権渡し) に変更する
@@ -26,8 +34,9 @@
   - `average_bitrate` / `expected_frame_rate` の `Some(0)` を `InvalidConfig` で拒否する
   - 解像度・コーデック・ピクセルフォーマットの変更は `Encoder` 再生成で対応する
   - @voluntas
-
-### misc
+- [FIX] `Encoder::validate_config` で `average_bitrate = Some(0)` を `InvalidConfig` で拒否する
+  - `Encoder::reconfigure` 側の検証と挙動を揃える
+  - @voluntas
 
 
 ## 2026.1.1
