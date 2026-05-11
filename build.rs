@@ -39,6 +39,8 @@ fn main() {
                 "pub struct VTEncodeInfoFlags;",
                 "pub struct VTCompressionSessionRef;",
                 "pub struct VTCompressionSessionCreate;",
+                "pub struct OpaqueCMBlockBuffer;",
+                "pub struct opaqueCMSampleBuffer;",
             ),
         )
         .expect("write file error");
