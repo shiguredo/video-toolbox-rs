@@ -80,13 +80,13 @@ fn wait_and_take_results<T>(
     results: &SharedEncodeResults<T>,
     min_count: usize,
 ) -> Vec<EncodeResult<T>> {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if results.lock().expect("results mutex poisoned").len() >= min_count {
             break;
         }
         if Instant::now() >= deadline {
-            break;
+            panic!("timeout waiting for {min_count} encode callbacks");
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -537,25 +537,65 @@ fn reconfigure_rejects_average_bitrate_above_i64_max() -> Result<(), Error> {
 #[test]
 fn reconfigure_accepts_expected_frame_rate_at_i32_max() -> Result<(), Error> {
     let config = encoder_config(false);
-    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     encoder.reconfigure(ReconfigureParams {
         average_bitrate: None,
         expected_frame_rate: Some(i32::MAX as u32),
     })?;
     assert_eq!(encoder.config().fps_numerator, i32::MAX as u32);
     assert_eq!(encoder.config().fps_denominator, 1);
+    // reconfigure 後でも encode→出力コールバックまで通ることを確認する
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.finish()?;
+    let callbacks = wait_and_take_results(&results, 1);
+    assert!(callbacks.iter().all(|r| r.is_ok()));
     Ok(())
 }
 
 #[test]
 fn reconfigure_accepts_average_bitrate_at_i64_max() -> Result<(), Error> {
     let config = encoder_config(false);
-    let mut encoder = Encoder::<()>::new(config, |_| {})?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(config, {
+        let results = Arc::clone(&results);
+        move |result| {
+            results.lock().expect("results mutex poisoned").push(result);
+        }
+    })?;
     encoder.reconfigure(ReconfigureParams {
         average_bitrate: Some(i64::MAX as u64),
         expected_frame_rate: None,
     })?;
     assert_eq!(encoder.config().average_bitrate, Some(i64::MAX as u64));
+    // reconfigure 後でも encode→出力コールバックまで通ることを確認する
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.finish()?;
+    let callbacks = wait_and_take_results(&results, 1);
+    assert!(callbacks.iter().all(|r| r.is_ok()));
     Ok(())
 }
 

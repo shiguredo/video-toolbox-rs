@@ -17,22 +17,35 @@
 - [ADD] `Encoder::config()` ゲッターを追加する
   - 戻り値は `&EncoderConfig` で、`reconfigure` 経由で更新した場合は内部の正規化値 (例: `fps_denominator = 1`) が観測される
   - @voluntas
+- [ADD] `Error::UnknownPixelFormat { expected, fourcc }` バリアントを追加する
+  - `Encoder::encode_pixel_buffer` で I420/Nv12 のいずれでもない FourCC が渡されたときに返す
+  - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
   - `Encoder<T>` / `Decoder<T>` ジェネリクスを導入し、コールバックに渡すユーザーデータの型を `T` で表現する
   - `Encoder::new` / `Decoder::new` の第 2 引数に `FnMut(Result<..., Error>) + Send + 'static` のコールバックを取るように変更する
   - `Encoder::encode` / `Encoder::encode_pixel_buffer` / `Decoder::decode` の引数に `user_data: T` を追加する
   - `EncodedFrame<T>` に `user_data: T` フィールドを追加する
   - `DecodedFrame` を `I420 { frame, user_data }` / `Nv12 { frame, user_data }` の構造体バリアントに変更する
+  - `Decoder::decode` の戻り値を `Result<Option<DecodedFrame<'_>>, Error>` から `Result<(), Error>` に変更する
+  - `I420Frame<'a>` / `Nv12Frame<'a>` のライフタイム引数を削除する
   - `Decoder::finish()` を追加し、遅延フレームの排出と非同期コールバック完了待ちを行う
+  - `Decoder::update_format` が内部で `Decoder::finish()` 相当の同期処理を行うようにする
   - `Encoder::next_frame()` を廃止する
+  - エンコード / デコードのコールバックは `extern "C"` 境界で `std::panic::catch_unwind` により保護され、ユーザーが提供する `FnMut` が panic した場合でも UB にならない
   - @melpon
 - [CHANGE] `Encoder::reconfigure` を動的プロパティ更新専用 API に変更する
   - 引数を `EncoderConfig` から `ReconfigureParams` (所有権渡し) に変更する
   - `VTSessionSetProperties` ベースの実装に置き換え、セッション再作成を行わない
+  - 旧実装で行っていた未出力フレームの自動フラッシュは廃止する。フラッシュが必要なら呼び出し側で `Encoder::finish()` を明示的に呼ぶ
   - 動的に変更可能な項目を `average_bitrate` / `expected_frame_rate` に限定する
-  - `expected_frame_rate` 更新時は内部の `next_input_pts` を新 timescale に再スケールし、出力 PTS の物理時間を連続させる
+  - `expected_frame_rate` 更新時は内部の `next_input_pts` を新 timescale に切り上げ (div_ceil) で再スケールし、PTS の単調増加性を維持する
   - `average_bitrate` / `expected_frame_rate` の `Some(0)` を `InvalidConfig` で拒否する
   - 解像度・コーデック・ピクセルフォーマットの変更は `Encoder` 再生成で対応する
+  - @voluntas
+- [CHANGE] `Encoder::Drop` で `VTCompressionSessionInvalidate` の前に `VTCompressionSessionCompleteFrames` を呼ぶようにする
+  - in-flight な出力コールバックが解放済みの `callback` Box にアクセスして UAF になるのを防ぐ
+  - @voluntas
+- [FIX] `Encoder::encode_pixel_buffer` の I420 判定を `sys::kCVPixelFormatType_420YpCbCr8Planar` 定数ベースに揃え、未知フォーマット時には期待値の逆を返す代わりに `Error::UnknownPixelFormat` を返す
   - @voluntas
 - [FIX] `Encoder::validate_config` で `average_bitrate = Some(0)` を `InvalidConfig` で拒否する
   - `Encoder::reconfigure` 側の検証と挙動を揃える
