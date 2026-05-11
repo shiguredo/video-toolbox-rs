@@ -134,8 +134,8 @@ type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 type EncodeCallback<T> = dyn FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static;
 
 // `outputCallbackRefCon` で受け渡すコールバック本体。
-// FFI へは `&EncodeCallbackBox<T>` のポインタを渡す。
-type EncodeCallbackBox<T> = Box<EncodeCallback<T>>;
+// FFI へは `&BoxEncodedCallback<T>` のポインタを渡す。
+type BoxEncodedCallback<T> = Box<EncodeCallback<T>>;
 
 /// エンコーダーに渡すフレームデータ
 pub enum FrameData<'a> {
@@ -165,7 +165,7 @@ pub struct Encoder<T: Send + 'static> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
-    callback: Box<EncodeCallbackBox<T>>,
+    callback: Box<BoxEncodedCallback<T>>,
 }
 
 impl<T: Send + 'static> Encoder<T> {
@@ -176,7 +176,7 @@ impl<T: Send + 'static> Encoder<T> {
     {
         Self::validate_config(&config)?;
         // EncodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
-        let callback = Box::new(Box::new(on_encoded) as EncodeCallbackBox<T>);
+        let callback = Box::new(Box::new(on_encoded) as BoxEncodedCallback<T>);
         let session = unsafe { Self::create_compression_session(&config, callback.as_ref())? };
 
         Ok(Self {
@@ -217,7 +217,7 @@ impl<T: Send + 'static> Encoder<T> {
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
     unsafe fn create_compression_session(
         config: &EncoderConfig,
-        callback_ref_con: &EncodeCallbackBox<T>,
+        callback_ref_con: &BoxEncodedCallback<T>,
     ) -> Result<sys::VTCompressionSessionRef, Error> {
         unsafe {
             let mut session = std::ptr::null_mut();
@@ -248,7 +248,7 @@ impl<T: Send + 'static> Encoder<T> {
                 }
             };
 
-            // `outputCallbackRefCon` には `EncodeCallbackBox<T>` へのポインタを渡す。
+            // `outputCallbackRefCon` には `BoxEncodedCallback<T>` へのポインタを渡す。
             // 出力コールバック内で復元し、ユーザー指定の `FnMut` を呼び出す（`process_encoded_output`）。
             // ポインタは `Encoder` が `Box` で保持するコールバックを指し、`Encoder` の生存期間中は有効である。
             let status = VTCompressionSessionCreate(
@@ -260,7 +260,7 @@ impl<T: Send + 'static> Encoder<T> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 Some(callback),
-                (callback_ref_con as *const EncodeCallbackBox<T>)
+                (callback_ref_con as *const BoxEncodedCallback<T>)
                     .cast::<c_void>()
                     .cast_mut(),
                 &mut session,
@@ -866,16 +866,16 @@ impl<T: Send + 'static> Encoder<T> {
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut EncodeCallbackBox<T>> {
+    ) -> Option<&'a mut BoxEncodedCallback<T>> {
         if output_callback_ref_con.is_null() {
             log::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
-        Some(unsafe { &mut *output_callback_ref_con.cast::<EncodeCallbackBox<T>>() })
+        Some(unsafe { &mut *output_callback_ref_con.cast::<BoxEncodedCallback<T>>() })
     }
 
     fn invoke_callback(
-        callback: &mut EncodeCallbackBox<T>,
+        callback: &mut BoxEncodedCallback<T>,
         result: Result<EncodedFrame<T>, Error>,
     ) {
         let callback = callback.as_mut();

@@ -63,8 +63,8 @@ pub struct DecoderConfig<'a> {
 type DecodeCallback<T> = dyn FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static;
 
 // `decompressionOutputRefCon` で受け渡すコールバック本体。
-// FFI へは `&DecodeCallbackBox<T>` のポインタを渡す。
-type DecodeCallbackBox<T> = Box<DecodeCallback<T>>;
+// FFI へは `&BoxDecodeCallback<T>` のポインタを渡す。
+type BoxDecodeCallback<T> = Box<DecodeCallback<T>>;
 
 // 1 回の decode 呼び出しに対応するデータ保持領域。
 // 非同期デコード完了コールバックが来るまで圧縮データと CoreMedia オブジェクトを保持する。
@@ -84,7 +84,7 @@ pub struct Decoder<T: Send + 'static> {
     description: sys::CMVideoFormatDescriptionRef,
     session: sys::VTDecompressionSessionRef,
     pixel_format: PixelFormat,
-    callback: Box<DecodeCallbackBox<T>>,
+    callback: Box<BoxDecodeCallback<T>>,
 }
 
 impl<T: Send + 'static> Decoder<T> {
@@ -94,7 +94,7 @@ impl<T: Send + 'static> Decoder<T> {
         F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
     {
         // `DecodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
-        let callback = Box::new(Box::new(on_decoded) as DecodeCallbackBox<T>);
+        let callback = Box::new(Box::new(on_decoded) as BoxDecodeCallback<T>);
 
         unsafe {
             let description = Self::create_format_description(&config.codec)
@@ -274,7 +274,7 @@ impl<T: Send + 'static> Decoder<T> {
     unsafe fn create_decompression_session(
         description: sys::CMVideoFormatDescriptionRef,
         pixel_format: PixelFormat,
-        callback_ref_con: &DecodeCallbackBox<T>,
+        callback_ref_con: &BoxDecodeCallback<T>,
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
@@ -283,7 +283,7 @@ impl<T: Send + 'static> Decoder<T> {
             let mut callback =
                 MaybeUninit::<sys::VTDecompressionOutputCallbackRecord>::zeroed().assume_init();
             callback.decompressionOutputCallback = Some(Self::output_callback);
-            callback.decompressionOutputRefCon = (callback_ref_con as *const DecodeCallbackBox<T>)
+            callback.decompressionOutputRefCon = (callback_ref_con as *const BoxDecodeCallback<T>)
                 .cast::<c_void>()
                 .cast_mut();
 
@@ -390,16 +390,16 @@ impl<T: Send + 'static> Decoder<T> {
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut DecodeCallbackBox<T>> {
+    ) -> Option<&'a mut BoxDecodeCallback<T>> {
         if output_callback_ref_con.is_null() {
             log::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
-        Some(unsafe { &mut *output_callback_ref_con.cast::<DecodeCallbackBox<T>>() })
+        Some(unsafe { &mut *output_callback_ref_con.cast::<BoxDecodeCallback<T>>() })
     }
 
     fn invoke_callback(
-        callback: &mut DecodeCallbackBox<T>,
+        callback: &mut BoxDecodeCallback<T>,
         result: Result<DecodedFrame<T>, Error>,
     ) {
         let callback = callback.as_mut();
