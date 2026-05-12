@@ -108,7 +108,7 @@ fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
         config,
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),
@@ -157,7 +157,7 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
         config,
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),
@@ -205,7 +205,10 @@ fn encoder_rejects_zero_width() {
     let mut c = minimal_encoder_config();
     c.width = 0;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -215,7 +218,10 @@ fn encoder_rejects_zero_height() {
     let mut c = minimal_encoder_config();
     c.height = 0;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -228,7 +234,10 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             ..
@@ -241,7 +250,10 @@ fn encoder_rejects_width_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.width = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -251,7 +263,10 @@ fn encoder_rejects_height_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.height = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -264,7 +279,10 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     let mut c = minimal_encoder_config();
     c.average_bitrate = Some(i64::MAX as u64 + 1);
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "average_bitrate",
             ..
@@ -277,7 +295,10 @@ fn encoder_rejects_zero_fps_denominator() {
     let mut c = minimal_encoder_config();
     c.fps_denominator = 0;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "fps_denominator",
             ..
@@ -290,7 +311,10 @@ fn encoder_rejects_zero_fps_numerator() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = 0;
     assert!(matches!(
-        Encoder::<()>::new(c, FnEncodeHandler::new(|_| {})),
+        Encoder::new(
+            c,
+            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+        ),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             reason: "must not be zero"
@@ -305,7 +329,7 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
         minimal_encoder_config(),
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),
@@ -337,7 +361,7 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
         minimal_encoder_config(),
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),
@@ -369,7 +393,7 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
         minimal_encoder_config(),
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),
@@ -399,7 +423,7 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
         minimal_nv12_encoder_config(),
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, Error>| {
                 results.lock().expect("results mutex poisoned").push(result);
             }
         }),

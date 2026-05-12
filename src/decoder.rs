@@ -59,37 +59,41 @@ pub struct DecoderConfig<'a> {
 ///
 /// `Decoder::new()` に渡すコールバックを trait 化したもの。
 /// クロージャで実装する場合は [`FnDecodeHandler`] を使う。
-pub trait DecodeHandler<T>: Send + 'static {
+pub trait DecodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
     /// デコード完了時に呼ばれる
-    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, Error>);
+    fn on_decoded(&mut self, result: Result<DecodedFrame<Self::UserData>, Self::Error>);
 }
 
-/// `FnMut(Result<DecodedFrame<T>, Error>)` を [`DecodeHandler`] にするラッパー
-pub struct FnDecodeHandler<F>(F);
+/// `FnMut(Result<DecodedFrame<T>, E>)` を [`DecodeHandler`] にするラッパー
+pub struct FnDecodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<DecodedFrame<T>, E>) + Send + 'static>,
+}
 
-impl<F> FnDecodeHandler<F> {
-    /// `FnMut(Result<DecodedFrame<T>, Error>)` から [`DecodeHandler`] を構築する
-    pub fn new(f: F) -> Self {
-        Self(f)
+impl<T, E> FnDecodeHandler<T, E> {
+    /// `FnMut(Result<DecodedFrame<T>, E>)` から [`DecodeHandler`] を構築する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<DecodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
     }
 }
 
-impl<T, F> DecodeHandler<T> for FnDecodeHandler<F>
+impl<T, E> DecodeHandler for FnDecodeHandler<T, E>
 where
-    F: FnMut(Result<DecodedFrame<T>, Error>) + Send + 'static,
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
 {
-    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, Error>) {
-        (self.0)(result);
+    type UserData = T;
+    type Error = E;
+    fn on_decoded(&mut self, result: Result<DecodedFrame<T>, E>) {
+        (self.f)(result);
     }
 }
-
-// デコード完了通知コールバック型
-// `Err` の場合はデコード失敗や出力欠落を表す。
-type DecodeCallback<T> = dyn DecodeHandler<T> + Send + 'static;
-
-// `decompressionOutputRefCon` で受け渡すコールバック本体。
-// FFI へは `&BoxDecodeCallback<T>` のポインタを渡す。
-type BoxDecodeCallback<T> = Box<DecodeCallback<T>>;
 
 // 1 回の decode 呼び出しに対応するデータ保持領域。
 // 非同期デコード完了コールバックが来るまで圧縮データと CoreMedia オブジェクトを保持する。
@@ -109,21 +113,17 @@ struct PendingDecode<T> {
 ///
 /// デコード完了時に [`DecodeHandler`] を呼び出す。
 /// コールバックは Video Toolbox のコールバックスレッドで実行される。
-pub struct Decoder<T: Send + 'static> {
+pub struct Decoder<H: DecodeHandler> {
     description: sys::CMVideoFormatDescriptionRef,
     session: sys::VTDecompressionSessionRef,
     pixel_format: PixelFormat,
-    callback: Box<BoxDecodeCallback<T>>,
+    handler: Box<H>,
 }
 
-impl<T: Send + 'static> Decoder<T> {
+impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーのインスタンスを生成する
-    pub fn new<H>(config: DecoderConfig<'_>, on_decoded: H) -> Result<Self, Error>
-    where
-        H: DecodeHandler<T>,
-    {
-        // `DecodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
-        let callback = Box::new(Box::new(on_decoded) as BoxDecodeCallback<T>);
+    pub fn new(config: DecoderConfig<'_>, on_decoded: H) -> Result<Self, Error> {
+        let handler = Box::new(on_decoded);
 
         unsafe {
             let description = Self::create_format_description(&config.codec)
@@ -131,7 +131,7 @@ impl<T: Send + 'static> Decoder<T> {
             let session = Self::create_decompression_session(
                 description,
                 config.pixel_format,
-                callback.as_ref(),
+                handler.as_ref(),
             )
             .map_err(|e| {
                 sys::CFRelease(description as *const c_void);
@@ -142,7 +142,7 @@ impl<T: Send + 'static> Decoder<T> {
                 description,
                 session,
                 pixel_format: config.pixel_format,
-                callback,
+                handler,
             })
         }
     }
@@ -189,7 +189,7 @@ impl<T: Send + 'static> Decoder<T> {
                 let new_session = match Self::create_decompression_session(
                     new_description,
                     self.pixel_format,
-                    self.callback.as_ref(),
+                    self.handler.as_ref(),
                 ) {
                     Ok(session) => session,
                     Err(e) => {
@@ -221,6 +221,19 @@ impl<T: Send + 'static> Decoder<T> {
             Error::check(status, "VTDecompressionSessionWaitForAsynchronousFrames")?;
         }
         Ok(())
+    }
+
+    /// ハンドラへの参照を返す
+    ///
+    /// # Safety
+    ///
+    /// FFI コールバックは別スレッドで `&mut H` としてハンドラにアクセスするため、
+    /// このメソッドが返す `&H` と競合すると未定義動作になる。
+    /// 呼び出し側は本メソッドを以下のいずれかのタイミングでのみ呼ぶこと:
+    /// - `finish()` 完了後、すべてのコールバックが処理された後
+    /// - `Decoder` が一切のデコード中でないことが保証できる場合
+    pub unsafe fn handler(&self) -> &H {
+        &self.handler
     }
 
     /// DecoderCodec から CMVideoFormatDescription を作成する
@@ -303,15 +316,13 @@ impl<T: Send + 'static> Decoder<T> {
     unsafe fn create_decompression_session(
         description: sys::CMVideoFormatDescriptionRef,
         pixel_format: PixelFormat,
-        callback_ref_con: &BoxDecodeCallback<T>,
+        handler: &H,
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
-            let callback = sys::VTDecompressionOutputCallbackRecord {
+            let record = sys::VTDecompressionOutputCallbackRecord {
                 decompressionOutputCallback: Some(Self::output_callback),
-                decompressionOutputRefCon: (callback_ref_con as *const BoxDecodeCallback<T>)
-                    .cast::<c_void>()
-                    .cast_mut(),
+                decompressionOutputRefCon: (handler as *const H).cast::<c_void>().cast_mut(),
             };
 
             let cv_pixel_format = match pixel_format {
@@ -326,7 +337,7 @@ impl<T: Send + 'static> Decoder<T> {
                 description,
                 std::ptr::null_mut(),
                 dest_attrs,
-                &callback,
+                &record,
                 &mut session,
             );
             Error::check(status, "VTDecompressionSessionCreate")?;
@@ -339,7 +350,7 @@ impl<T: Send + 'static> Decoder<T> {
     ///
     /// `user_data` は対応するデコード完了時に `DecodedFrame<T>` に載せて返す。
     /// 完了通知は `Decoder::new` で渡したコールバックで受け取る。
-    pub fn decode(&mut self, data: &[u8], user_data: T) -> Result<(), Error> {
+    pub fn decode(&mut self, data: &[u8], user_data: H::UserData) -> Result<(), Error> {
         // `CMBlockBufferCreateWithMemoryBlock` に渡すメモリを `Vec` で所有する。
         // `&[u8]` からミュータブルポインタを渡すとエイリアス規則上の未定義動作の余地があるため、
         // コピーで所有権を明確にする（CoreMedia はデコード時に参照するのみ）。
@@ -395,7 +406,7 @@ impl<T: Send + 'static> Decoder<T> {
                 &mut info_flags,
             );
             if let Err(e) = Error::check(status, "VTDecompressionSessionDecodeFrame") {
-                let _ = Box::from_raw(source_frame_ref_con.cast::<PendingDecode<T>>());
+                let _ = Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>());
                 return Err(e);
             }
 
@@ -406,30 +417,31 @@ impl<T: Send + 'static> Decoder<T> {
     unsafe fn take_pending_decode(
         source_frame_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<Box<PendingDecode<T>>> {
+    ) -> Option<Box<PendingDecode<H::UserData>>> {
         if source_frame_ref_con.is_null() {
             log::error!("{callback_name}: source_frame_ref_con is null");
             return None;
         }
-        Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<T>>()) })
+        Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>()) })
     }
 
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut BoxDecodeCallback<T>> {
+    ) -> Option<&'a mut H> {
         if output_callback_ref_con.is_null() {
             log::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
-        Some(unsafe { &mut *output_callback_ref_con.cast::<BoxDecodeCallback<T>>() })
+        // SAFETY:
+        // - `output_callback_ref_con` は `Box<H>` のヒープアドレスを指す。
+        //   `Box<H>` のヒープアドレスは `Decoder` の生存期間中不変である。
+        // - FFI コールバックは `&mut H` で排他的にアクセスする。
+        Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
     }
 
-    fn invoke_callback(
-        callback: &mut BoxDecodeCallback<T>,
-        result: Result<DecodedFrame<T>, Error>,
-    ) {
-        callback.on_decoded(result);
+    fn invoke_callback(handler: &mut H, result: Result<DecodedFrame<H::UserData>, H::Error>) {
+        handler.on_decoded(result);
     }
 
     unsafe extern "C" fn output_callback(
@@ -447,7 +459,7 @@ impl<T: Send + 'static> Decoder<T> {
         else {
             return;
         };
-        let Some(callback) =
+        let Some(handler) =
             (unsafe { Self::callback_from_ref_con(decompression_output_ref_con, callback_name) })
         else {
             return;
@@ -461,7 +473,7 @@ impl<T: Send + 'static> Decoder<T> {
 
         if let Err(e) = Error::check(status, callback_name) {
             log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
@@ -471,7 +483,7 @@ impl<T: Send + 'static> Decoder<T> {
                 reason: "decoded image buffer is null",
             };
             log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
@@ -484,7 +496,7 @@ impl<T: Send + 'static> Decoder<T> {
         let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
         if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
             log::error!("{e}");
-            Self::invoke_callback(callback, Err(e));
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
@@ -502,11 +514,11 @@ impl<T: Send + 'static> Decoder<T> {
                 user_data,
             },
         };
-        Self::invoke_callback(callback, Ok(frame));
+        Self::invoke_callback(handler, Ok(frame));
     }
 }
 
-impl<T: Send + 'static> Drop for Decoder<T> {
+impl<H: DecodeHandler> Drop for Decoder<H> {
     fn drop(&mut self) {
         if let Err(e) = self.finish() {
             log::error!("{e}");
@@ -522,8 +534,8 @@ impl<T: Send + 'static> Drop for Decoder<T> {
 
 // SAFETY: VTDecompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// コールバックは別スレッドで実行されるため、`T: Send` 制約を課して所有権を安全に移動させる。
-unsafe impl<T: Send + 'static> Send for Decoder<T> {}
+// handler は Box<H> でヒープに隔離されており、FFI コールバックは &mut H で排他的に借用する。
+unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
 /// デコードされた映像フレーム
 pub enum DecodedFrame<T> {

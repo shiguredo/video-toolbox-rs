@@ -48,7 +48,7 @@ fn take_results(results: &SharedDecodeResults) -> Vec<DecodeEvent> {
 
 #[test]
 fn decoder_vp9_rejects_width_above_i32_max() {
-    let r = Decoder::<()>::new(
+    let r = Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Vp9 {
                 width: i32::MAX as u32 + 1,
@@ -56,7 +56,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        FnDecodeHandler::new(|_| {}),
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     );
     assert!(matches!(
         r,
@@ -66,7 +66,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
 
 #[test]
 fn decoder_av1_rejects_height_above_i32_max() {
-    let r = Decoder::<()>::new(
+    let r = Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: 640,
@@ -74,7 +74,7 @@ fn decoder_av1_rejects_height_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        FnDecodeHandler::new(|_| {}),
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     );
     assert!(matches!(
         r,
@@ -104,7 +104,7 @@ fn h264_decoder() -> Result<(), Error> {
         },
         FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
         }),
@@ -168,7 +168,7 @@ fn h265_decoder() -> Result<(), Error> {
         },
         FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
         }),
@@ -221,7 +221,7 @@ fn init_av1_decoder() -> Result<(), Error> {
     // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
     // コーデック固有のパラメータが不足して失敗する場合がある。
     // 実際のビットストリームからデコードする場合は正常に動作する。
-    match Decoder::<()>::new(
+    match Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
@@ -229,7 +229,7 @@ fn init_av1_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        FnDecodeHandler::new(|_| {}),
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     ) {
         Ok(_) => Ok(()),
         Err(Error::UnsupportedCodec { .. }) => Ok(()),
@@ -407,7 +407,7 @@ fn vp9_decoder() -> Result<(), Error> {
         },
         FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
         }),

@@ -334,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut encoder = Encoder::new(
         config,
         FnEncodeHandler::new({
-            move |result| {
+            move |result: Result<EncodedFrame<u64>, VideoToolboxError>| {
                 if encoded_result_tx.send(result).is_err() {
                     eprintln!("encoded results receiver is dropped");
                 }
