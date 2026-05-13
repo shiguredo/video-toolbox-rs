@@ -55,10 +55,9 @@ pub struct DecoderConfig<'a> {
     pub pixel_format: PixelFormat,
 }
 
-/// デコード完了通知ハンドラー
+/// デコード結果を通知するためのハンドラー
 ///
-/// `Decoder::new()` に渡すコールバックを trait 化したもの。
-/// クロージャで実装する場合は [`FnDecodeHandler`] を使う。
+/// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
 pub trait DecodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
@@ -111,8 +110,8 @@ struct PendingDecode<T> {
 
 /// H.264 / H.265 / VP9 / AV1 デコーダー
 ///
-/// デコード完了時に [`DecodeHandler`] を呼び出す。
-/// コールバックは Video Toolbox のコールバックスレッドで実行される。
+/// デコード完了時に [`DecodeHandler::on_decoded`] を呼び出す。
+/// この [`DecodeHandler::on_decoded`] の呼び出しは Video Toolbox のコールバックスレッドから行われる。
 pub struct Decoder<H: DecodeHandler> {
     description: sys::CMVideoFormatDescriptionRef,
     session: sys::VTDecompressionSessionRef,
@@ -122,8 +121,8 @@ pub struct Decoder<H: DecodeHandler> {
 
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーのインスタンスを生成する
-    pub fn new(config: DecoderConfig<'_>, on_decoded: H) -> Result<Self, Error> {
-        let handler = Box::new(on_decoded);
+    pub fn new(config: DecoderConfig<'_>, handler: H) -> Result<Self, Error> {
+        let handler = Box::new(handler);
 
         unsafe {
             let description = Self::create_format_description(&config.codec)
@@ -221,19 +220,6 @@ impl<H: DecodeHandler> Decoder<H> {
             Error::check(status, "VTDecompressionSessionWaitForAsynchronousFrames")?;
         }
         Ok(())
-    }
-
-    /// ハンドラへの参照を返す
-    ///
-    /// # Safety
-    ///
-    /// FFI コールバックは別スレッドで `&mut H` としてハンドラにアクセスするため、
-    /// このメソッドが返す `&H` と競合すると未定義動作になる。
-    /// 呼び出し側は本メソッドを以下のいずれかのタイミングでのみ呼ぶこと:
-    /// - `finish()` 完了後、すべてのコールバックが処理された後
-    /// - `Decoder` が一切のデコード中でないことが保証できる場合
-    pub unsafe fn handler(&self) -> &H {
-        &self.handler
     }
 
     /// DecoderCodec から CMVideoFormatDescription を作成する
@@ -472,7 +458,6 @@ impl<H: DecodeHandler> Decoder<H> {
         } = *pending;
 
         if let Err(e) = Error::check(status, callback_name) {
-            log::error!("{e}");
             Self::invoke_callback(handler, Err(e.into()));
             return;
         }
@@ -482,7 +467,6 @@ impl<H: DecodeHandler> Decoder<H> {
             let e = Error::LimitExceeded {
                 reason: "decoded image buffer is null",
             };
-            log::error!("{e}");
             Self::invoke_callback(handler, Err(e.into()));
             return;
         }
@@ -495,7 +479,6 @@ impl<H: DecodeHandler> Decoder<H> {
         let flags_readonly = 1;
         let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
         if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
-            log::error!("{e}");
             Self::invoke_callback(handler, Err(e.into()));
             return;
         }
@@ -534,7 +517,7 @@ impl<H: DecodeHandler> Drop for Decoder<H> {
 
 // SAFETY: VTDecompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// handler は Box<H> でヒープに隔離されており、FFI コールバックは &mut H で排他的に借用する。
+// handler は Box<H> でヒープに隔離されており、Decoder の生存期間中はアドレス不変である。
 unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
 /// デコードされた映像フレーム

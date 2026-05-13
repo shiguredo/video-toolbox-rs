@@ -130,10 +130,9 @@ pub struct EncodeOptions {
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-/// エンコード完了通知ハンドラー
+/// エンコード結果を通知するためのハンドラー
 ///
-/// `Encoder::new()` に渡すコールバックを trait 化したもの。
-/// クロージャで実装する場合は [`FnEncodeHandler`] を使う。
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
 pub trait EncodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
@@ -172,8 +171,8 @@ where
 
 /// H.264 / H.265 エンコーダー
 ///
-/// エンコード完了時に [`EncodeHandler`] を呼び出す。
-/// コールバックは Video Toolbox のコールバックスレッドで実行される。
+/// エンコード完了時に [`EncodeHandler::on_encoded`] を呼び出す。
+/// この [`EncodeHandler::on_encoded`] の呼び出しは Video Toolbox のコールバックスレッドから行われる。
 pub struct Encoder<H: EncodeHandler> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
@@ -183,9 +182,9 @@ pub struct Encoder<H: EncodeHandler> {
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(config: EncoderConfig, on_encoded: H) -> Result<Self, Error> {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        let handler = Box::new(on_encoded);
+        let handler = Box::new(handler);
         let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
         Ok(Self {
@@ -221,19 +220,6 @@ impl<H: EncodeHandler> Encoder<H> {
         }
 
         Ok(())
-    }
-
-    /// ハンドラへの参照を返す
-    ///
-    /// # Safety
-    ///
-    /// FFI コールバックは別スレッドで `&mut H` としてハンドラにアクセスするため、
-    /// このメソッドが返す `&H` と競合すると未定義動作になる。
-    /// 呼び出し側は本メソッドを以下のいずれかのタイミングでのみ呼ぶこと:
-    /// - `finish()` 完了後、すべてのコールバックが処理された後
-    /// - `Encoder` が一切のエンコード中でないことが保証できる場合
-    pub unsafe fn handler(&self) -> &H {
-        &self.handler
     }
 
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
@@ -960,7 +946,6 @@ impl<H: EncodeHandler> Encoder<H> {
         };
 
         if let Err(e) = Error::check(status, callback_name) {
-            log::error!("{e}");
             Self::invoke_callback(handler, Err(e.into()));
             return;
         }
@@ -970,7 +955,6 @@ impl<H: EncodeHandler> Encoder<H> {
             let e = Error::LimitExceeded {
                 reason: "encoded sample buffer is null",
             };
-            log::error!("{e}");
             Self::invoke_callback(handler, Err(e.into()));
             return;
         }
@@ -981,7 +965,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 let e = Error::LimitExceeded {
                     reason: "CMSampleBufferGetDataBuffer returned null",
                 };
-                log::error!("{e}");
                 Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
@@ -1007,7 +990,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                log::error!("{e}");
                 Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
@@ -1020,7 +1002,6 @@ impl<H: EncodeHandler> Encoder<H> {
                     let e = Error::LimitExceeded {
                         reason: "CMSampleBufferGetFormatDescription returned null for keyframe",
                     };
-                    log::error!("{e}");
                     Self::invoke_callback(handler, Err(e.into()));
                     return;
                 }
@@ -1030,7 +1011,6 @@ impl<H: EncodeHandler> Encoder<H> {
                         let e = Error::LimitExceeded {
                             reason: "failed to extract codec parameter sets",
                         };
-                        log::error!("{e}");
                         Self::invoke_callback(handler, Err(e.into()));
                         return;
                     }
@@ -1197,7 +1177,7 @@ impl<H: EncodeHandler> Drop for Encoder<H> {
 
 // SAFETY: VTCompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// handler は Box<H> でヒープに隔離されており、FFI コールバックは &mut H で排他的に借用する。
+// handler は Box<H> でヒープに隔離されており、Encoder の生存期間中はアドレス不変である。
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 /// エンコードされた映像フレーム (AVCC 形式)
