@@ -11,6 +11,9 @@
 
 ## develop
 
+- [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
+  - @melpon
+
 ### misc
 
 

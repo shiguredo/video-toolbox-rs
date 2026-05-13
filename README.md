@@ -66,8 +66,8 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameData,
-    H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
 let config = EncoderConfig {
@@ -91,33 +91,40 @@ let config = EncoderConfig {
     max_frame_delay_count: None,
 };
 
-let mut encoder = Encoder::new(config)?;
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(
+    |result: Result<EncodedFrame<u64>, Error>| {
+        match result {
+            Ok(encoded) => {
+                println!(
+                    "encoded bytes: {} (user_data={})",
+                    encoded.data.len(),
+                    encoded.user_data
+                );
+            }
+            Err(e) => {
+                eprintln!("encode callback error: {e}");
+            }
+        }
+    },
+))?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
-encoder.encode(&frame, &EncodeOptions::default())?;
+encoder.encode(&frame, &EncodeOptions::default(), 0)?;
 
 // キーフレームを強制的に生成する
 encoder.encode(&frame, &EncodeOptions {
     force_key_frame: true,
-})?;
-
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("encoded bytes: {}", encoded.data.len());
-}
+}, 1)?;
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
 ```
 
 ### デコード
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, FnDecodeHandler, PixelFormat};
 
 // H.264 デコーダー (SPS / PPS が必要)
 let mut decoder = Decoder::new(DecoderConfig {
@@ -127,24 +134,28 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-})?;
-
-// AVCC フォーマットのデータをデコード
-if let Some(frame) = decoder.decode(&avcc_data)? {
-    match frame {
-        DecodedFrame::I420(f) => {
-            let y = f.y_plane();
-            let u = f.u_plane();
-            let v = f.v_plane();
-            println!("{}x{}", f.width(), f.height());
+}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, _>| {
+    match result {
+        Ok(DecodedFrame::I420 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let u = frame.u_plane();
+            let v = frame.v_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
         }
-        DecodedFrame::Nv12(f) => {
-            let y = f.y_plane();
-            let uv = f.uv_plane();
-            println!("{}x{}", f.width(), f.height());
+        Ok(DecodedFrame::Nv12 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let uv = frame.uv_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
+        }
+        Err(e) => {
+            eprintln!("decode callback error: {e}");
         }
     }
-}
+}))?;
+
+// AVCC フォーマットのデータを非同期デコード
+decoder.decode(&avcc_data, 42)?;
+decoder.finish()?;
 ```
 
 ## 設定
@@ -250,12 +261,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat};
 
-match Decoder::new(DecoderConfig {
+match Decoder::<()>::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}) {
+}, FnDecodeHandler::new(|_| {})) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
@@ -275,7 +286,7 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 
 `reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、`next_frame()` で取得できます。
+Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、エンコード完了コールバックで通知されます。
 
 ```rust
 // 動的に解像度を変更
@@ -301,11 +312,6 @@ let new_config = EncoderConfig {
     max_frame_delay_count: None,
 };
 encoder.reconfigure(new_config)?;
-
-// フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
 ```
 
 ### デコーダー

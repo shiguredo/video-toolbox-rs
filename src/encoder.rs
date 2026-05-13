@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::c_void, num::NonZeroU32, time::Duration};
+use std::{ffi::c_void, num::NonZeroU32, time::Duration};
 
 use crate::{
     error::Error,
@@ -130,59 +130,68 @@ pub struct EncodeOptions {
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-/// エンコーダーに渡すフレームデータ
-pub enum FrameData<'a> {
-    /// I420 (3 プレーン)
-    I420 {
-        /// Y プレーン
-        y: &'a [u8],
-        /// U プレーン
-        u: &'a [u8],
-        /// V プレーン
-        v: &'a [u8],
-    },
-    /// NV12 (2 プレーン)
-    Nv12 {
-        /// Y プレーン
-        y: &'a [u8],
-        /// UV インターリーブプレーン
-        uv: &'a [u8],
-    },
+/// エンコード結果を通知するためのハンドラー
+///
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+pub trait EncodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
+}
+
+/// `FnMut(Result<EncodedFrame<T>, E>)` を [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<EncodedFrame<T>, E>) + Send + 'static>,
+}
+
+impl<T, E> FnEncodeHandler<T, E> {
+    /// `FnMut(Result<EncodedFrame<T>, E>)` から [`EncodeHandler`] を構築する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl<T, E> EncodeHandler for FnEncodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
+        (self.f)(result);
+    }
 }
 
 /// H.264 / H.265 エンコーダー
 ///
-/// エンコードコールバックは未制限バッファの [`std::sync::mpsc::channel`] にフレームを送る。
-/// 受信側が [`Encoder::next_frame`] を十分な頻度で呼ばないと、チャネルおよび内部の `output_frames` に
-/// データが滞留し、メモリ使用量が増え続ける可能性がある。
-#[derive(Debug)]
-pub struct Encoder {
+/// エンコード完了時に [`EncodeHandler::on_encoded`] を呼び出す。
+/// この [`EncodeHandler::on_encoded`] の呼び出しは Video Toolbox のコールバックスレッドから行われる。
+pub struct Encoder<H: EncodeHandler> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
-    next_output_pts: i64,
-    output_frames: HashMap<i64, EncodedFrame>, // キーは pts
-    encoded_frame_rx: std::sync::mpsc::Receiver<EncodedFrame>,
-
-    encoded_frame_tx: Box<std::sync::mpsc::Sender<EncodedFrame>>,
+    handler: Box<H>,
 }
 
-impl Encoder {
+impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(config: EncoderConfig) -> Result<Self, Error> {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = Box::new(tx);
-        let session = unsafe { Self::create_compression_session(&config, &tx)? };
+        let handler = Box::new(handler);
+        let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
         Ok(Self {
             session,
             config,
             next_input_pts: 0,
-            next_output_pts: 0,
-            output_frames: HashMap::new(),
-            encoded_frame_tx: tx,
-            encoded_frame_rx: rx,
+            handler,
         })
     }
 
@@ -190,18 +199,16 @@ impl Encoder {
     ///
     /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
     /// 新しい設定でセッションを再作成する。
-    /// フラッシュされたフレームは `next_frame()` で取得できる。
+    /// フラッシュされたフレームはエンコード完了コールバックで通知される。
     pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
         Self::validate_config(&config)?;
-        // 未出力フレームをフラッシュ
+        // 未出力フレームをフラッシュ（完了通知はコールバックで受け取る）
         self.finish()?;
 
         unsafe {
-            // チャネルを再作成し、新しいセッションを先に作成する
+            // 新しいセッションを先に作成する
             // 失敗時に self が不整合にならないようにする
-            let (tx, rx) = std::sync::mpsc::channel();
-            let tx = Box::new(tx);
-            let session = Self::create_compression_session(&config, &tx)?;
+            let session = Self::create_compression_session(&config, self.handler.as_ref())?;
 
             // 新しいセッションの作成に成功してから既存のセッションを破棄する
             sys::VTCompressionSessionInvalidate(self.session);
@@ -210,19 +217,15 @@ impl Encoder {
             self.session = session;
             self.config = config;
             self.next_input_pts = 0;
-            self.next_output_pts = 0;
-            self.output_frames.clear();
-            self.encoded_frame_tx = tx;
-            self.encoded_frame_rx = rx;
         }
 
         Ok(())
     }
 
-    /// EncoderConfig と Sender から VTCompressionSession を作成する
+    /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
     unsafe fn create_compression_session(
         config: &EncoderConfig,
-        tx: &std::sync::mpsc::Sender<EncodedFrame>,
+        handler: &H,
     ) -> Result<sys::VTCompressionSessionRef, Error> {
         unsafe {
             let mut session = std::ptr::null_mut();
@@ -253,9 +256,10 @@ impl Encoder {
                 }
             };
 
-            // `outputCallbackRefCon` には `Sender<EncodedFrame>` へのポインタを渡す。
-            // エンコード出力コールバック内では同一ポインタを `Sender` として復元して `send` する（`process_encoded_output`）。
-            // ポインタは `Encoder` が `Box` で保持する `Sender` を指し、`Encoder` の生存期間中は有効である。
+            // SAFETY:
+            // - `outputCallbackRefCon` には `&H` のポインタを渡す。
+            //   `handler` は `Box<H>` でヒープに隔離されており、`Encoder` の生存期間中はアドレス不変である。
+            // - 出力コールバック内で `&mut H` として復元し、ユーザー指定のハンドラを呼び出す (`process_encoded_output`)。
             let status = VTCompressionSessionCreate(
                 std::ptr::null_mut(),
                 config.width as i32,
@@ -265,9 +269,7 @@ impl Encoder {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 Some(callback),
-                (tx as *const std::sync::mpsc::Sender<EncodedFrame>)
-                    .cast::<c_void>()
-                    .cast_mut(),
+                (handler as *const H).cast::<c_void>().cast_mut(),
                 &mut session,
             );
             Error::check(status, "VTCompressionSessionCreate")?;
@@ -632,12 +634,15 @@ impl Encoder {
 
     /// 画像データをエンコードする
     ///
-    /// エンコード結果は [`Encoder::next_frame()`] で取得できる
+    /// エンコード結果は構築時に指定したコールバックで通知される
     ///
     /// なお `y` のストライドは入力フレームの幅と等しいことが前提
-    ///
-    /// また B フレームは扱わない前提（つまり入力フレームと出力フレームの順番が一致する）
-    pub fn encode(&mut self, frame: &FrameData<'_>, options: &EncodeOptions) -> Result<(), Error> {
+    pub fn encode(
+        &mut self,
+        frame: &FrameData<'_>,
+        options: &EncodeOptions,
+        user_data: H::UserData,
+    ) -> Result<(), Error> {
         // Video Toolbox は CVPixelBuffer 単位でフォーマットを持つためフレームごとに変更可能だが、
         // このライブラリでは EncoderConfig.pixel_format でセッション全体のフォーマットを固定している。
         // FrameData のバリアントが EncoderConfig.pixel_format と一致しない場合はエラーとする。
@@ -724,6 +729,7 @@ impl Encoder {
             } else {
                 None
             };
+            let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
 
             let status = sys::VTCompressionSessionEncodeFrame(
                 self.session,
@@ -731,10 +737,14 @@ impl Encoder {
                 sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
                 sys::kCMTimeInvalid,
                 frame_properties,
-                std::ptr::null_mut(),
+                source_frame_ref_con,
                 std::ptr::null_mut(),
             );
-            Error::check(status, "VTCompressionSessionEncodeFrame")?;
+            if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
+                // status エラー時は sourceFrameRefCon がコールバックされないため、ここで drop する
+                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
+                return Err(e);
+            }
 
             self.next_input_pts = self
                 .next_input_pts
@@ -752,7 +762,7 @@ impl Encoder {
     /// video-device-rs の `PixelBuffer::as_ptr()` で取得した CVPixelBuffer ポインタを渡す。
     /// 内部で CFRetain するため、呼び出し元はこの関数の後にポインタ元を drop してよい。
     ///
-    /// エンコード結果は [`Encoder::next_frame()`] で取得できる
+    /// エンコード結果は構築時に指定したコールバックで通知される
     ///
     /// # Safety
     ///
@@ -764,6 +774,7 @@ impl Encoder {
         &mut self,
         pixel_buffer_ptr: *mut c_void,
         options: &EncodeOptions,
+        user_data: H::UserData,
     ) -> Result<(), Error> {
         unsafe {
             // ピクセルフォーマットの検証
@@ -808,6 +819,7 @@ impl Encoder {
             } else {
                 None
             };
+            let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
 
             let status = sys::VTCompressionSessionEncodeFrame(
                 self.session,
@@ -815,10 +827,13 @@ impl Encoder {
                 sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
                 sys::kCMTimeInvalid,
                 frame_properties,
-                std::ptr::null_mut(),
+                source_frame_ref_con,
                 std::ptr::null_mut(),
             );
-            Error::check(status, "VTCompressionSessionEncodeFrame")?;
+            if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
+                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
+                return Err(e);
+            }
 
             self.next_input_pts = self
                 .next_input_pts
@@ -833,7 +848,7 @@ impl Encoder {
 
     /// これ以上データが来ないことをエンコーダーに伝える
     ///
-    /// 残りのエンコード結果は [`Encoder::next_frame()`] で取得できる
+    /// 残りのエンコード結果は構築時に指定したコールバックで通知される
     pub fn finish(&mut self) -> Result<(), Error> {
         unsafe {
             let status = sys::VTCompressionSessionCompleteFrames(self.session, sys::kCMTimeInvalid);
@@ -842,53 +857,39 @@ impl Encoder {
         Ok(())
     }
 
-    /// エンコード済みのフレームを取り出す
-    ///
-    /// PTS 順に出力するため HashMap でバッファリングしている。
-    /// `next_output_pts` は `0` から始まり、成功のたびに `fps_denominator` だけ加算される。
-    /// **この値と一致する PTS** のフレームだけが順に返る。
-    ///
-    /// バックエンドが返すサンプルの PTS がその列から外れる（欠番・順不同・刻みの不一致）と、
-    /// 一致するキーが存在せず **繰り返し `None` になり得る**。
-    /// その間、別 PTS のフレームは `output_frames` に残り、メモリが増え続ける可能性がある。
-    /// `allow_frame_reordering: false` を前提としており、B フレームなどで PTS が飛ぶ構成には対応していない。
-    ///
-    /// 入力には `CMTimeMake(next_input_pts, fps_numerator as i32)` を用い、出力は `CMSampleBuffer` の PTS の整数部を使う。
-    /// 入力ステップと出力 PTS のスケールが一致しないと、上記のギャップが起きやすい。
-    ///
-    /// 出力側 PTS の加算が `i64` で表現できなくなった場合は [`Error::LimitExceeded`] を返す。
-    /// その場合でも **まだ取り出していない**エンコード済みフレームは `output_frames` に残る。
-    ///
-    /// チャネルに新しいフレームが届いていなくても、過去の呼び出しでバッファした `output_frames` があれば取出す。
-    pub fn next_frame(&mut self) -> Result<Option<EncodedFrame>, Error> {
-        if let Ok(frame) = self.encoded_frame_rx.try_recv() {
-            let pts = frame.pts;
-            if let Some(_dropped) = self.output_frames.insert(pts, frame) {
-                log::warn!(
-                    "duplicate encoded frame at pts={pts}, previous frame with same pts was dropped"
-                );
-            }
+    unsafe fn take_user_data(
+        source_frame_ref_con: *mut c_void,
+        callback_name: &'static str,
+    ) -> Option<H::UserData> {
+        if source_frame_ref_con.is_null() {
+            log::error!("{callback_name}: source_frame_ref_con is null");
+            return None;
         }
-        if !self.output_frames.contains_key(&self.next_output_pts) {
-            return Ok(None);
+        Some(unsafe { *Box::from_raw(source_frame_ref_con.cast::<H::UserData>()) })
+    }
+
+    unsafe fn callback_from_ref_con<'a>(
+        output_callback_ref_con: *mut c_void,
+        callback_name: &'static str,
+    ) -> Option<&'a mut H> {
+        if output_callback_ref_con.is_null() {
+            log::error!("{callback_name}: output_callback_ref_con is null");
+            return None;
         }
-        // `remove` より先に加算可否を検証し、失敗時にフレームをドロップしない
-        let next_pts = self
-            .next_output_pts
-            .checked_add(self.config.fps_denominator as i64)
-            .ok_or(Error::LimitExceeded {
-                reason: "output presentation timestamp overflow",
-            })?;
-        let Some(out) = self.output_frames.remove(&self.next_output_pts) else {
-            return Ok(None);
-        };
-        self.next_output_pts = next_pts;
-        Ok(Some(out))
+        // SAFETY:
+        // - `output_callback_ref_con` は `Box<H>` のヒープアドレスを指す。
+        //   `Box<H>` のヒープアドレスは `Encoder` の生存期間中不変である。
+        // - FFI コールバックは `&mut H` で排他的にアクセスする。
+        Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
+    }
+
+    fn invoke_callback(handler: &mut H, result: Result<EncodedFrame<H::UserData>, H::Error>) {
+        handler.on_encoded(result);
     }
 
     unsafe extern "C" fn output_callback_h264(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: i32,
         _info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
@@ -896,6 +897,7 @@ impl Encoder {
         unsafe {
             Self::process_encoded_output(
                 output_callback_ref_con,
+                source_frame_ref_con,
                 sample_buffer,
                 status,
                 "output_callback_h264",
@@ -906,7 +908,7 @@ impl Encoder {
 
     unsafe extern "C" fn output_callback_h265(
         output_callback_ref_con: *mut c_void,
-        _source_frame_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         status: i32,
         _info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
@@ -914,6 +916,7 @@ impl Encoder {
         unsafe {
             Self::process_encoded_output(
                 output_callback_ref_con,
+                source_frame_ref_con,
                 sample_buffer,
                 status,
                 "output_callback_h265",
@@ -925,35 +928,58 @@ impl Encoder {
     /// エンコードコールバックの共通処理
     unsafe fn process_encoded_output(
         output_callback_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
         sample_buffer: sys::CMSampleBufferRef,
         status: i32,
         callback_name: &'static str,
         extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Option<ParameterSets>,
     ) {
+        let Some(user_data) =
+            (unsafe { Self::take_user_data(source_frame_ref_con, callback_name) })
+        else {
+            return;
+        };
+        let Some(handler) =
+            (unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) })
+        else {
+            return;
+        };
+
         if let Err(e) = Error::check(status, callback_name) {
-            log::error!("{e}");
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
         // フレームドロップ等で sample_buffer が NULL になる場合がある
         if sample_buffer.is_null() {
+            let e = Error::LimitExceeded {
+                reason: "encoded sample buffer is null",
+            };
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
         unsafe {
             let data_buffer = sys::CMSampleBufferGetDataBuffer(sample_buffer);
             if data_buffer.is_null() {
-                log::error!("CMSampleBufferGetDataBuffer returned null");
+                let e = Error::LimitExceeded {
+                    reason: "CMSampleBufferGetDataBuffer returned null",
+                };
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
             // 非連続バッファでは `data_pointer_len < block_len` になり得るため、`CMBlockBufferCopyDataBytes` で全長をコピーする。
             let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
             if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
+                let e = Error::LimitExceeded {
+                    reason: "encoded block length exceeds defensive maximum",
+                };
                 log::error!(
                     "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
                     max = MAX_ENCODED_BLOCK_COPY_BYTES
                 );
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
             let mut data = vec![0u8; block_len];
@@ -964,22 +990,30 @@ impl Encoder {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                log::error!("{e}");
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
 
-            let pts = sys::CMSampleBufferGetPresentationTimeStamp(sample_buffer);
             let description = sys::CMSampleBufferGetFormatDescription(sample_buffer);
             let keyframe = is_keyframe(sample_buffer);
 
             let (vps_list, sps_list, pps_list) = if keyframe {
                 if description.is_null() {
-                    log::error!("CMSampleBufferGetFormatDescription returned null for keyframe");
+                    let e = Error::LimitExceeded {
+                        reason: "CMSampleBufferGetFormatDescription returned null for keyframe",
+                    };
+                    Self::invoke_callback(handler, Err(e.into()));
                     return;
                 }
                 match extract_params(description) {
                     Some(params) => params,
-                    None => return,
+                    None => {
+                        let e = Error::LimitExceeded {
+                            reason: "failed to extract codec parameter sets",
+                        };
+                        Self::invoke_callback(handler, Err(e.into()));
+                        return;
+                    }
                 }
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
@@ -991,15 +1025,9 @@ impl Encoder {
                 pps_list,
                 vps_list,
                 data,
-                pts: pts.value,
+                user_data,
             };
-
-            // `output_callback_ref_con` は `create_compression_session` が `VTCompressionSessionCreate` に渡した
-            // `Sender<EncodedFrame>` と同一アドレスであること（Video Toolbox の契約）。
-            // 呼び出しもとスレッドに結果を伝える。
-            // (Sender は Send を実装しているので、複数スレッドで参照を共有しても問題ない)
-            let tx = &*(output_callback_ref_con as *mut std::sync::mpsc::Sender<EncodedFrame>);
-            let _ = tx.send(frame);
+            Self::invoke_callback(handler, Ok(frame));
         }
     }
 
@@ -1138,7 +1166,7 @@ impl Encoder {
     }
 }
 
-impl Drop for Encoder {
+impl<H: EncodeHandler> Drop for Encoder<H> {
     fn drop(&mut self) {
         unsafe {
             sys::VTCompressionSessionInvalidate(self.session);
@@ -1149,12 +1177,12 @@ impl Drop for Encoder {
 
 // SAFETY: VTCompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// コールバックは別スレッドから呼ばれるが、mpsc::Sender 経由でデータを渡すため安全。
-unsafe impl Send for Encoder {}
+// handler は Box<H> でヒープに隔離されており、Encoder の生存期間中はアドレス不変である。
+unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 /// エンコードされた映像フレーム (AVCC 形式)
 #[derive(Debug)]
-pub struct EncodedFrame {
+pub struct EncodedFrame<T> {
     /// キーフレームかどうか
     pub keyframe: bool,
 
@@ -1170,7 +1198,28 @@ pub struct EncodedFrame {
     /// 圧縮データ
     pub data: Vec<u8>,
 
-    pts: i64,
+    /// `encode` / `encode_pixel_buffer` 呼び出し時に指定したユーザーデータ
+    pub user_data: T,
+}
+
+/// エンコーダーに渡すフレームデータ
+pub enum FrameData<'a> {
+    /// I420 (3 プレーン)
+    I420 {
+        /// Y プレーン
+        y: &'a [u8],
+        /// U プレーン
+        u: &'a [u8],
+        /// V プレーン
+        v: &'a [u8],
+    },
+    /// NV12 (2 プレーン)
+    Nv12 {
+        /// Y プレーン
+        y: &'a [u8],
+        /// UV インターリーブプレーン
+        uv: &'a [u8],
+    },
 }
 
 /// パラメータセット 1 個あたりのコピー上限（バイト）。
