@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use shiguredo_video_toolbox::{
-    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat, VideoCodecType,
-    supported_codecs,
+    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat,
+    VideoCodecType, supported_codecs,
 };
 
 const WIDTH: u32 = 640;
@@ -17,6 +17,9 @@ enum DecodeEvent {
         height: usize,
         y_plane: Vec<u8>,
         y_stride: usize,
+    },
+    Nv12 {
+        user_data: u64,
     },
     Err(Error),
 }
@@ -32,9 +35,7 @@ fn push_decode_event(results: &SharedDecodeResults, result: Result<DecodedFrame<
             y_plane: frame.y_plane().to_vec(),
             y_stride: frame.y_stride(),
         },
-        Ok(DecodedFrame::Nv12 { user_data, .. }) => {
-            panic!("unexpected NV12 frame in I420-only tests: user_data={user_data}")
-        }
+        Ok(DecodedFrame::Nv12 { user_data, .. }) => DecodeEvent::Nv12 { user_data },
         Err(e) => DecodeEvent::Err(e),
     };
     results.lock().expect("results mutex poisoned").push(event);
@@ -47,7 +48,7 @@ fn take_results(results: &SharedDecodeResults) -> Vec<DecodeEvent> {
 
 #[test]
 fn decoder_vp9_rejects_width_above_i32_max() {
-    let r = Decoder::<()>::new(
+    let r = Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Vp9 {
                 width: i32::MAX as u32 + 1,
@@ -55,7 +56,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     );
     assert!(matches!(
         r,
@@ -65,7 +66,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
 
 #[test]
 fn decoder_av1_rejects_height_above_i32_max() {
-    let r = Decoder::<()>::new(
+    let r = Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: 640,
@@ -73,7 +74,7 @@ fn decoder_av1_rejects_height_above_i32_max() {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     );
     assert!(matches!(
         r,
@@ -101,12 +102,12 @@ fn h264_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     let nal_unit = [
@@ -135,6 +136,9 @@ fn h264_decoder() -> Result<(), Error> {
             assert_eq!(width, WIDTH as usize);
             assert_eq!(height, HEIGHT as usize);
         }
+        DecodeEvent::Nv12 { .. } => {
+            unreachable!("expected I420 but got NV12");
+        }
         DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
     }
 
@@ -162,12 +166,12 @@ fn h265_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     let nal_unit = [
@@ -196,48 +200,12 @@ fn h265_decoder() -> Result<(), Error> {
             assert_eq!(width, WIDTH as usize);
             assert_eq!(height, HEIGHT as usize);
         }
+        DecodeEvent::Nv12 { .. } => {
+            unreachable!("expected I420 but got NV12");
+        }
         DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
     }
 
-    Ok(())
-}
-
-#[test]
-fn update_format_replaces_parameter_sets() -> Result<(), Error> {
-    // H.264 デコーダーを起動し、同コーデックの別 SPS/PPS で `update_format` を呼んで
-    // 内部の `finish()` 呼び出し含めて成功することを確認する。
-    let sps = [
-        103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22, 45,
-        150,
-    ];
-    let pps = [104, 235, 227, 203, 34, 192];
-    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
-    let mut decoder = Decoder::new(
-        DecoderConfig {
-            codec: DecoderCodec::H264 {
-                sps: &sps,
-                pps: &pps,
-                nalu_len_bytes: 4,
-            },
-            pixel_format: PixelFormat::I420,
-        },
-        {
-            let results = Arc::clone(&results);
-            move |result| {
-                push_decode_event(&results, result);
-            }
-        },
-    )?;
-
-    // 同じパラメータセットで update_format を呼んでも成功すること
-    decoder.update_format(DecoderCodec::H264 {
-        sps: &sps,
-        pps: &pps,
-        nalu_len_bytes: 4,
-    })?;
-    // 続けて decode できることを確認 (フォーマット更新後にデコードパスが活きていることの観測)
-    decoder.finish()?;
-    let _ = take_results(&results);
     Ok(())
 }
 
@@ -253,7 +221,7 @@ fn init_av1_decoder() -> Result<(), Error> {
     // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
     // コーデック固有のパラメータが不足して失敗する場合がある。
     // 実際のビットストリームからデコードする場合は正常に動作する。
-    match Decoder::<()>::new(
+    match Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::Av1 {
                 width: WIDTH,
@@ -261,7 +229,7 @@ fn init_av1_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        |_| {},
+        FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
     ) {
         Ok(_) => Ok(()),
         Err(Error::UnsupportedCodec { .. }) => Ok(()),
@@ -437,12 +405,12 @@ fn vp9_decoder() -> Result<(), Error> {
             },
             pixel_format: PixelFormat::I420,
         },
-        {
+        FnDecodeHandler::new({
             let results = Arc::clone(&results);
-            move |result| {
+            move |result: Result<DecodedFrame<u64>, Error>| {
                 push_decode_event(&results, result);
             }
-        },
+        }),
     )?;
 
     for (i, encoded_data) in encoded_frames.iter().enumerate() {
@@ -493,6 +461,9 @@ fn vp9_decoder() -> Result<(), Error> {
                     psnr >= min_psnr_db,
                     "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
                 );
+            }
+            DecodeEvent::Nv12 { user_data, .. } => {
+                unreachable!("frame {user_data}: expected I420 but got NV12");
             }
             DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
         }

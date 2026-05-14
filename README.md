@@ -30,9 +30,9 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的設定変更
-  - エンコーダー: `Encoder::reconfigure()` でビットレート / フレームレートを動的に更新 (セッション再作成なし)
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新 (セッション流用を判定し、不可能な場合のみ再作成)
+- 動的解像度変更
+  - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
+  - デコーダー: `Decoder::update_format()` でフォーマットを更新
 - AVCC 形式の入出力
 
 ## 動作要件
@@ -66,8 +66,8 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FrameData,
-    H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
 let config = EncoderConfig {
@@ -91,20 +91,22 @@ let config = EncoderConfig {
     max_frame_delay_count: None,
 };
 
-let mut encoder = Encoder::new(config, |result: Result<EncodedFrame<u64>, Error>| {
-    match result {
-        Ok(encoded) => {
-            println!(
-                "encoded bytes: {} (user_data={})",
-                encoded.data.len(),
-                encoded.user_data
-            );
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(
+    |result: Result<EncodedFrame<u64>, Error>| {
+        match result {
+            Ok(encoded) => {
+                println!(
+                    "encoded bytes: {} (user_data={})",
+                    encoded.data.len(),
+                    encoded.user_data
+                );
+            }
+            Err(e) => {
+                eprintln!("encode callback error: {e}");
+            }
         }
-        Err(e) => {
-            eprintln!("encode callback error: {e}");
-        }
-    }
-})?;
+    },
+))?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
@@ -122,7 +124,7 @@ encoder.finish()?;
 ### デコード
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, FnDecodeHandler, PixelFormat};
 
 // H.264 デコーダー (SPS / PPS が必要)
 let mut decoder = Decoder::new(DecoderConfig {
@@ -132,7 +134,7 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-}, |result: Result<DecodedFrame<u64>, _>| {
+}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, _>| {
     match result {
         Ok(DecodedFrame::I420 { frame, user_data }) => {
             let y = frame.y_plane();
@@ -149,7 +151,7 @@ let mut decoder = Decoder::new(DecoderConfig {
             eprintln!("decode callback error: {e}");
         }
     }
-})?;
+}))?;
 
 // AVCC フォーマットのデータを非同期デコード
 decoder.decode(&avcc_data, 42)?;
@@ -259,12 +261,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat};
 
 match Decoder::<()>::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}, |_| {}) {
+}, FnDecodeHandler::new(|_| {})) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
@@ -276,36 +278,41 @@ match Decoder::<()>::new(DecoderConfig {
 }
 ```
 
-## 動的設定変更
+## 動的解像度変更
 
-WebRTC やアダプティブビットレートストリーミングなど、ストリーム中にビットレートやフレームレートを変更したり、デコーダー側のフォーマットが変わったりするユースケースに対応しています。
+WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に解像度が変わるユースケースに対応しています。
 
 ### エンコーダー
 
-エンコーダーで動的に変更できるのはビットレートとフレームレートのみです。解像度・コーデック・ピクセルフォーマットを変更する場合は `Encoder` を作り直してください（Video Toolbox の `VTCompressionSession` が仕様上これらの動的変更をサポートしないため）。
+`reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
 
-`reconfigure()` で `ReconfigureParams` を渡し、`VTSessionSetProperties` ベースで動的プロパティを更新します。セッション再作成は行わないため、未出力フレームのフラッシュは行われません。`expected_frame_rate` を更新した場合は、内部の PTS カウンタを新しい timescale に再スケールして物理時間が連続するようにします。
+Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、エンコード完了コールバックで通知されます。
 
 ```rust
-// 動的に bitrate と framerate を更新
-// `None` のフィールドは現在値を維持する
-encoder.reconfigure(ReconfigureParams {
+// 動的に解像度を変更
+// 未出力フレームは自動的にフラッシュされる
+let new_config = EncoderConfig {
+    width: 1280,
+    height: 720,
+    codec: CodecConfig::H264(H264EncoderConfig {
+        profile: H264Profile::Main,
+        entropy_mode: H264EntropyMode::Cabac,
+    }),
+    pixel_format: PixelFormat::I420,
     average_bitrate: Some(2_000_000),
-    expected_frame_rate: Some(30),
-})?;
+    fps_numerator: 30,
+    fps_denominator: 1,
+    prioritize_encoding_speed_over_quality: false,
+    real_time: false,
+    maximize_power_efficiency: false,
+    allow_frame_reordering: false,
+    allow_temporal_compression: true,
+    max_key_frame_interval: None,
+    max_key_frame_interval_duration: None,
+    max_frame_delay_count: None,
+};
+encoder.reconfigure(new_config)?;
 ```
-
-`ReconfigureParams::default()` は全項目 `None` で初期化されるため、更新したい項目だけを指定できます。
-
-```rust
-// bitrate のみ更新する
-encoder.reconfigure(ReconfigureParams {
-    average_bitrate: Some(1_500_000),
-    ..ReconfigureParams::default()
-})?;
-```
-
-`expected_frame_rate` は `EncoderConfig` の `fps_numerator` / `fps_denominator` ペアではなく単一整数で受け取ります。これは VideoToolbox の `kVTCompressionPropertyKey_ExpectedFrameRate` が単一数値しか受け付けないためです。`reconfigure` 経由で更新すると `fps_denominator` は `1` に正規化されるため、29.97 fps (30000/1001) など分数フレームレートを維持したい場合は `Encoder` を作り直してください。
 
 ### デコーダー
 
@@ -347,9 +354,8 @@ decoder.update_format(DecoderCodec::Av1 {
 | | エンコーダー | デコーダー |
 |---|---|---|
 | メソッド | `reconfigure()` | `update_format()` |
-| 仕組み | `VTSessionSetProperties` で動的プロパティ更新 (セッション再作成なし) | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `ReconfigureParams` (動的更新可能な項目のみ) | `DecoderCodec` (パラメータセットのみ) |
-| 解像度・コーデック変更 | 非対応 (`Encoder` を作り直す) | 対応 |
+| 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
+| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
 
 ## ライセンス
 

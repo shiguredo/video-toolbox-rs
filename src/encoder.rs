@@ -1,9 +1,4 @@
-use std::{
-    ffi::c_void,
-    num::NonZeroU32,
-    panic::{AssertUnwindSafe, catch_unwind},
-    time::Duration,
-};
+use std::{ffi::c_void, num::NonZeroU32, time::Duration};
 
 use crate::{
     error::Error,
@@ -132,226 +127,96 @@ pub struct EncodeOptions {
     pub force_key_frame: bool,
 }
 
-/// `Encoder::reconfigure` で動的に更新可能なエンコードパラメータ
-///
-/// `None` のフィールドは現在値を維持する。全項目 `None` の場合は no-op となる。
-///
-/// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
-/// 項目はここに含まれていない。これらを変更する場合は `Encoder` を作り直す。
-///
-/// 将来のフィールド追加 (例: `DataRateLimits`) は破壊的変更として扱う。
-/// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新する記述を推奨する。
-#[derive(Debug, Clone, Default)]
-pub struct ReconfigureParams {
-    /// kVTCompressionPropertyKey_AverageBitRate (bps 単位)
-    pub average_bitrate: Option<u64>,
-
-    /// kVTCompressionPropertyKey_ExpectedFrameRate (整数 fps)
-    ///
-    /// 詳細な正規化 / 再スケール挙動は [`Encoder::reconfigure`] の rustdoc を参照。
-    pub expected_frame_rate: Option<u32>,
-}
-
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 
-/// `average_bitrate` (bps) の境界を検証する
-fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
-    if bitrate == 0 {
-        return Err(Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must not be zero",
-        });
-    }
-    if bitrate > i64::MAX as u64 {
-        return Err(Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must fit in i64 for CFNumber",
-        });
-    }
-    Ok(())
+/// エンコード結果を通知するためのハンドラー
+///
+/// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+pub trait EncodeHandler: Send + 'static {
+    /// ユーザーデータ型
+    type UserData: Send + 'static;
+    /// エラー型
+    type Error: From<crate::Error> + Send + 'static;
+    /// エンコード完了時に呼ばれる
+    fn on_encoded(&mut self, result: Result<EncodedFrame<Self::UserData>, Self::Error>);
 }
 
-/// `fps_numerator` の境界を検証する (CMTimeMake の timescale 用)
-fn validate_fps_numerator(value: u32) -> Result<(), Error> {
-    if value == 0 {
-        return Err(Error::InvalidConfig {
-            field: "fps_numerator",
-            reason: "must not be zero",
-        });
-    }
-    if value > i32::MAX as u32 {
-        return Err(Error::InvalidConfig {
-            field: "fps_numerator",
-            reason: "must fit in i32 for CMTime timescale",
-        });
-    }
-    Ok(())
+/// `FnMut(Result<EncodedFrame<T>, E>)` を [`EncodeHandler`] にするラッパー
+pub struct FnEncodeHandler<T, E = crate::Error> {
+    f: Box<dyn FnMut(Result<EncodedFrame<T>, E>) + Send + 'static>,
 }
 
-/// `expected_frame_rate` の境界を検証する
-fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
-    if value == 0 {
-        return Err(Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must not be zero",
-        });
+impl<T, E> FnEncodeHandler<T, E> {
+    /// `FnMut(Result<EncodedFrame<T>, E>)` から [`EncodeHandler`] を構築する
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(Result<EncodedFrame<T>, E>) + Send + 'static,
+    {
+        Self { f: Box::new(f) }
     }
-    if value > i32::MAX as u32 {
-        return Err(Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must fit in i32 for CFNumber",
-        });
-    }
-    Ok(())
 }
 
-// エンコード完了通知コールバック型
-type EncodeCallback<T> = dyn FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static;
-
-// `outputCallbackRefCon` で受け渡すコールバック本体。
-// FFI へは `&EncodeCallbackBox<T>` のポインタを渡す。
-type EncodeCallbackBox<T> = Box<EncodeCallback<T>>;
-
-/// エンコーダーに渡すフレームデータ
-pub enum FrameData<'a> {
-    /// I420 (3 プレーン)
-    I420 {
-        /// Y プレーン
-        y: &'a [u8],
-        /// U プレーン
-        u: &'a [u8],
-        /// V プレーン
-        v: &'a [u8],
-    },
-    /// NV12 (2 プレーン)
-    Nv12 {
-        /// Y プレーン
-        y: &'a [u8],
-        /// UV インターリーブプレーン
-        uv: &'a [u8],
-    },
+impl<T, E> EncodeHandler for FnEncodeHandler<T, E>
+where
+    T: Send + 'static,
+    E: From<crate::Error> + Send + 'static,
+{
+    type UserData = T;
+    type Error = E;
+    fn on_encoded(&mut self, result: Result<EncodedFrame<T>, E>) {
+        (self.f)(result);
+    }
 }
 
 /// H.264 / H.265 エンコーダー
 ///
-/// エンコード完了時に `FnMut(Result<EncodedFrame<T>, Error>)` を呼び出す。
-/// コールバックは Video Toolbox のコールバックスレッドで実行される。
-pub struct Encoder<T: Send + 'static> {
+/// エンコード完了時に [`EncodeHandler::on_encoded`] を呼び出す。
+/// この [`EncodeHandler::on_encoded`] の呼び出しは Video Toolbox のコールバックスレッドから行われる。
+pub struct Encoder<H: EncodeHandler> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
-    // FFI の outputCallbackRefCon にこの Box の中身ポインタを渡しているため、
-    // `Encoder` の生存期間中は破棄しない。Rust 側からは参照しない。
-    #[allow(dead_code)]
-    callback: Box<EncodeCallbackBox<T>>,
+    handler: Box<H>,
 }
 
-impl<T: Send + 'static> Encoder<T> {
+impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new<F>(config: EncoderConfig, on_encoded: F) -> Result<Self, Error>
-    where
-        F: FnMut(Result<EncodedFrame<T>, Error>) + Send + 'static,
-    {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        // EncodeCallback<T>` は fat pointer であるため、さらに `Box` でラップして通常のポインタにする。
-        let callback = Box::new(Box::new(on_encoded) as EncodeCallbackBox<T>);
-        let session = unsafe { Self::create_compression_session(&config, callback.as_ref())? };
+        let handler = Box::new(handler);
+        let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
         Ok(Self {
             session,
             config,
             next_input_pts: 0,
-            callback,
+            handler,
         })
     }
 
-    /// 現在エンコーダーが内部で保持している設定を返す
+    /// 新しい設定でエンコーダーを再作成する
     ///
-    /// 戻り値は `Encoder::new` で渡した値、または直近の [`Encoder::reconfigure`] 呼び出しで
-    /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
-    ///
-    /// `Encoder::reconfigure` 経由で動的に更新され得るのは `average_bitrate` /
-    /// `fps_numerator` / `fps_denominator` の 3 項目のみで、その他のフィールドは
-    /// `Encoder::new` で渡した初期値のまま保持される。
-    pub fn config(&self) -> &EncoderConfig {
-        &self.config
-    }
-
-    /// 動的に変更可能なエンコードパラメータを更新する
-    ///
-    /// `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。
-    /// セッション再作成は行わないため、未出力フレームの自動フラッシュも行わない。
-    /// フラッシュが必要なら呼び出し側で先に `Encoder::finish()` を明示する。
-    ///
-    /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
-    /// `VTSessionSetProperties` が失敗した場合は `self.config` を変更せず、セッションも生かしたままエラーを返す。
-    ///
-    /// `expected_frame_rate` を更新した場合は、内部の `next_input_pts` を新しい timescale に切り上げで
-    /// 再スケールし、直前出力フレームと物理時間として単調増加するようにする。再スケール結果が
-    /// `i64` を超えた場合は [`Error::LimitExceeded`] を返す。
-    ///
-    /// 解像度・コーデック・ピクセルフォーマットの変更はこの API では対応しないため `Encoder` を作り直す。
-    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
-        // 全項目 `None` のときは API 呼び出し自体を省略する
-        if params.average_bitrate.is_none() && params.expected_frame_rate.is_none() {
-            return Ok(());
-        }
-
-        Self::validate_reconfigure_params(&params)?;
-
-        // VTSessionSetProperties 実行前に `next_input_pts` の再スケール値を確定させる。
-        // FFI 呼び出しが失敗した場合はここまでで巻き戻し、self の状態を変更しない。
-        // 直前出力フレームとの PTS 単調性を維持するため切り上げ (div_ceil) で再スケールする。
-        // 切り捨てだと new_timescale < old_timescale 時に rescaled が潰れて逆行し得る。
-        let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
-            let old_timescale = self.config.fps_numerator as i128;
-            let new_timescale = fps as i128;
-            let old_pts = self.next_input_pts as i128;
-            let product = old_pts * new_timescale;
-            let rescaled = (product + old_timescale - 1) / old_timescale;
-            if !(i64::MIN as i128..=i64::MAX as i128).contains(&rescaled) {
-                return Err(Error::LimitExceeded {
-                    reason: "rescaled presentation timestamp overflow",
-                });
-            }
-            Some(rescaled as i64)
-        } else {
-            None
-        };
+    /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
+    /// 新しい設定でセッションを再作成する。
+    /// フラッシュされたフレームはエンコード完了コールバックで通知される。
+    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
+        Self::validate_config(&config)?;
+        // 未出力フレームをフラッシュ（完了通知はコールバックで受け取る）
+        self.finish()?;
 
         unsafe {
-            let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
-            let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
+            // 新しいセッションを先に作成する
+            // 失敗時に self が不整合にならないようにする
+            let session = Self::create_compression_session(&config, self.handler.as_ref())?;
 
-            if let Some(bitrate) = params.average_bitrate {
-                let value = cf_number_i64(bitrate as i64)?;
-                properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
-                cf_objects.push(value);
-            }
-            if let Some(fps) = params.expected_frame_rate {
-                let value = cf_number_i32(fps as i32)?;
-                properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
-                cf_objects.push(value);
-            }
+            // 新しいセッションの作成に成功してから既存のセッションを破棄する
+            sys::VTCompressionSessionInvalidate(self.session);
+            sys::CFRelease(self.session as *const c_void);
 
-            let properties_dict = cf_dictionary(&properties)?;
-            let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
-            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
-            Error::check(status, "VTSessionSetProperties")?;
-        }
-
-        // FFI 成功時のみ self の状態を更新する。
-        if let Some(bitrate) = params.average_bitrate {
-            self.config.average_bitrate = Some(bitrate);
-        }
-        if let Some(fps) = params.expected_frame_rate {
-            // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
-            self.config.fps_numerator = fps;
-            self.config.fps_denominator = 1;
-        }
-        if let Some(new_pts) = rescaled_next_input_pts {
-            self.next_input_pts = new_pts;
+            self.session = session;
+            self.config = config;
+            self.next_input_pts = 0;
         }
 
         Ok(())
@@ -360,7 +225,7 @@ impl<T: Send + 'static> Encoder<T> {
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
     unsafe fn create_compression_session(
         config: &EncoderConfig,
-        callback_ref_con: &EncodeCallbackBox<T>,
+        handler: &H,
     ) -> Result<sys::VTCompressionSessionRef, Error> {
         unsafe {
             let mut session = std::ptr::null_mut();
@@ -391,9 +256,10 @@ impl<T: Send + 'static> Encoder<T> {
                 }
             };
 
-            // `outputCallbackRefCon` には `EncodeCallbackBox<T>` へのポインタを渡す。
-            // 出力コールバック内で復元し、ユーザー指定の `FnMut` を呼び出す（`process_encoded_output`）。
-            // ポインタは `Encoder` が `Box` で保持するコールバックを指し、`Encoder` の生存期間中は有効である。
+            // SAFETY:
+            // - `outputCallbackRefCon` には `&H` のポインタを渡す。
+            //   `handler` は `Box<H>` でヒープに隔離されており、`Encoder` の生存期間中はアドレス不変である。
+            // - 出力コールバック内で `&mut H` として復元し、ユーザー指定のハンドラを呼び出す (`process_encoded_output`)。
             let status = VTCompressionSessionCreate(
                 std::ptr::null_mut(),
                 config.width as i32,
@@ -403,9 +269,7 @@ impl<T: Send + 'static> Encoder<T> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 Some(callback),
-                (callback_ref_con as *const EncodeCallbackBox<T>)
-                    .cast::<c_void>()
-                    .cast_mut(),
+                (handler as *const H).cast::<c_void>().cast_mut(),
                 &mut session,
             );
             Error::check(status, "VTCompressionSessionCreate")?;
@@ -590,20 +454,26 @@ impl<T: Send + 'static> Encoder<T> {
                 reason: "must not be zero",
             });
         }
-        validate_fps_numerator(config.fps_numerator)?;
-        if let Some(bitrate) = config.average_bitrate {
-            validate_average_bitrate(bitrate)?;
+        if config.fps_numerator == 0 {
+            return Err(Error::InvalidConfig {
+                field: "fps_numerator",
+                reason: "must not be zero",
+            });
         }
-        Ok(())
-    }
-
-    /// `reconfigure` に渡された `ReconfigureParams` を検証する
-    fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
-        if let Some(bitrate) = params.average_bitrate {
-            validate_average_bitrate(bitrate)?;
+        // `CMTimeMake` の timescale に `fps_numerator as i32` を渡すため、`i32` に収まる必要がある。
+        if config.fps_numerator > i32::MAX as u32 {
+            return Err(Error::InvalidConfig {
+                field: "fps_numerator",
+                reason: "must fit in i32 for CMTime timescale",
+            });
         }
-        if let Some(fps) = params.expected_frame_rate {
-            validate_expected_frame_rate(fps)?;
+        if let Some(bitrate) = config.average_bitrate
+            && bitrate > i64::MAX as u64
+        {
+            return Err(Error::InvalidConfig {
+                field: "average_bitrate",
+                reason: "must fit in i64 for CFNumber",
+            });
         }
         Ok(())
     }
@@ -767,13 +637,11 @@ impl<T: Send + 'static> Encoder<T> {
     /// エンコード結果は構築時に指定したコールバックで通知される
     ///
     /// なお `y` のストライドは入力フレームの幅と等しいことが前提
-    ///
-    /// また B フレームは扱わない前提（つまり入力フレームと出力フレームの順番が一致する）
     pub fn encode(
         &mut self,
         frame: &FrameData<'_>,
         options: &EncodeOptions,
-        user_data: T,
+        user_data: H::UserData,
     ) -> Result<(), Error> {
         // Video Toolbox は CVPixelBuffer 単位でフォーマットを持つためフレームごとに変更可能だが、
         // このライブラリでは EncoderConfig.pixel_format でセッション全体のフォーマットを固定している。
@@ -874,7 +742,7 @@ impl<T: Send + 'static> Encoder<T> {
             );
             if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
                 // status エラー時は sourceFrameRefCon がコールバックされないため、ここで drop する
-                let _ = Box::from_raw(source_frame_ref_con.cast::<T>());
+                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
                 return Err(e);
             }
 
@@ -906,18 +774,24 @@ impl<T: Send + 'static> Encoder<T> {
         &mut self,
         pixel_buffer_ptr: *mut c_void,
         options: &EncodeOptions,
-        user_data: T,
+        user_data: H::UserData,
     ) -> Result<(), Error> {
         unsafe {
             // ピクセルフォーマットの検証
             let format_type = sys::CVPixelBufferGetPixelFormatType(pixel_buffer_ptr.cast());
             let actual = match format_type {
-                x if x == sys::kCVPixelFormatType_420YpCbCr8Planar => PixelFormat::I420,
+                x if x == u32::from_be_bytes(*b"y420") => PixelFormat::I420,
                 x if x == sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => PixelFormat::Nv12,
                 _ => {
-                    return Err(Error::UnknownPixelFormat {
+                    // 未知のフォーマットは I420 でも Nv12 でもないので、
+                    // どちらを actual にしても不一致になる。期待値の逆を返す。
+                    let actual = match self.config.pixel_format {
+                        PixelFormat::I420 => PixelFormat::Nv12,
+                        PixelFormat::Nv12 => PixelFormat::I420,
+                    };
+                    return Err(Error::PixelFormatMismatch {
                         expected: self.config.pixel_format,
-                        fourcc: format_type,
+                        actual,
                     });
                 }
             };
@@ -957,7 +831,7 @@ impl<T: Send + 'static> Encoder<T> {
                 std::ptr::null_mut(),
             );
             if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
-                let _ = Box::from_raw(source_frame_ref_con.cast::<T>());
+                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
                 return Err(e);
             }
 
@@ -986,48 +860,48 @@ impl<T: Send + 'static> Encoder<T> {
     unsafe fn take_user_data(
         source_frame_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<T> {
+    ) -> Option<H::UserData> {
         if source_frame_ref_con.is_null() {
             log::error!("{callback_name}: source_frame_ref_con is null");
             return None;
         }
-        Some(unsafe { *Box::from_raw(source_frame_ref_con.cast::<T>()) })
+        Some(unsafe { *Box::from_raw(source_frame_ref_con.cast::<H::UserData>()) })
     }
 
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut EncodeCallbackBox<T>> {
+    ) -> Option<&'a mut H> {
         if output_callback_ref_con.is_null() {
             log::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
-        Some(unsafe { &mut *output_callback_ref_con.cast::<EncodeCallbackBox<T>>() })
+        // SAFETY:
+        // - `output_callback_ref_con` は `Box<H>` のヒープアドレスを指す。
+        //   `Box<H>` のヒープアドレスは `Encoder` の生存期間中不変である。
+        // - FFI コールバックは `&mut H` で排他的にアクセスする。
+        Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
+    }
+
+    fn invoke_callback(handler: &mut H, result: Result<EncodedFrame<H::UserData>, H::Error>) {
+        handler.on_encoded(result);
     }
 
     unsafe extern "C" fn output_callback_h264(
         output_callback_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
-        info_flags: sys::VTEncodeInfoFlags,
+        _info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
     ) {
-        // ユーザー提供の FnMut が panic しても unwind が `extern "C"` 境界を越えないように `catch_unwind` で吸収する。
-        // 越えると UB になるため、ライブラリ側で必ず止める必要がある。
-        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        unsafe {
             Self::process_encoded_output(
                 output_callback_ref_con,
                 source_frame_ref_con,
                 sample_buffer,
                 status,
-                info_flags,
                 "output_callback_h264",
                 Self::extract_h264_params,
-            );
-        }));
-        if result.is_err() {
-            log::error!(
-                "output_callback_h264: user callback panicked; panic was caught at FFI boundary"
             );
         }
     }
@@ -1036,23 +910,17 @@ impl<T: Send + 'static> Encoder<T> {
         output_callback_ref_con: *mut c_void,
         source_frame_ref_con: *mut c_void,
         status: i32,
-        info_flags: sys::VTEncodeInfoFlags,
+        _info_flags: sys::VTEncodeInfoFlags,
         sample_buffer: sys::CMSampleBufferRef,
     ) {
-        let result = catch_unwind(AssertUnwindSafe(|| unsafe {
+        unsafe {
             Self::process_encoded_output(
                 output_callback_ref_con,
                 source_frame_ref_con,
                 sample_buffer,
                 status,
-                info_flags,
                 "output_callback_h265",
                 Self::extract_h265_params,
-            );
-        }));
-        if result.is_err() {
-            log::error!(
-                "output_callback_h265: user callback panicked; panic was caught at FFI boundary"
             );
         }
     }
@@ -1063,64 +931,55 @@ impl<T: Send + 'static> Encoder<T> {
         source_frame_ref_con: *mut c_void,
         sample_buffer: sys::CMSampleBufferRef,
         status: i32,
-        info_flags: sys::VTEncodeInfoFlags,
         callback_name: &'static str,
         extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Option<ParameterSets>,
     ) {
-        // callback を先に取り出してから user_data を取り出す。
-        // user_data を先に取って callback 取得に失敗すると、エラー通知できないまま
-        // user_data を黙って捨てることになるため、順序をこの形で固定する。
-        let Some(callback) =
-            (unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) })
-        else {
-            return;
-        };
         let Some(user_data) =
             (unsafe { Self::take_user_data(source_frame_ref_con, callback_name) })
         else {
             return;
         };
+        let Some(handler) =
+            (unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) })
+        else {
+            return;
+        };
 
         if let Err(e) = Error::check(status, callback_name) {
-            (callback.as_mut())(Err(e));
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
-        // Video Toolbox がレート制御等でこのフレームをドロップした場合は kVTEncodeInfo_FrameDropped が立ち、
-        // sample_buffer は NULL になる。これは正常イベントなのでエラーとして通知せず、user_data を破棄して終了する。
-        if (info_flags & sys::kVTEncodeInfo_FrameDropped) != 0 {
-            log::debug!("{callback_name}: frame dropped by encoder rate control");
-            drop(user_data);
-            return;
-        }
-
+        // フレームドロップ等で sample_buffer が NULL になる場合がある
         if sample_buffer.is_null() {
-            // ドロップフラグが立っていないのに sample_buffer が NULL になるのは Video Toolbox の想定外。
-            (callback.as_mut())(Err(Error::LimitExceeded {
-                reason: "encoded sample buffer is null without drop flag",
-            }));
+            let e = Error::LimitExceeded {
+                reason: "encoded sample buffer is null",
+            };
+            Self::invoke_callback(handler, Err(e.into()));
             return;
         }
 
         unsafe {
             let data_buffer = sys::CMSampleBufferGetDataBuffer(sample_buffer);
             if data_buffer.is_null() {
-                (callback.as_mut())(Err(Error::LimitExceeded {
+                let e = Error::LimitExceeded {
                     reason: "CMSampleBufferGetDataBuffer returned null",
-                }));
+                };
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
             // 非連続バッファでは `data_pointer_len < block_len` になり得るため、`CMBlockBufferCopyDataBytes` で全長をコピーする。
             let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
             if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
+                let e = Error::LimitExceeded {
+                    reason: "encoded block length exceeds defensive maximum",
+                };
                 log::error!(
                     "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
                     max = MAX_ENCODED_BLOCK_COPY_BYTES
                 );
-                (callback.as_mut())(Err(Error::LimitExceeded {
-                    reason: "encoded block length exceeds defensive maximum",
-                }));
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
             let mut data = vec![0u8; block_len];
@@ -1131,7 +990,7 @@ impl<T: Send + 'static> Encoder<T> {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                (callback.as_mut())(Err(e));
+                Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
 
@@ -1140,17 +999,19 @@ impl<T: Send + 'static> Encoder<T> {
 
             let (vps_list, sps_list, pps_list) = if keyframe {
                 if description.is_null() {
-                    (callback.as_mut())(Err(Error::LimitExceeded {
+                    let e = Error::LimitExceeded {
                         reason: "CMSampleBufferGetFormatDescription returned null for keyframe",
-                    }));
+                    };
+                    Self::invoke_callback(handler, Err(e.into()));
                     return;
                 }
                 match extract_params(description) {
                     Some(params) => params,
                     None => {
-                        (callback.as_mut())(Err(Error::LimitExceeded {
+                        let e = Error::LimitExceeded {
                             reason: "failed to extract codec parameter sets",
-                        }));
+                        };
+                        Self::invoke_callback(handler, Err(e.into()));
                         return;
                     }
                 }
@@ -1166,7 +1027,7 @@ impl<T: Send + 'static> Encoder<T> {
                 data,
                 user_data,
             };
-            (callback.as_mut())(Ok(frame));
+            Self::invoke_callback(handler, Ok(frame));
         }
     }
 
@@ -1305,32 +1166,19 @@ impl<T: Send + 'static> Encoder<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for Encoder<T> {
+impl<H: EncodeHandler> Drop for Encoder<H> {
     fn drop(&mut self) {
-        // ユーザーが `finish()` を呼ばずに drop した場合でも、in-flight な出力コールバックが
-        // 解放済みの `callback` Box にアクセスして UAF にならないように、`CompleteFrames` で
-        // 既に投入済みのフレームを同期的に処理し終えてから `Invalidate` する。
-        // `CompleteFrames` の失敗は drop 中なので panic させず log に流す。
         unsafe {
-            let status = sys::VTCompressionSessionCompleteFrames(self.session, sys::kCMTimeInvalid);
-            if let Err(e) = Error::check(status, "VTCompressionSessionCompleteFrames") {
-                log::error!("{e}");
-            }
             sys::VTCompressionSessionInvalidate(self.session);
             sys::CFRelease(self.session as *const c_void);
         }
     }
 }
 
-// SAFETY:
-// - VTCompressionSession は内部でスレッドセーフに管理されており、Apple のドキュメントでも
-//   セッションの操作は異なるスレッドから呼び出し可能とされている。
-// - 出力コールバックは VT が同一セッションについて直列に発火させるため、`callback_from_ref_con` 経由で
-//   得る `&mut EncodeCallbackBox<T>` の `&mut` が並行する可能性はない。
-// - 保持する `callback: Box<EncodeCallbackBox<T>>` は `Encoder::new` の `F: FnMut(...) + Send + 'static`
-//   制約により中身が `Send` であることが担保されている。`T: Send` も同制約から得られるため、
-//   コールバックでメインスレッドへ移譲する `user_data` の所有権を安全に移動できる。
-unsafe impl<T: Send + 'static> Send for Encoder<T> {}
+// SAFETY: VTCompressionSession は内部でスレッドセーフに管理されており、
+// Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
+// handler は Box<H> でヒープに隔離されており、Encoder の生存期間中はアドレス不変である。
+unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 /// エンコードされた映像フレーム (AVCC 形式)
 #[derive(Debug)]
@@ -1354,6 +1202,26 @@ pub struct EncodedFrame<T> {
     pub user_data: T,
 }
 
+/// エンコーダーに渡すフレームデータ
+pub enum FrameData<'a> {
+    /// I420 (3 プレーン)
+    I420 {
+        /// Y プレーン
+        y: &'a [u8],
+        /// U プレーン
+        u: &'a [u8],
+        /// V プレーン
+        v: &'a [u8],
+    },
+    /// NV12 (2 プレーン)
+    Nv12 {
+        /// Y プレーン
+        y: &'a [u8],
+        /// UV インターリーブプレーン
+        uv: &'a [u8],
+    },
+}
+
 /// パラメータセット 1 個あたりのコピー上限（バイト）。
 ///
 /// **根拠（レビューで追試可能）**: ISO/IEC 14496-15（MPEG-4 Part 15）において、
@@ -1367,23 +1235,11 @@ const MAX_PARAMETER_SET_COPY_BYTES: usize = u16::MAX as usize;
 
 /// エンコード出力 1 フレーム分を `Vec` にコピーするときの防御的上限（バイト）。
 ///
-/// **位置付け**: `MAX_PARAMETER_SET_COPY_BYTES` のような ISO/IEC 仕様に基づく根拠はなく、
-/// `CMBlockBufferGetDataLength` が異常値（破損したセッション状態や FFI バグ等）を返した場合の OOM を
-/// 防ぐための運用上の上限である。
-///
-/// **値の根拠**: 4K (3840x2160) を超高ビットレートで 1 フレーム圧縮しても 1 ～ 数 MB のオーダーに収まる。
-/// その 100 倍程度を上限としても通常運用では到達しないため `256 MiB` とする。
-/// 利用者から「正常な圧縮データが拒否される」報告があれば、計測のうえ見直すこと。
-///
-/// **超過時の挙動**: ログを出して当該フレームを `Error::LimitExceeded` で破棄する（クランプはせず拒否のみ）。
+/// `MAX_PARAMETER_SET_COPY_BYTES`（パラメータセット用）とは別。`CMBlockBufferGetDataLength` が異常に大きい場合の OOM を防ぐ。
+/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はログして当該フレームを破棄する。
 const MAX_ENCODED_BLOCK_COPY_BYTES: usize = 256 * 1024 * 1024;
 
 /// `slice::from_raw_parts` の前提（長さ 0 でも非 NULL ポインタ、長さ正では NULL 禁止）を満たすためのヘルパー
-///
-/// 長さ 0 の場合は **ポインタが NULL であっても空 `Vec` を返す**。
-/// Core Media のパラメータセット取得 API は理論上「長さ 0 + NULL」を返す可能性があり、
-/// その場合「該当パラメータセットが空である」と解釈して安全側に倒すための仕様。
-/// 長さが正で NULL のときは `slice::from_raw_parts` を呼べないため `None` を返す。
 fn vec_u8_from_raw_parts_safe(
     ptr: *const u8,
     len: usize,
@@ -1431,135 +1287,5 @@ fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
             sys::kCMSampleAttachmentKey_NotSync as *const c_void,
         );
         not_sync != sys::kCFBooleanTrue as *const c_void
-    }
-}
-
-// `Encoder::next_input_pts` などの private フィールド・実装詳細に直接触れる必要があるテスト群。
-// 公開 API では観測できないため、内部 `mod tests` に置いて borrow チェッカ越しに観測する。
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_encoder_config() -> EncoderConfig {
-        EncoderConfig {
-            width: 960,
-            height: 480,
-            codec: CodecConfig::H264(H264EncoderConfig {
-                profile: H264Profile::Main,
-                entropy_mode: H264EntropyMode::Cabac,
-            }),
-            pixel_format: PixelFormat::I420,
-            average_bitrate: Some(100_000),
-            fps_numerator: 1,
-            fps_denominator: 1,
-            prioritize_encoding_speed_over_quality: false,
-            real_time: false,
-            maximize_power_efficiency: false,
-            allow_frame_reordering: false,
-            allow_temporal_compression: true,
-            max_key_frame_interval: None,
-            max_key_frame_interval_duration: None,
-            max_frame_delay_count: None,
-        }
-    }
-
-    fn black_i420_frame(width: u32, height: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let w = width as usize;
-        let h = height as usize;
-        let uv_w = w.div_ceil(2);
-        let uv_h = h.div_ceil(2);
-        (
-            vec![0u8; w * h],
-            vec![0u8; uv_w * uv_h],
-            vec![0u8; uv_w * uv_h],
-        )
-    }
-
-    #[test]
-    fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
-        // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
-        // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
-        let mut config = base_encoder_config();
-        config.fps_numerator = 30_000;
-        config.fps_denominator = 1_001;
-        let mut encoder = Encoder::<()>::new(config, |_| {})?;
-
-        let (y, u, v) = black_i420_frame(960, 480);
-        let frame = FrameData::I420 {
-            y: &y,
-            u: &u,
-            v: &v,
-        };
-        // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
-        encoder.encode(&frame, &EncodeOptions::default(), ())?;
-        encoder.encode(&frame, &EncodeOptions::default(), ())?;
-        assert_eq!(encoder.next_input_pts, 2 * 1001);
-
-        encoder.reconfigure(ReconfigureParams {
-            average_bitrate: None,
-            expected_frame_rate: Some(60),
-        })?;
-
-        // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004。
-        // PTS の単調性を保つため切り上げ (div_ceil) を採用しているので 5 となる。
-        assert_eq!(encoder.config().fps_numerator, 60);
-        assert_eq!(encoder.config().fps_denominator, 1);
-        assert_eq!(encoder.next_input_pts, 5);
-        Ok(())
-    }
-
-    #[test]
-    fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
-        // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
-        let config = base_encoder_config();
-        let mut encoder = Encoder::<()>::new(config, |_| {})?;
-
-        let (y, u, v) = black_i420_frame(960, 480);
-        let frame = FrameData::I420 {
-            y: &y,
-            u: &u,
-            v: &v,
-        };
-        encoder.encode(&frame, &EncodeOptions::default(), ())?;
-        encoder.encode(&frame, &EncodeOptions::default(), ())?;
-        let before = encoder.next_input_pts;
-
-        encoder.reconfigure(ReconfigureParams {
-            average_bitrate: Some(500_000),
-            expected_frame_rate: None,
-        })?;
-
-        assert_eq!(encoder.next_input_pts, before);
-        Ok(())
-    }
-
-    #[test]
-    fn reconfigure_overflows_when_rescaled_pts_exceeds_i64_max() -> Result<(), Error> {
-        // i64 の上限を意図的に超える条件で再スケールし、`Error::LimitExceeded` が返ることを確認する。
-        // 初期 timescale を 1 にしておくと encode を 1 回するごとに next_input_pts が +1 進む。
-        // ここでは VTCompressionSession を起動するコストを避けるため、構築後に next_input_pts を
-        // 直接 i64::MAX に書き込んでから reconfigure を呼ぶ（private フィールドなのでこのモジュールから可能）。
-        let config = base_encoder_config();
-        let mut encoder = Encoder::<()>::new(config, |_| {})?;
-
-        encoder.next_input_pts = i64::MAX;
-
-        // new_timescale > old_timescale となる組合せで `i64::MAX * 2 / 1` が i64 範囲を超える。
-        let err = encoder
-            .reconfigure(ReconfigureParams {
-                average_bitrate: None,
-                expected_frame_rate: Some(2),
-            })
-            .expect_err("rescale should overflow");
-        assert!(matches!(
-            err,
-            Error::LimitExceeded {
-                reason: "rescaled presentation timestamp overflow",
-            }
-        ));
-        // 失敗時には config も next_input_pts も変更されない
-        assert_eq!(encoder.config().fps_numerator, 1);
-        assert_eq!(encoder.next_input_pts, i64::MAX);
-        Ok(())
     }
 }

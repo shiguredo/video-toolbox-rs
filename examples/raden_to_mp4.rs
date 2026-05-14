@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use raden::{Circle, CompOp, Context, Image, PipelineRuntime, PixelFormat, Rect, Rgba32};
 use shiguredo_mp4::boxes::{
@@ -19,8 +19,8 @@ use shiguredo_mp4::mux::{Mp4FileMuxer, Sample};
 use shiguredo_mp4::{TrackKind, Uint};
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error as VideoToolboxError,
-    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
-    PixelFormat as VideoPixelFormat,
+    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
+    HevcProfile, PixelFormat as VideoPixelFormat,
 };
 
 const DEFAULT_WIDTH: u32 = 1280;
@@ -28,7 +28,6 @@ const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DURATION_SECS: f64 = 5.0;
 type EncodedResult = Result<EncodedFrame<u64>, VideoToolboxError>;
-type SharedEncodedResults = Arc<Mutex<Vec<EncodedResult>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -331,17 +330,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
     };
-    let encoded_results: SharedEncodedResults = Arc::new(Mutex::new(Vec::new()));
-    let mut encoder = Encoder::new(config, {
-        let encoded_results = Arc::clone(&encoded_results);
-        move |result| {
-            if let Ok(mut guard) = encoded_results.lock() {
-                guard.push(result);
-            } else {
-                eprintln!("encoded results mutex is poisoned");
+    let (encoded_result_tx, encoded_result_rx) = mpsc::channel::<EncodedResult>();
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            move |result: Result<EncodedFrame<u64>, VideoToolboxError>| {
+                if encoded_result_tx.send(result).is_err() {
+                    eprintln!("encoded results receiver is dropped");
+                }
             }
-        }
-    })?;
+        }),
+    )?;
 
     // MP4 マルチプレクサーの初期化
     let mut muxer = Mp4FileMuxer::new()?;
@@ -420,12 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // エンコード済みフレームを MP4 に書き込む
-        let mut guard = encoded_results
-            .lock()
-            .map_err(|_| std::io::Error::other("encoded results mutex is poisoned"))?;
-        let results = std::mem::take(&mut *guard);
-        drop(guard);
-        for result in results {
+        for result in encoded_result_rx.try_iter() {
             let encoded = result?;
             write_encoded_frame(
                 &encoded,
@@ -448,12 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 残りのフレームをフラッシュ
     encoder.finish()?;
-    let mut guard = encoded_results
-        .lock()
-        .map_err(|_| std::io::Error::other("encoded results mutex is poisoned"))?;
-    let results = std::mem::take(&mut *guard);
-    drop(guard);
-    for result in results {
+    for result in encoded_result_rx.try_iter() {
         let encoded = result?;
         write_encoded_frame(
             &encoded,
