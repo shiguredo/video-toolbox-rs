@@ -11,8 +11,18 @@
 
 ## develop
 
+- [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
+  - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
   - @melpon
+- [CHANGE] `Encoder::reconfigure` を `ReconfigureParams` ベースの動的更新専用 API に変更する
+  - 旧 API は `EncoderConfig` を所有権で受け取りセッションを再作成していたが、
+    `VTSessionSetProperties` 1 回で完結する動的更新型に置き換える
+  - 動的に変更可能な項目は `average_bitrate` / `expected_frame_rate` のみで、
+    解像度・コーデック・ピクセルフォーマットの変更は `Encoder` を作り直す運用に統一する
+  - `expected_frame_rate` 更新時は内部 PTS を切り上げで再スケールし、
+    オーバーフロー時には `Error::LimitExceeded` を返す
+  - @voluntas
 
 ### misc
 

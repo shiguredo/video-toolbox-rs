@@ -9,7 +9,7 @@ use std::{
 use shiguredo_video_toolbox::{
     CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
     FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
-    PixelFormat,
+    PixelFormat, ReconfigureParams,
 };
 
 const WIDTH: u32 = 960;
@@ -413,6 +413,129 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
         })
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
+    Ok(())
+}
+
+#[test]
+fn reconfigure_updates_config_on_success() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(250_000),
+        expected_frame_rate: Some(60),
+    })?;
+    assert_eq!(encoder.config().average_bitrate, Some(250_000));
+    assert_eq!(encoder.config().fps_numerator, 60);
+    // ExpectedFrameRate は単一整数のため分母は 1 に正規化される
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let before_bitrate = config.average_bitrate;
+    let before_fps_num = config.fps_numerator;
+    let before_fps_den = config.fps_denominator;
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    encoder.reconfigure(ReconfigureParams::default())?;
+    assert_eq!(encoder.config().average_bitrate, before_bitrate);
+    assert_eq!(encoder.config().fps_numerator, before_fps_num);
+    assert_eq!(encoder.config().fps_denominator, before_fps_den);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_zero_bitrate() -> Result<(), Error> {
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    let err = encoder
+        .reconfigure(ReconfigureParams {
+            average_bitrate: Some(0),
+            expected_frame_rate: None,
+        })
+        .expect_err("zero bitrate must be rejected");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero",
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_zero_expected_frame_rate() -> Result<(), Error> {
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    let err = encoder
+        .reconfigure(ReconfigureParams {
+            average_bitrate: None,
+            expected_frame_rate: Some(0),
+        })
+        .expect_err("zero frame rate must be rejected");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must not be zero",
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_expected_frame_rate_above_i32_max() -> Result<(), Error> {
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    let err = encoder
+        .reconfigure(ReconfigureParams {
+            average_bitrate: None,
+            expected_frame_rate: Some(i32::MAX as u32 + 1),
+        })
+        .expect_err("frame rate above i32::MAX must be rejected");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "expected_frame_rate",
+            ..
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_bitrate_above_i64_max() -> Result<(), Error> {
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
+    )?;
+    let err = encoder
+        .reconfigure(ReconfigureParams {
+            average_bitrate: Some(i64::MAX as u64 + 1),
+            expected_frame_rate: None,
+        })
+        .expect_err("bitrate above i64::MAX must be rejected");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "average_bitrate",
+            ..
+        }
+    ));
     Ok(())
 }
 

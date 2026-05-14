@@ -28,7 +28,7 @@ pub use decoder::{
 pub use encoder::{
     CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
     FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
-    HevcProfile,
+    HevcProfile, ReconfigureParams,
 };
 pub use error::Error;
 pub use types::PixelFormat;

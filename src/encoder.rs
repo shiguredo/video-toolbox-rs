@@ -127,8 +127,79 @@ pub struct EncodeOptions {
     pub force_key_frame: bool,
 }
 
+/// [`Encoder::reconfigure`] で動的に更新可能なエンコードパラメータ
+///
+/// `None` のフィールドは現在値を維持する。全項目 `None` の場合は no-op となる。
+///
+/// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
+/// 項目はここに含まれていない。これらを変更する場合は [`Encoder`] を作り直す。
+///
+/// 将来のフィールド追加 (例: `DataRateLimits`) は破壊的変更として扱う。
+/// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新する記述を推奨する。
+#[derive(Debug, Clone, Default)]
+pub struct ReconfigureParams {
+    /// kVTCompressionPropertyKey_AverageBitRate (bps 単位)
+    pub average_bitrate: Option<u64>,
+
+    /// kVTCompressionPropertyKey_ExpectedFrameRate (整数 fps)
+    ///
+    /// 詳細な正規化 / 再スケール挙動は [`Encoder::reconfigure`] の rustdoc を参照。
+    pub expected_frame_rate: Option<u32>,
+}
+
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// `average_bitrate` (bps) の境界を検証する
+fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
+    if bitrate == 0 {
+        return Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero",
+        });
+    }
+    if bitrate > i64::MAX as u64 {
+        return Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must fit in i64 for CFNumber",
+        });
+    }
+    Ok(())
+}
+
+/// `fps_numerator` の境界を検証する (CMTimeMake の timescale 用)
+fn validate_fps_numerator(value: u32) -> Result<(), Error> {
+    if value == 0 {
+        return Err(Error::InvalidConfig {
+            field: "fps_numerator",
+            reason: "must not be zero",
+        });
+    }
+    if value > i32::MAX as u32 {
+        return Err(Error::InvalidConfig {
+            field: "fps_numerator",
+            reason: "must fit in i32 for CMTime timescale",
+        });
+    }
+    Ok(())
+}
+
+/// `expected_frame_rate` の境界を検証する
+fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
+    if value == 0 {
+        return Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must not be zero",
+        });
+    }
+    if value > i32::MAX as u32 {
+        return Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must fit in i32 for CFNumber",
+        });
+    }
+    Ok(())
+}
 
 /// エンコード結果を通知するためのハンドラー
 ///
@@ -177,6 +248,9 @@ pub struct Encoder<H: EncodeHandler> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
+    // FFI の outputCallbackRefCon にこの Box の中身ポインタを渡しているため、
+    // Encoder の生存期間中は保持し続ける必要がある。Rust 側からは直接参照しない。
+    #[allow(dead_code)]
     handler: Box<H>,
 }
 
@@ -195,28 +269,92 @@ impl<H: EncodeHandler> Encoder<H> {
         })
     }
 
-    /// 新しい設定でエンコーダーを再作成する
+    /// 現在エンコーダーが内部で保持している設定を返す
     ///
-    /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
-    /// 新しい設定でセッションを再作成する。
-    /// フラッシュされたフレームはエンコード完了コールバックで通知される。
-    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
-        Self::validate_config(&config)?;
-        // 未出力フレームをフラッシュ（完了通知はコールバックで受け取る）
-        self.finish()?;
+    /// 戻り値は [`Encoder::new`] で渡した値、または直近の [`Encoder::reconfigure`] 呼び出しで
+    /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
+    ///
+    /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは `average_bitrate` /
+    /// `fps_numerator` / `fps_denominator` の 3 項目のみで、その他のフィールドは
+    /// [`Encoder::new`] で渡した初期値のまま保持される。
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
+    /// 動的に変更可能なエンコードパラメータを更新する
+    ///
+    /// `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。
+    /// セッション再作成は行わないため、未出力フレームの自動フラッシュも行わない。
+    /// フラッシュが必要なら呼び出し側で先に [`Encoder::finish`] を明示する。
+    ///
+    /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
+    /// `VTSessionSetProperties` が失敗した場合は `self.config` を変更せず、セッションも生かしたままエラーを返す。
+    ///
+    /// `expected_frame_rate` を更新した場合は、内部の `next_input_pts` を新しい timescale に切り上げで
+    /// 再スケールし、直前出力フレームと物理時間として単調増加するようにする。再スケール結果が
+    /// `i64` を超えた場合は [`Error::LimitExceeded`] を返す。
+    ///
+    /// 解像度・コーデック・ピクセルフォーマットの変更はこの API では対応しないため [`Encoder`] を作り直す。
+    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+        // 全項目 `None` のときは API 呼び出し自体を省略する
+        if params.average_bitrate.is_none() && params.expected_frame_rate.is_none() {
+            return Ok(());
+        }
+
+        Self::validate_reconfigure_params(&params)?;
+
+        // VTSessionSetProperties 実行前に `next_input_pts` の再スケール値を確定させる。
+        // FFI 呼び出しが失敗した場合はここまでで巻き戻し、self の状態を変更しない。
+        // 直前出力フレームとの PTS 単調性を維持するため切り上げ (div_ceil) で再スケールする。
+        // 切り捨てだと new_timescale < old_timescale 時に rescaled が潰れて逆行し得る。
+        let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
+            let old_timescale = self.config.fps_numerator as i128;
+            let new_timescale = fps as i128;
+            let old_pts = self.next_input_pts as i128;
+            let product = old_pts * new_timescale;
+            let rescaled = (product + old_timescale - 1) / old_timescale;
+            if !(i64::MIN as i128..=i64::MAX as i128).contains(&rescaled) {
+                return Err(Error::LimitExceeded {
+                    reason: "rescaled presentation timestamp overflow",
+                });
+            }
+            Some(rescaled as i64)
+        } else {
+            None
+        };
 
         unsafe {
-            // 新しいセッションを先に作成する
-            // 失敗時に self が不整合にならないようにする
-            let session = Self::create_compression_session(&config, self.handler.as_ref())?;
+            let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
+            let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
 
-            // 新しいセッションの作成に成功してから既存のセッションを破棄する
-            sys::VTCompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
+            if let Some(bitrate) = params.average_bitrate {
+                let value = cf_number_i64(bitrate as i64)?;
+                properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
+                cf_objects.push(value);
+            }
+            if let Some(fps) = params.expected_frame_rate {
+                let value = cf_number_i32(fps as i32)?;
+                properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
+                cf_objects.push(value);
+            }
 
-            self.session = session;
-            self.config = config;
-            self.next_input_pts = 0;
+            let properties_dict = cf_dictionary(&properties)?;
+            let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
+            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
+            Error::check(status, "VTSessionSetProperties")?;
+        }
+
+        // FFI 成功時のみ self の状態を更新する。
+        if let Some(bitrate) = params.average_bitrate {
+            self.config.average_bitrate = Some(bitrate);
+        }
+        if let Some(fps) = params.expected_frame_rate {
+            // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
+            self.config.fps_numerator = fps;
+            self.config.fps_denominator = 1;
+        }
+        if let Some(new_pts) = rescaled_next_input_pts {
+            self.next_input_pts = new_pts;
         }
 
         Ok(())
@@ -454,26 +592,20 @@ impl<H: EncodeHandler> Encoder<H> {
                 reason: "must not be zero",
             });
         }
-        if config.fps_numerator == 0 {
-            return Err(Error::InvalidConfig {
-                field: "fps_numerator",
-                reason: "must not be zero",
-            });
+        validate_fps_numerator(config.fps_numerator)?;
+        if let Some(bitrate) = config.average_bitrate {
+            validate_average_bitrate(bitrate)?;
         }
-        // `CMTimeMake` の timescale に `fps_numerator as i32` を渡すため、`i32` に収まる必要がある。
-        if config.fps_numerator > i32::MAX as u32 {
-            return Err(Error::InvalidConfig {
-                field: "fps_numerator",
-                reason: "must fit in i32 for CMTime timescale",
-            });
+        Ok(())
+    }
+
+    /// [`Encoder::reconfigure`] に渡された [`ReconfigureParams`] を検証する
+    fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
+        if let Some(bitrate) = params.average_bitrate {
+            validate_average_bitrate(bitrate)?;
         }
-        if let Some(bitrate) = config.average_bitrate
-            && bitrate > i64::MAX as u64
-        {
-            return Err(Error::InvalidConfig {
-                field: "average_bitrate",
-                reason: "must fit in i64 for CFNumber",
-            });
+        if let Some(fps) = params.expected_frame_rate {
+            validate_expected_frame_rate(fps)?;
         }
         Ok(())
     }
@@ -1287,5 +1419,139 @@ fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
             sys::kCMSampleAttachmentKey_NotSync as *const c_void,
         );
         not_sync != sys::kCFBooleanTrue as *const c_void
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `Encoder::reconfigure` の内部状態 (`next_input_pts`) を直接確認するためのテスト。
+    //! `tests/test_encoder.rs` からは到達できない private フィールド検証だけをここに置く。
+    //! 通常系の検証は `tests/test_encoder.rs` 側にある。
+
+    use super::*;
+
+    fn base_encoder_config() -> EncoderConfig {
+        EncoderConfig {
+            width: 960,
+            height: 480,
+            codec: CodecConfig::H264(H264EncoderConfig {
+                profile: H264Profile::Main,
+                entropy_mode: H264EntropyMode::Cabac,
+            }),
+            pixel_format: PixelFormat::I420,
+            average_bitrate: None,
+            fps_numerator: 1,
+            fps_denominator: 1,
+            prioritize_encoding_speed_over_quality: false,
+            real_time: false,
+            maximize_power_efficiency: false,
+            allow_frame_reordering: false,
+            allow_temporal_compression: true,
+            max_key_frame_interval: None,
+            max_key_frame_interval_duration: None,
+            max_frame_delay_count: None,
+        }
+    }
+
+    fn black_i420_frame(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
+        (
+            vec![0u8; w * h],
+            vec![0u8; uv_w * uv_h],
+            vec![0u8; uv_w * uv_h],
+        )
+    }
+
+    fn noop_handler() -> FnEncodeHandler<()> {
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+    }
+
+    #[test]
+    fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
+        // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
+        // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
+        let mut config = base_encoder_config();
+        config.fps_numerator = 30_000;
+        config.fps_denominator = 1_001;
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        assert_eq!(encoder.next_input_pts, 2 * 1001);
+
+        encoder.reconfigure(ReconfigureParams {
+            average_bitrate: None,
+            expected_frame_rate: Some(60),
+        })?;
+
+        // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004。
+        // PTS の単調性を保つため切り上げ (div_ceil) を採用しているので 5 となる。
+        assert_eq!(encoder.config().fps_numerator, 60);
+        assert_eq!(encoder.config().fps_denominator, 1);
+        assert_eq!(encoder.next_input_pts, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
+        // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        let before = encoder.next_input_pts;
+
+        encoder.reconfigure(ReconfigureParams {
+            average_bitrate: Some(500_000),
+            expected_frame_rate: None,
+        })?;
+
+        assert_eq!(encoder.next_input_pts, before);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_overflows_when_rescaled_pts_exceeds_i64_max() -> Result<(), Error> {
+        // i64 の上限を意図的に超える条件で再スケールし、`Error::LimitExceeded` が返ることを確認する。
+        // 初期 timescale を 1 にしておくと encode を 1 回するごとに next_input_pts が +1 進む。
+        // ここでは VTCompressionSession を起動するコストを避けるため、構築後に next_input_pts を
+        // 直接 i64::MAX に書き込んでから reconfigure を呼ぶ (private フィールドなのでこのモジュールから可能)。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        encoder.next_input_pts = i64::MAX;
+
+        // new_timescale > old_timescale となる組合せで `i64::MAX * 2 / 1` が i64 範囲を超える。
+        let err = encoder
+            .reconfigure(ReconfigureParams {
+                average_bitrate: None,
+                expected_frame_rate: Some(2),
+            })
+            .expect_err("rescale should overflow");
+        assert!(matches!(
+            err,
+            Error::LimitExceeded {
+                reason: "rescaled presentation timestamp overflow",
+            }
+        ));
+        // 失敗時には config も next_input_pts も変更されない
+        assert_eq!(encoder.config().fps_numerator, 1);
+        assert_eq!(encoder.next_input_pts, i64::MAX);
+        Ok(())
     }
 }
