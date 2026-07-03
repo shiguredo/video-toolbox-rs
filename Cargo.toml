@@ -1,6 +1,6 @@
 [package]
 name = "shiguredo_video_toolbox"
-version = "2026.1.1"
+version = "2026.2.0-canary.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust bindings for Apple Video Toolbox hardware video encoders and decoders"
