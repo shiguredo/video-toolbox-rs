@@ -30,9 +30,9 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的解像度変更
-  - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新
+- 動的設定更新
+  - エンコーダー: `Encoder::reconfigure()` でビットレート / フレームレートを動的に更新 (解像度・コーデック変更は `Encoder` 作り直し)
+  - デコーダー: `Decoder::update_format()` でフォーマットを更新 (解像度変更を含む)
 - AVCC 形式の入出力
 
 ## 動作要件
@@ -278,40 +278,29 @@ match Decoder::<()>::new(DecoderConfig {
 }
 ```
 
-## 動的解像度変更
+## 動的設定更新
 
-WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に解像度が変わるユースケースに対応しています。
+WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に設定を変更するユースケースに対応しています。
 
 ### エンコーダー
 
-`reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
+`reconfigure()` で `ReconfigureParams` を渡し、動的に変更可能な項目だけを更新します。
+`VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映するため、セッション再作成は行われません。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、エンコード完了コールバックで通知されます。
+動的に更新できる項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の 3 つです。
+解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
+`Encoder` を作り直して対応します。
 
 ```rust
-// 動的に解像度を変更
-// 未出力フレームは自動的にフラッシュされる
-let new_config = EncoderConfig {
-    width: 1280,
-    height: 720,
-    codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
-    }),
-    pixel_format: PixelFormat::I420,
+use shiguredo_video_toolbox::ReconfigureParams;
+
+// ビットレートとフレームレートを動的に更新
+// 未指定 (None) の項目は現在値を維持する
+encoder.reconfigure(ReconfigureParams {
     average_bitrate: Some(2_000_000),
-    fps_numerator: 30,
-    fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
-    max_key_frame_interval: None,
-    max_key_frame_interval_duration: None,
-    max_frame_delay_count: None,
-};
-encoder.reconfigure(new_config)?;
+    expected_frame_rate: Some(60),
+    ..Default::default()
+})?;
 ```
 
 ### デコーダー
@@ -354,8 +343,9 @@ decoder.update_format(DecoderCodec::Av1 {
 | | エンコーダー | デコーダー |
 |---|---|---|
 | メソッド | `reconfigure()` | `update_format()` |
-| 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
+| 仕組み | `VTSessionSetProperties` で動的更新 (セッション再作成なし) | セッション流用を判定し、不可能な場合のみ再作成 |
+| 引数 | `ReconfigureParams` (動的更新可能項目のみ) | `DecoderCodec` (パラメータセットのみ) |
+| 対応外項目 | 解像度・コーデック・ピクセルフォーマット → `Encoder` を作り直す | (`DecoderCodec` バリアントが対応するもの以外) |
 
 ## ライセンス
 

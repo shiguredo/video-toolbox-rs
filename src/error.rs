@@ -48,6 +48,13 @@ pub enum Error {
         /// 関数名
         function: &'static str,
     },
+    /// 認識できないピクセルフォーマット (I420/Nv12 のいずれでもない FourCC が渡された)
+    UnknownPixelFormat {
+        /// 期待するピクセルフォーマット
+        expected: PixelFormat,
+        /// 実際の FourCC
+        fourcc: u32,
+    },
 }
 
 impl Error {
@@ -101,6 +108,12 @@ impl std::fmt::Display for Error {
                     f,
                     "Core Foundation object creation failed: {}() returned null",
                     function
+                )
+            }
+            Self::UnknownPixelFormat { expected, fourcc } => {
+                write!(
+                    f,
+                    "unknown pixel format: encoder expects {expected:?}, but got FourCC=0x{fourcc:08x}"
                 )
             }
         }

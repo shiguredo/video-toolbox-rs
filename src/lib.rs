@@ -26,9 +26,9 @@ pub use decoder::{
     Nv12Frame,
 };
 pub use encoder::{
-    CodecConfig, EncodeHandler, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
+    CodecConfig, DataRateLimit, EncodeHandler, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
     FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
-    HevcProfile,
+    HevcProfile, ReconfigureParams,
 };
 pub use error::Error;
 pub use types::PixelFormat;

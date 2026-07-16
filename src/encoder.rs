@@ -4,8 +4,8 @@ use crate::{
     error::Error,
     sys::{self, VTCompressionSessionCreate},
     types::{
-        CfPtr, CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_dictionary, cf_number_f64,
-        cf_number_i32, cf_number_i64, validate_video_dimensions_for_toolbox,
+        CfPtr, CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_array, cf_dictionary,
+        cf_number_f64, cf_number_i32, cf_number_i64, validate_video_dimensions_for_toolbox,
     },
 };
 
@@ -118,6 +118,30 @@ pub struct EncoderConfig {
 
     /// kVTCompressionPropertyKey_MaxFrameDelayCount
     pub max_frame_delay_count: Option<NonZeroU32>,
+
+    /// kVTCompressionPropertyKey_DataRateLimits
+    ///
+    /// `None` は未設定。`Some(空 Vec)` も未設定と同じ扱いで、[`Encoder::new`] 時に `None` へ
+    /// 正規化される ([`Encoder::config`] が返す表現を一意にするため)。
+    /// 詳細は [`DataRateLimit`] を参照。
+    pub data_rate_limits: Option<Vec<DataRateLimit>>,
+}
+
+/// データレートのハードリミット 1 個分
+///
+/// `window` 秒間の任意の連続区間で、圧縮データの総量が `bytes` を超えないことを
+/// エンコーダーに要求する (kVTCompressionPropertyKey_DataRateLimits)。
+///
+/// VTCompressionProperties.h の discussion は、`AverageBitRate` で全体の目標を指定しつつ
+/// 本プロパティで短期ウィンドウのハード上限を併設する使い方を推奨している。
+/// 指定できるリミットは Video Toolbox の仕様上 0〜2 個で、コーデックによっては
+/// 指定レートに収まらないことがある (仕様は将来変更される可能性がある)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataRateLimit {
+    /// ウィンドウあたりの総バイト数の上限
+    pub bytes: u64,
+    /// ウィンドウの長さ
+    pub window: Duration,
 }
 
 /// VTCompressionSessionEncodeFrame の frameProperties に指定するオプション
@@ -127,8 +151,148 @@ pub struct EncodeOptions {
     pub force_key_frame: bool,
 }
 
+/// [`Encoder::reconfigure`] で動的に更新可能なエンコードパラメータ
+///
+/// `None` のフィールドは現在値を維持する。全項目 `None` の場合は no-op となる。
+///
+/// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
+/// 項目はここに含まれていない。これらを変更する場合は [`Encoder`] を作り直す。
+///
+/// `#[non_exhaustive]` は付けていないため、フィールド追加は破壊的変更 (メジャーバージョンアップ) となる。
+/// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新すると、
+/// フィールド追加時の修正箇所を減らせる。
+#[derive(Debug, Clone, Default)]
+pub struct ReconfigureParams {
+    /// kVTCompressionPropertyKey_AverageBitRate (bps 単位)
+    pub average_bitrate: Option<u64>,
+
+    /// kVTCompressionPropertyKey_ExpectedFrameRate (整数 fps)
+    ///
+    /// 詳細な正規化 / 再スケール挙動は [`Encoder::reconfigure`] の rustdoc を参照。
+    pub expected_frame_rate: Option<u32>,
+
+    /// kVTCompressionPropertyKey_DataRateLimits
+    ///
+    /// `None` は現在値を維持する。`Some(空 Vec)` は設定済みの上限を解除する。
+    /// 詳細は [`DataRateLimit`] を参照。
+    pub data_rate_limits: Option<Vec<DataRateLimit>>,
+}
+
 // パラメータセット (VPS, SPS, PPS) のタプル型
 type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// `average_bitrate` (bps) の境界を検証する
+fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
+    if bitrate == 0 {
+        return Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero",
+        });
+    }
+    if bitrate > i64::MAX as u64 {
+        return Err(Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must fit in i64 for CFNumber",
+        });
+    }
+    Ok(())
+}
+
+/// `data_rate_limits` の境界を検証する
+///
+/// kVTCompressionPropertyKey_DataRateLimits は「0〜2 個のハードリミット」と規定されている
+/// (VTCompressionProperties.h)。
+fn validate_data_rate_limits(limits: &[DataRateLimit]) -> Result<(), Error> {
+    if limits.len() > 2 {
+        return Err(Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "must contain at most two limits",
+        });
+    }
+    for limit in limits {
+        if limit.bytes == 0 {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "bytes must not be zero",
+            });
+        }
+        if limit.bytes > i64::MAX as u64 {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "bytes must fit in i64 for CFNumber",
+            });
+        }
+        if limit.window.is_zero() {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "window must not be zero",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `fps_numerator` の境界を検証する (CMTimeMake の timescale 用)
+fn validate_fps_numerator(value: u32) -> Result<(), Error> {
+    if value == 0 {
+        return Err(Error::InvalidConfig {
+            field: "fps_numerator",
+            reason: "must not be zero",
+        });
+    }
+    if value > i32::MAX as u32 {
+        return Err(Error::InvalidConfig {
+            field: "fps_numerator",
+            reason: "must fit in i32 for CMTime timescale",
+        });
+    }
+    Ok(())
+}
+
+/// `expected_frame_rate` の境界を検証する
+fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
+    if value == 0 {
+        return Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must not be zero",
+        });
+    }
+    if value > i32::MAX as u32 {
+        return Err(Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must fit in i32 for CFNumber",
+        });
+    }
+    Ok(())
+}
+
+/// `data_rate_limits` を CFArray に変換して properties に追加する
+///
+/// kVTCompressionPropertyKey_DataRateLimits は「bytes, seconds を交互に並べた偶数個の
+/// CFNumber の CFArray」と規定されている (VTCompressionProperties.h)。
+/// CFArray は各要素を retain するため、要素の CFNumber は本関数内で drop してよい。
+fn push_data_rate_limits_property(
+    properties: &mut Vec<(sys::CFStringRef, *const c_void)>,
+    cf_objects: &mut Vec<CfPtr<c_void>>,
+    limits: &[DataRateLimit],
+) -> Result<(), Error> {
+    let mut elements: Vec<CfPtr<c_void>> = Vec::new();
+    let mut raw: Vec<*const c_void> = Vec::new();
+    for limit in limits {
+        let bytes = cf_number_i64(limit.bytes as i64)?;
+        let seconds = cf_number_f64(limit.window.as_secs_f64())?;
+        raw.push(bytes.0);
+        raw.push(seconds.0);
+        elements.push(bytes);
+        elements.push(seconds);
+    }
+    let array = cf_array(&raw)?;
+    unsafe {
+        properties.push((sys::kVTCompressionPropertyKey_DataRateLimits, array.0));
+    }
+    cf_objects.push(array);
+    Ok(())
+}
 
 /// エンコード結果を通知するためのハンドラー
 ///
@@ -177,13 +341,24 @@ pub struct Encoder<H: EncodeHandler> {
     session: sys::VTCompressionSessionRef,
     config: EncoderConfig,
     next_input_pts: i64,
+    // FFI の outputCallbackRefCon にこの Box の中身ポインタを渡しているため、
+    // Encoder の生存期間中は保持し続ける必要がある。Rust 側からは直接参照しない。
+    #[allow(dead_code)]
     handler: Box<H>,
 }
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
+    pub fn new(mut config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
+        // `Some(空 Vec)` は未設定と同義なので `None` へ正規化し、`config()` が返す表現を一意にする
+        if config
+            .data_rate_limits
+            .as_deref()
+            .is_some_and(<[_]>::is_empty)
+        {
+            config.data_rate_limits = None;
+        }
         let handler = Box::new(handler);
         let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
@@ -195,28 +370,107 @@ impl<H: EncodeHandler> Encoder<H> {
         })
     }
 
-    /// 新しい設定でエンコーダーを再作成する
+    /// 現在エンコーダーが内部で保持している設定を返す
     ///
-    /// 未出力フレームをフラッシュした後、既存のセッションを破棄して
-    /// 新しい設定でセッションを再作成する。
-    /// フラッシュされたフレームはエンコード完了コールバックで通知される。
-    pub fn reconfigure(&mut self, config: EncoderConfig) -> Result<(), Error> {
-        Self::validate_config(&config)?;
-        // 未出力フレームをフラッシュ（完了通知はコールバックで受け取る）
-        self.finish()?;
+    /// 戻り値は [`Encoder::new`] で渡した値、または直近の [`Encoder::reconfigure`] 呼び出しで
+    /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
+    ///
+    /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは `average_bitrate` /
+    /// `fps_numerator` / `fps_denominator` / `data_rate_limits` の 4 項目のみで、
+    /// その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
+    pub fn config(&self) -> &EncoderConfig {
+        &self.config
+    }
+
+    /// 動的に変更可能なエンコードパラメータを更新する
+    ///
+    /// `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。
+    /// セッション再作成は行わないため、未出力フレームの自動フラッシュも行わない。
+    /// フラッシュが必要なら呼び出し側で先に [`Encoder::finish`] を明示する。
+    ///
+    /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
+    /// `VTSessionSetProperties` が失敗した場合は `self.config` を変更せず、セッションも生かしたままエラーを返す。
+    ///
+    /// `expected_frame_rate` を更新した場合は `fps_numerator` / `fps_denominator` が
+    /// `expected_frame_rate / 1` に正規化される (分数 fps は保持されない)。また、内部の
+    /// `next_input_pts` を新しい timescale に切り上げで再スケールし、直前出力フレームと
+    /// 物理時間として単調増加するようにする。切り上げのため 1 回の更新につき最大
+    /// 1/`expected_frame_rate` 秒だけ PTS が前倒しされ、頻繁に更新すると累積し得る。
+    /// 再スケール結果が `i64` を超えた場合は [`Error::LimitExceeded`] を返す。
+    ///
+    /// 解像度・コーデック・ピクセルフォーマットの変更はこの API では対応しないため [`Encoder`] を作り直す。
+    pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
+        Self::validate_reconfigure_params(&params)?;
+
+        // VTSessionSetProperties 実行前に `next_input_pts` の再スケール値を確定させる。
+        // FFI 呼び出しが失敗した場合はここまでで巻き戻し、self の状態を変更しない。
+        // 直前出力フレームとの PTS 単調性を維持するため切り上げ (div_ceil) で再スケールする。
+        // 切り捨てだと new_timescale < old_timescale 時に rescaled が潰れて逆行し得る。
+        // `next_input_pts` は 0 開始で加算しかされない非負値なので u128 で計算できる
+        // (符号付き整数の div_ceil は unstable のため)。
+        let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
+            let old_timescale = self.config.fps_numerator as u128;
+            let new_timescale = fps as u128;
+            let old_pts = self.next_input_pts as u128;
+            let rescaled = (old_pts * new_timescale).div_ceil(old_timescale);
+            if rescaled > i64::MAX as u128 {
+                return Err(Error::LimitExceeded {
+                    reason: "rescaled presentation timestamp overflow",
+                });
+            }
+            Some(rescaled as i64)
+        } else {
+            None
+        };
 
         unsafe {
-            // 新しいセッションを先に作成する
-            // 失敗時に self が不整合にならないようにする
-            let session = Self::create_compression_session(&config, self.handler.as_ref())?;
+            let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
+            let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
 
-            // 新しいセッションの作成に成功してから既存のセッションを破棄する
-            sys::VTCompressionSessionInvalidate(self.session);
-            sys::CFRelease(self.session as *const c_void);
+            if let Some(bitrate) = params.average_bitrate {
+                let value = cf_number_i64(bitrate as i64)?;
+                properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
+                cf_objects.push(value);
+            }
+            if let Some(fps) = params.expected_frame_rate {
+                let value = cf_number_i32(fps as i32)?;
+                properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
+                cf_objects.push(value);
+            }
+            if let Some(ref limits) = params.data_rate_limits {
+                push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
+            }
 
-            self.session = session;
-            self.config = config;
-            self.next_input_pts = 0;
+            // 更新対象が無ければ no-op (パラメータのフィールド列挙で判定するとフィールド追加時に漏れる)
+            if properties.is_empty() {
+                return Ok(());
+            }
+
+            let properties_dict = cf_dictionary(&properties)?;
+            let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
+            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
+            Error::check(status, "VTSessionSetProperties")?;
+        }
+
+        // FFI 成功時のみ self の状態を更新する。
+        if let Some(bitrate) = params.average_bitrate {
+            self.config.average_bitrate = Some(bitrate);
+        }
+        if let Some(fps) = params.expected_frame_rate {
+            // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
+            self.config.fps_numerator = fps;
+            self.config.fps_denominator = 1;
+        }
+        if let Some(limits) = params.data_rate_limits {
+            // 解除 (空 Vec) は「未設定」へ正規化し、`config()` の表現を一意にする
+            self.config.data_rate_limits = if limits.is_empty() {
+                None
+            } else {
+                Some(limits)
+            };
+        }
+        if let Some(new_pts) = rescaled_next_input_pts {
+            self.next_input_pts = new_pts;
         }
 
         Ok(())
@@ -405,6 +659,11 @@ impl<H: EncodeHandler> Encoder<H> {
                     sys::kCFBooleanTrue.cast(),
                 ));
             }
+
+            // データレートのハードリミット (指定時のみ設定。空 Vec は `Encoder::new` で `None` に正規化済み)
+            if let Some(limits) = &config.data_rate_limits {
+                push_data_rate_limits_property(properties, cf_objects, limits)?;
+            }
         }
         Ok(())
     }
@@ -454,26 +713,26 @@ impl<H: EncodeHandler> Encoder<H> {
                 reason: "must not be zero",
             });
         }
-        if config.fps_numerator == 0 {
-            return Err(Error::InvalidConfig {
-                field: "fps_numerator",
-                reason: "must not be zero",
-            });
+        validate_fps_numerator(config.fps_numerator)?;
+        if let Some(bitrate) = config.average_bitrate {
+            validate_average_bitrate(bitrate)?;
         }
-        // `CMTimeMake` の timescale に `fps_numerator as i32` を渡すため、`i32` に収まる必要がある。
-        if config.fps_numerator > i32::MAX as u32 {
-            return Err(Error::InvalidConfig {
-                field: "fps_numerator",
-                reason: "must fit in i32 for CMTime timescale",
-            });
+        if let Some(limits) = &config.data_rate_limits {
+            validate_data_rate_limits(limits)?;
         }
-        if let Some(bitrate) = config.average_bitrate
-            && bitrate > i64::MAX as u64
-        {
-            return Err(Error::InvalidConfig {
-                field: "average_bitrate",
-                reason: "must fit in i64 for CFNumber",
-            });
+        Ok(())
+    }
+
+    /// [`Encoder::reconfigure`] に渡された [`ReconfigureParams`] を検証する
+    fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
+        if let Some(bitrate) = params.average_bitrate {
+            validate_average_bitrate(bitrate)?;
+        }
+        if let Some(fps) = params.expected_frame_rate {
+            validate_expected_frame_rate(fps)?;
+        }
+        if let Some(ref limits) = params.data_rate_limits {
+            validate_data_rate_limits(limits)?;
         }
         Ok(())
     }
@@ -1287,5 +1546,137 @@ fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
             sys::kCMSampleAttachmentKey_NotSync as *const c_void,
         );
         not_sync != sys::kCFBooleanTrue as *const c_void
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `Encoder::reconfigure` の内部状態 (`next_input_pts`) を直接確認するためのテスト。
+    //! `tests/test_encoder.rs` からは到達できない private フィールド検証だけをここに置く。
+    //! 通常系の検証は `tests/test_encoder.rs` 側にある。
+
+    use super::*;
+
+    fn base_encoder_config() -> EncoderConfig {
+        EncoderConfig {
+            width: 960,
+            height: 480,
+            codec: CodecConfig::H264(H264EncoderConfig {
+                profile: H264Profile::Main,
+                entropy_mode: H264EntropyMode::Cabac,
+            }),
+            pixel_format: PixelFormat::I420,
+            average_bitrate: None,
+            fps_numerator: 1,
+            fps_denominator: 1,
+            prioritize_encoding_speed_over_quality: false,
+            real_time: false,
+            maximize_power_efficiency: false,
+            allow_frame_reordering: false,
+            allow_temporal_compression: true,
+            max_key_frame_interval: None,
+            max_key_frame_interval_duration: None,
+            max_frame_delay_count: None,
+            data_rate_limits: None,
+        }
+    }
+
+    fn black_i420_frame(w: usize, h: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
+        (
+            vec![0u8; w * h],
+            vec![0u8; uv_w * uv_h],
+            vec![0u8; uv_w * uv_h],
+        )
+    }
+
+    fn noop_handler() -> FnEncodeHandler<()> {
+        FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+    }
+
+    #[test]
+    fn reconfigure_rescales_next_input_pts_on_frame_rate_change() -> Result<(), Error> {
+        // 30000/1001 (29.97 fps) で開始し、60 fps に reconfigure すると
+        // `next_input_pts` が新しい timescale (= 60) に再スケールされることを確認する。
+        let mut config = base_encoder_config();
+        config.fps_numerator = 30_000;
+        config.fps_denominator = 1_001;
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        // 2 フレームを encode して next_input_pts = 2 * 1001 = 2002
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        assert_eq!(encoder.next_input_pts, 2 * 1001);
+
+        encoder.reconfigure(ReconfigureParams {
+            expected_frame_rate: Some(60),
+            ..Default::default()
+        })?;
+
+        // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004。
+        // PTS の単調性を保つため切り上げ (div_ceil) を採用しているので 5 となる。
+        assert_eq!(encoder.next_input_pts, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_preserves_next_input_pts_when_only_bitrate_changes() -> Result<(), Error> {
+        // expected_frame_rate を指定しない場合、next_input_pts は再スケールされない。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        let before = encoder.next_input_pts;
+
+        encoder.reconfigure(ReconfigureParams {
+            average_bitrate: Some(500_000),
+            ..Default::default()
+        })?;
+
+        assert_eq!(encoder.next_input_pts, before);
+        Ok(())
+    }
+
+    #[test]
+    fn reconfigure_overflows_when_rescaled_pts_exceeds_i64_max() -> Result<(), Error> {
+        // i64 の上限を意図的に超える条件で再スケールし、`Error::LimitExceeded` が返ることを確認する。
+        // 公開 API 経由で next_input_pts を i64::MAX にするには encode を i64::MAX 回呼ぶ必要があるため、
+        // private フィールドへ直接書き込んで境界条件を作る (このモジュールからのみ可能)。
+        let config = base_encoder_config();
+        let mut encoder = Encoder::new(config, noop_handler())?;
+
+        encoder.next_input_pts = i64::MAX;
+
+        // new_timescale > old_timescale となる組合せで `i64::MAX * 2 / 1` が i64 範囲を超える。
+        let err = encoder
+            .reconfigure(ReconfigureParams {
+                expected_frame_rate: Some(2),
+                ..Default::default()
+            })
+            .expect_err("rescale should overflow");
+        assert!(matches!(
+            err,
+            Error::LimitExceeded {
+                reason: "rescaled presentation timestamp overflow",
+            }
+        ));
+        // 失敗時には config も next_input_pts も変更されない
+        assert_eq!(encoder.config().fps_numerator, 1);
+        assert_eq!(encoder.next_input_pts, i64::MAX);
+        Ok(())
     }
 }

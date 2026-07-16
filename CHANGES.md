@@ -11,8 +11,32 @@
 
 ## develop
 
+- [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型と
+  `ReconfigureParams::data_rate_limits` を追加する
+  - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
+    ウィンドウあたりの総バイト数のハード上限を併設できるようにする
+  - 指定できるリミットは Video Toolbox の仕様上 0〜2 個
+  - @voluntas
+- [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
+  - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
   - @melpon
+- [CHANGE] `Encoder::reconfigure` を `ReconfigureParams` ベースの動的更新専用 API に変更する
+  - 旧 API は `EncoderConfig` を所有権で受け取りセッションを再作成していたが、
+    `VTSessionSetProperties` 1 回で完結する動的更新型に置き換える
+  - 動的に変更可能な項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の
+    3 項目で、解像度・コーデック・ピクセルフォーマットの変更は `Encoder` を作り直す運用に統一する
+  - `expected_frame_rate` 更新時は内部 PTS を切り上げで再スケールし、
+    オーバーフロー時には `Error::LimitExceeded` を返す
+  - @voluntas
+- [CHANGE] `EncoderConfig` に `data_rate_limits` フィールドを追加する
+  - `#[non_exhaustive]` を付けていない公開構造体へのフィールド追加のため、
+    構造体リテラルで構築しているコードは `data_rate_limits: None` の追記が必要になる
+  - @voluntas
+- [CHANGE] `Encoder::new` が `average_bitrate` に 0 を指定された場合に `Error::InvalidConfig` を返すようにする
+  - 従来は 0 がそのまま Video Toolbox に渡っていたが、`Encoder::reconfigure` と検証を共通化して
+    構築時点で拒否する
+  - @voluntas
 
 ### misc
 

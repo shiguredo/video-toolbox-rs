@@ -329,6 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
+        data_rate_limits: None,
     };
     let (encoded_result_tx, encoded_result_rx) = mpsc::channel::<EncodedResult>();
     let mut encoder = Encoder::new(

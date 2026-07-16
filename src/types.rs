@@ -98,6 +98,27 @@ pub(crate) fn cf_dictionary(
     Ok(ptr)
 }
 
+/// CF オブジェクトの配列から CFArray を生成する
+///
+/// `kCFTypeArrayCallBacks` を使うため、生成された CFArray は各要素を retain する。
+/// 呼び出し側は渡した要素の `CfPtr` を CFArray 生成後に drop してよい。
+pub(crate) fn cf_array(values: &[*const c_void]) -> Result<CfPtr<c_void>, Error> {
+    let ptr = unsafe {
+        sys::CFArrayCreate(
+            std::ptr::null_mut(),
+            values.as_ptr().cast_mut(),
+            values.len() as sys::CFIndex,
+            &sys::kCFTypeArrayCallBacks,
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFArrayCreate",
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}
+
 pub(crate) fn cf_number_i32(n: i32) -> Result<CfPtr<c_void>, Error> {
     let ptr = unsafe {
         sys::CFNumberCreate(

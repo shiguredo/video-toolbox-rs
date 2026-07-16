@@ -7,9 +7,9 @@ use std::{
 };
 
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
-    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
-    PixelFormat,
+    CodecConfig, DataRateLimit, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
+    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
+    HevcProfile, PixelFormat, ReconfigureParams,
 };
 
 const WIDTH: u32 = 960;
@@ -38,6 +38,7 @@ fn minimal_encoder_config() -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
+        data_rate_limits: None,
     }
 }
 
@@ -75,11 +76,26 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
+        data_rate_limits: None,
     }
 }
 
 fn build_i420_black_frame() -> ([u8; SIZE], [u8; SIZE / 4], [u8; SIZE / 4]) {
     ([0; SIZE], [0; SIZE / 4], [0; SIZE / 4])
+}
+
+/// エンコード結果を無視するハンドラー (構築・設定の検証だけで完結するテスト用)
+fn noop_encode_handler() -> FnEncodeHandler<()> {
+    FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+}
+
+/// 検証エラーを期待して `reconfigure` を呼び、返された `Error` を取り出す
+fn reconfigure_err(params: ReconfigureParams) -> Error {
+    let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())
+        .expect("encoder construction must succeed");
+    encoder
+        .reconfigure(params)
+        .expect_err("invalid params must be rejected")
 }
 
 fn wait_and_take_results<T>(
@@ -205,10 +221,7 @@ fn encoder_rejects_zero_width() {
     let mut c = minimal_encoder_config();
     c.width = 0;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -218,10 +231,7 @@ fn encoder_rejects_zero_height() {
     let mut c = minimal_encoder_config();
     c.height = 0;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -234,10 +244,7 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             ..
@@ -250,10 +257,7 @@ fn encoder_rejects_width_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.width = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig { field: "width", .. })
     ));
 }
@@ -263,10 +267,7 @@ fn encoder_rejects_height_above_i32_max() {
     let mut c = minimal_encoder_config();
     c.height = i32::MAX as u32 + 1;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "height",
             ..
@@ -279,10 +280,7 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     let mut c = minimal_encoder_config();
     c.average_bitrate = Some(i64::MAX as u64 + 1);
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "average_bitrate",
             ..
@@ -295,10 +293,7 @@ fn encoder_rejects_zero_fps_denominator() {
     let mut c = minimal_encoder_config();
     c.fps_denominator = 0;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "fps_denominator",
             ..
@@ -311,10 +306,7 @@ fn encoder_rejects_zero_fps_numerator() {
     let mut c = minimal_encoder_config();
     c.fps_numerator = 0;
     assert!(matches!(
-        Encoder::new(
-            c,
-            FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
-        ),
+        Encoder::new(c, noop_encode_handler()),
         Err(Error::InvalidConfig {
             field: "fps_numerator",
             reason: "must not be zero"
@@ -417,6 +409,92 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
 }
 
 #[test]
+fn reconfigure_updates_config_on_success() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let mut encoder = Encoder::new(config, noop_encode_handler())?;
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(250_000),
+        expected_frame_rate: Some(60),
+        ..Default::default()
+    })?;
+    assert_eq!(encoder.config().average_bitrate, Some(250_000));
+    assert_eq!(encoder.config().fps_numerator, 60);
+    // ExpectedFrameRate は単一整数のため分母は 1 に正規化される
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
+    let config = encoder_config(false);
+    let before_bitrate = config.average_bitrate;
+    let before_fps_num = config.fps_numerator;
+    let before_fps_den = config.fps_denominator;
+    let mut encoder = Encoder::new(config, noop_encode_handler())?;
+    encoder.reconfigure(ReconfigureParams::default())?;
+    assert_eq!(encoder.config().average_bitrate, before_bitrate);
+    assert_eq!(encoder.config().fps_numerator, before_fps_num);
+    assert_eq!(encoder.config().fps_denominator, before_fps_den);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_zero_bitrate() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            average_bitrate: Some(0),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_zero_expected_frame_rate() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            expected_frame_rate: Some(0),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_expected_frame_rate_above_i32_max() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            expected_frame_rate: Some(i32::MAX as u32 + 1),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "expected_frame_rate",
+            reason: "must fit in i32 for CFNumber",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_bitrate_above_i64_max() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            average_bitrate: Some(i64::MAX as u64 + 1),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must fit in i64 for CFNumber",
+        }
+    ));
+}
+
+#[test]
 fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
     let mut enc = Encoder::new(
@@ -441,4 +519,257 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
+}
+
+#[test]
+fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
+    let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())?;
+    let limits = vec![DataRateLimit {
+        bytes: 93_750,
+        window: Duration::from_secs(1),
+    }];
+    encoder.reconfigure(ReconfigureParams {
+        data_rate_limits: Some(limits.clone()),
+        ..Default::default()
+    })?;
+    assert_eq!(encoder.config().data_rate_limits, Some(limits));
+
+    // 空 Vec で上限を解除できる
+    encoder.reconfigure(ReconfigureParams {
+        data_rate_limits: Some(Vec::new()),
+        ..Default::default()
+    })?;
+    assert!(encoder.config().data_rate_limits.is_none());
+    Ok(())
+}
+
+#[test]
+fn reconfigure_rejects_more_than_two_data_rate_limits() {
+    let limit = DataRateLimit {
+        bytes: 93_750,
+        window: Duration::from_secs(1),
+    };
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            data_rate_limits: Some(vec![limit; 3]),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "must contain at most two limits",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_zero_bytes_data_rate_limit() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            data_rate_limits: Some(vec![DataRateLimit {
+                bytes: 0,
+                window: Duration::from_secs(1),
+            }]),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "bytes must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
+    // `bytes` は CFNumber (SInt64) に変換されるため i64::MAX を超える値は拒否される
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            data_rate_limits: Some(vec![DataRateLimit {
+                bytes: i64::MAX as u64 + 1,
+                window: Duration::from_secs(1),
+            }]),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "bytes must fit in i64 for CFNumber",
+        }
+    ));
+}
+
+#[test]
+fn reconfigure_rejects_zero_window_data_rate_limit() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            data_rate_limits: Some(vec![DataRateLimit {
+                bytes: 93_750,
+                window: Duration::ZERO,
+            }]),
+            ..Default::default()
+        }),
+        Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "window must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn new_rejects_invalid_data_rate_limits() {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = Some(vec![DataRateLimit {
+        bytes: 0,
+        window: Duration::from_secs(1),
+    }]);
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("invalid data rate limits must be rejected at construction");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "bytes must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn new_rejects_zero_average_bitrate() {
+    let mut config = minimal_encoder_config();
+    config.average_bitrate = Some(0);
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("zero average bitrate must be rejected at construction");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig {
+            field: "average_bitrate",
+            reason: "must not be zero",
+        }
+    ));
+}
+
+#[test]
+fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
+    // `Some(空 Vec)` は未設定と同義なので `config()` では `None` に正規化される
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = Some(Vec::new());
+    let encoder = Encoder::new(config, noop_encode_handler())?;
+    assert!(encoder.config().data_rate_limits.is_none());
+    Ok(())
+}
+
+/// スクロールするグラデーションと下部ノイズ帯で構成された合成フレームを生成する
+///
+/// グラデーション部は圧縮が効き、ノイズ帯 (下部 1/4) がビット消費を押し上げるため、
+/// レート制御が実際に働く負荷を安定して作れる。フレーム全面を純粋なノイズにすると
+/// 最低品質でも上限バイト数を物理的に下回れず、レートリミットの検証にならない。
+fn synthetic_i420_frame(frame_index: usize, seed: &mut u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w = WIDTH as usize;
+    let h = HEIGHT as usize;
+    let mut y_plane = vec![0u8; SIZE];
+    for row in 0..h {
+        for col in 0..w {
+            y_plane[row * w + col] = ((col * 255 / w + frame_index * 3) % 256) as u8;
+        }
+    }
+    for b in y_plane[SIZE * 3 / 4..].iter_mut() {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *b = (*seed >> 33) as u8;
+    }
+    (y_plane, vec![128u8; SIZE / 4], vec![128u8; SIZE / 4])
+}
+
+/// DataRateLimits がウィンドウあたりの出力バイト数を実際に抑えることを検証する
+///
+/// - `average_bitrate` (2 Mbps) をハード上限 (750 kbps) より高く設定し、
+///   リミット無しなら確実に超過する負荷 (合成フレーム) を 30 fps の PTS で
+///   90 フレーム (デコード時間 3 秒ぶん) エンコードする
+/// - 1 秒ウィンドウ (30 フレーム) ごとの合計バイト数が上限 + 50% 余裕に収まることを確認する。
+///   VTCompressionProperties.h は "some codecs do not support limiting to specified data rates"
+///   とレート制御の遵守を保証していないため、実装揺れを許容する広めのマージンを取る
+///   (リミット無しの 2 Mbps 出力とは明確に区別できる)
+/// - エンコーダーがレート制御で崩壊して出力が出なくなっていないことも確認する
+fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
+    const FRAMES: usize = 90;
+    const FPS: usize = 30;
+    const LIMIT_BYTES_PER_SEC: u64 = 93_750; // 750 kbps
+
+    let mut config = encoder_config(is_h265);
+    config.average_bitrate = Some(2_000_000);
+    config.fps_numerator = FPS as u32;
+    config.fps_denominator = 1;
+    config.real_time = true;
+    config.prioritize_encoding_speed_over_quality = true;
+    config.data_rate_limits = Some(vec![DataRateLimit {
+        bytes: LIMIT_BYTES_PER_SEC,
+        window: Duration::from_secs(1),
+    }]);
+
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results.lock().expect("results mutex poisoned").push(result);
+            }
+        }),
+    )?;
+
+    let mut seed = 0x5eed_5eed_5eed_5eedu64;
+    for i in 0..FRAMES {
+        let (y, u, v) = synthetic_i420_frame(i, &mut seed);
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            &EncodeOptions::default(),
+            i as u64,
+        )?;
+    }
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, FRAMES);
+    let mut sizes = Vec::new();
+    for callback in callbacks {
+        match callback {
+            Ok(frame) => sizes.push(frame.data.len() as u64),
+            Err(e) => panic!("unexpected encode callback error: {e}"),
+        }
+    }
+    assert_eq!(sizes.len(), FRAMES);
+
+    // 1 秒ウィンドウ (30 フレーム) ごとの合計がハード上限 + 50% 余裕に収まること。
+    // 先頭ウィンドウはキーフレームとレート制御の立ち上がりを含むため対象から外す。
+    let mut window_bytes = Vec::new();
+    for chunk in sizes.chunks(FPS) {
+        window_bytes.push(chunk.iter().sum::<u64>());
+    }
+    for (i, bytes) in window_bytes.iter().enumerate().skip(1) {
+        assert!(
+            *bytes <= LIMIT_BYTES_PER_SEC * 150 / 100,
+            "window {i} produced {bytes} bytes, exceeding hard limit {LIMIT_BYTES_PER_SEC} (+50%)"
+        );
+    }
+    // レート制御で出力が崩壊していないこと (2 Mbps 要求 + ノイズ帯なら上限の 1/4 は確実に使う)
+    let total: u64 = sizes.iter().sum();
+    assert!(
+        total >= LIMIT_BYTES_PER_SEC * (FRAMES as u64 / FPS as u64) / 4,
+        "encoder output collapsed: total {total} bytes over {FRAMES} frames"
+    );
+    Ok(())
+}
+
+#[test]
+fn data_rate_limits_cap_windowed_output_h264() -> Result<(), Error> {
+    data_rate_limits_cap_windowed_output(false)
+}
+
+#[test]
+fn data_rate_limits_cap_windowed_output_h265() -> Result<(), Error> {
+    data_rate_limits_cap_windowed_output(true)
 }
