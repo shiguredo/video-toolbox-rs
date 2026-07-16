@@ -5,75 +5,120 @@
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-docs
+- Updated: 2026-07-16
 
 ## 目的
 
-`Encoder::reconfigure` と `Encoder::config` の rustdoc が、`ReconfigureParams` の実体と一致していない。具体的には以下の 2 点。
+`Encoder::reconfigure` 関連の説明が rustdoc 3 ヶ所 + README 3 ヶ所に分散・重複しており、
+一部が実装の現状 (`ReconfigureParams` 化と `data_rate_limits` 追加、コミット bc6ce71) に
+追随できていない。残っている不整合は以下の 3 点。
 
-1. rustdoc に「動的に更新され得るのは `average_bitrate` / `fps_numerator` / `fps_denominator` の 3 項目のみ」と書かれているが、`ReconfigureParams` の公開フィールドは `average_bitrate: Option<u64>` と `expected_frame_rate: Option<u32>` の 2 項目のみ。`fps_numerator` / `fps_denominator` は内部正規化の結果書き換わるだけで、ユーザーが直接渡すフィールドではない。
-2. `reconfigure(expected_frame_rate: Some(N))` 呼び出しで `fps_denominator` が暗黙のうちに `1` に正規化される (`src/encoder.rs:353-354`)。これは初期で `30000/1001` 等の分数 fps を使っていたユーザーに精度劣化を引き起こすが、rustdoc / README で明示されていない。
+1. `Encoder::config` の rustdoc (`src/encoder.rs:378-380`) が「動的に更新され得るのは
+   `average_bitrate` / `fps_numerator` / `fps_denominator` / `data_rate_limits` の 4 項目のみ」と
+   `EncoderConfig` のフィールド名で列挙している。戻り値 `EncoderConfig` のどのフィールドが
+   変わり得るかという説明としては実装と一致しているが、`ReconfigureParams` のフィールド名
+   (`expected_frame_rate`) との対応 (`expected_frame_rate` 指定で `fps_numerator` / `fps_denominator`
+   が書き換わる) は利用者が自分で突き合わせる必要がある
+2. README に `fps_denominator = 1` 正規化 (分数 fps は保持されない) の記載が無い。また
+   「分数 fps を保持したい場合は `Encoder` を作り直す」という明示は rustdoc / README の
+   どこにも無い (rustdoc の「作り直す」は解像度・コーデック・ピクセルフォーマットの文脈のみ)
+3. 「reconfigure できる項目 / できない項目」の説明が複数箇所に重複しており、
+   項目が増えるたびに追随漏れが起きる (現に README「特徴」節は `data_rate_limits` 未反映)
 
-さらに、同じ「reconfigure できる項目 / できない項目」の説明が rustdoc 4 ヶ所 + README 2 ヶ所に重複している。
-
-公開 API のドキュメントは利用者が真に依存する契約なので、実装との乖離は最優先で解消する。
+公開 API のドキュメントは利用者が真に依存する契約なので、分散による追随漏れを構造的に防ぐ。
 
 ## 優先度根拠
 
-- 公開 API rustdoc は `cargo doc` で利用者に直接届く
-- 「3 項目」と書いてあるのに `ReconfigureParams` に対応するフィールドが存在せず、ユーザーが構築時に混乱する
-- 分数 fps の正規化挙動が明示されないと、`Encoder` の利用者が PTS 計算で誤った仮定を置く
-- 実装挙動の誤解を招く High リスク
+- 当初 High とした根拠 2 点 (rustdoc「3 項目」表記が `ReconfigureParams` の実フィールドと乖離、
+  fps 正規化が rustdoc / README のどこにも書かれていない) は bc6ce71 で解消済み
+- 残タスクは説明の集約と README への記載追加であり、実装挙動の誤解を招く度合いは当初より低い
+- 優先度を Medium へ引き下げる余地がある (判断はレビュー時に行う)
 
 ## 現状
 
-### 不整合 1: フィールド名のミスマッチ
+### 解消済み (bc6ce71、issue 0043 / 0054 の対応に含まれる)
 
-- `src/encoder.rs:277-279` (`Encoder::config` の rustdoc):
+- `Encoder::reconfigure` の rustdoc から「`fps_numerator` / `fps_denominator` の 3 項目」表記は
+  消滅し、`expected_frame_rate` ベースの記述に更新済み
+- `fps_numerator` / `fps_denominator` が `expected_frame_rate / 1` に正規化されること
+  (分数 fps 非保持)、切り上げ再スケールによる PTS 前倒しドリフトは
+  `Encoder::reconfigure` の rustdoc (`src/encoder.rs:394-399`) に明記済み
+- `ReconfigureParams::expected_frame_rate` の rustdoc (`src/encoder.rs:169-172`) は
+  `Encoder::reconfigure` の rustdoc への参照リンクで完結している
+- README のコード例 (`README.md:294-304`) は `..Default::default()` 付きでコンパイル可能な形に
+  修正済み。「動的設定更新」節 (`README.md:290`) は「`average_bitrate` / `expected_frame_rate` /
+  `data_rate_limits` の 3 つ」と実フィールド名で整合済み。比較表 (`README.md:343-348`) も
+  `ReconfigureParams` 名称で整合済み
 
-  ```
-  /// `Encoder::reconfigure` 経由で動的に更新され得るのは `average_bitrate` /
-  /// `fps_numerator` / `fps_denominator` の 3 項目のみで、その他のフィールドは
-  /// `Encoder::new` で渡した初期値のまま保持される。
-  ```
+### 残存 1: `Encoder::config` rustdoc の列挙
 
-- `src/encoder.rs:285-297` (`Encoder::reconfigure` の rustdoc): 同様に「3 項目」表現を使用
-- 実際の `ReconfigureParams` 定義 (`src/encoder.rs:140-148`): フィールドは `average_bitrate` と `expected_frame_rate` の 2 項目のみ
+`src/encoder.rs:378-380`:
 
-### 不整合 2: `fps_denominator = 1` 正規化の不告知
+```
+/// [`Encoder::reconfigure`] 経由で動的に更新され得るのは `average_bitrate` /
+/// `fps_numerator` / `fps_denominator` / `data_rate_limits` の 4 項目のみで、
+/// その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
+```
 
-- `src/encoder.rs:353-354` で `expected_frame_rate` 指定時に `self.config.fps_denominator = 1` を強制
-- これにより `encode()` 内の PTS 進行幅 (`next_input_pts += fps_denominator`) が変わる (`src/encoder.rs:881-886` 付近)
-- README.md (`README.md:281-302`) や rustdoc にこの正規化挙動が書かれていない
+実装 (`src/encoder.rs:456-471` で実際にこの 4 フィールドを更新) とは一致しているため誤りではないが、
+`ReconfigureParams` のフィールド名との対応が示されておらず、重複の一因にもなっている。
 
-### 不整合 3: rustdoc 重複
+### 残存 2: README の正規化未記載
 
-- 「動的更新可能項目 / 不可能項目」の説明が以下 4 + 2 = 6 ヶ所に散らばっている:
-  - `ReconfigureParams` rustdoc (`src/encoder.rs:130-138`)
-  - `Encoder::config` rustdoc (`src/encoder.rs:272-279`)
-  - `Encoder::reconfigure` rustdoc (`src/encoder.rs:285-297`)
-  - README.md 「特徴」節 (`README.md:33-35`)
-  - README.md 「動的設定更新」節 (`README.md:281-302`)
+- 正規化コード本体は `src/encoder.rs:460-462` (`self.config.fps_denominator = 1`)
+- これにより `encode()` / `encode_pixel_buffer()` 内の PTS 進行幅
+  (`next_input_pts += fps_denominator`、`src/encoder.rs:1008-1010` / `1092-1094`) が変わる
+- README の「動的設定更新」節 (`README.md:285-304`) にはこの正規化挙動の記載が無い
+  (`grep -n "正規化" README.md` は 0 件)
+
+### 残存 3: 説明の重複 (rustdoc 3 ヶ所 + README 3 ヶ所)
+
+「動的更新可能項目 / 不可能項目」の説明が以下に分散している
+(当初の「4 + 2 = 6 ヶ所」という数え方は列挙と合っていなかったため数え直した):
+
+- `ReconfigureParams` rustdoc (`src/encoder.rs:154-163`)
+- `Encoder::config` rustdoc (`src/encoder.rs:378-380`)
+- `Encoder::reconfigure` rustdoc (`src/encoder.rs:385-401`)
+- README「特徴」節 (`README.md:33-34`) — `data_rate_limits` 未反映のまま
+- README「動的設定更新」節 (`README.md:285-304`)
+- README「まとめ」比較表 (`README.md:341-348`)
+
+特に「解像度・コーデック・ピクセルフォーマットは `Encoder` を作り直す」という説明は
+`src/encoder.rs:158-159` / `src/encoder.rs:401` / `README.md:34` / `README.md:291-292` /
+`README.md:348` の 5 ヶ所で重複している。
 
 ## 設計方針
 
-- 「reconfigure できる項目 / できない項目」の本体説明を `ReconfigureParams` rustdoc 1 ヶ所に集約する
-- `Encoder::config` / `Encoder::reconfigure` の rustdoc は「詳細は [`ReconfigureParams`] を参照」とリンクするだけにする
-- README.md は「特徴」節を 1 行に圧縮し、本文は「動的設定更新」節に集約する
-- `fps_denominator` の `1` 正規化挙動は `Encoder::reconfigure` rustdoc と `ReconfigureParams::expected_frame_rate` rustdoc に明示する
-- フィールド名「`average_bitrate` / `fps_numerator` / `fps_denominator` の 3 項目」は「`ReconfigureParams` で受ける `average_bitrate` と `expected_frame_rate` の 2 項目」に書き換える
+- 「reconfigure できる項目 / できない項目」の本体説明を 1 ヶ所に集約し、他は参照リンクにする
+  - 当初案は `ReconfigureParams` rustdoc への集約だったが、bc6ce71 後の現状は
+    `Encoder::reconfigure` rustdoc が本体でフィールド rustdoc からリンクする逆構造になっている。
+    正規化・再スケールはメソッド呼び出しの副作用なのでメソッド側を本体とする現状構造にも
+    合理性があり、集約先は実装時にどちらかへ決定する
+- `Encoder::config` rustdoc の 4 項目列挙は、`ReconfigureParams` フィールドとの対応
+  (`expected_frame_rate` 指定で `fps_numerator` / `fps_denominator` が書き換わる) が分かる形に
+  するか、集約先への参照リンクに縮小する
+- README は「動的設定更新」節を本体とし、「特徴」節は `data_rate_limits` を含む現仕様に追随させる
+- `fps_denominator = 1` 正規化 (分数 fps 非保持) と「分数 fps を保持したい場合は `Encoder` を
+  作り直す」を README「動的設定更新」節と rustdoc に明示する
+- 注: issue 0053 (`src/encoder.rs` のモジュール分割) が実施されると本 issue の行番号参照は
+  無効になる。着手時は行番号ではなくシンボル名で対象を特定すること
 
 ## 完了条件
 
-- `cargo doc --no-deps` の出力で `Encoder::reconfigure` / `Encoder::config` / `ReconfigureParams` の説明が `ReconfigureParams` のフィールド名と一致する
-- 「`fps_denominator = 1` への正規化」「分数 fps を保持したい場合は `Encoder` を作り直す」が明示されている
-- 同じ説明が 1 ヶ所だけにあり、他は参照で完結する
-- README.md の重複が解消されている
+- 「reconfigure できる項目 / できない項目」の本体説明が 1 ヶ所だけにあり、他は参照で完結する
+- `Encoder::config` rustdoc が `ReconfigureParams` フィールドとの対応を、利用者が自分で
+  突き合わせることなく理解できる形になっている
+- README「動的設定更新」節に `fps_denominator = 1` への正規化 (分数 fps 非保持) と
+  「分数 fps を保持したい場合は `Encoder` を作り直す」が明示されている
+- README「特徴」節が `data_rate_limits` を含む現仕様と整合している
 - `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` が通る
 
 ## 解決方法
 
-- `src/encoder.rs:130-148` の `ReconfigureParams` rustdoc に「`fps_denominator` は内部で `1` に正規化される」を追記
-- `src/encoder.rs:272-282` の `Encoder::config` rustdoc を縮小し `ReconfigureParams` へのリンクのみにする
-- `src/encoder.rs:283-298` の `Encoder::reconfigure` rustdoc から「`fps_numerator` / `fps_denominator` の 3 項目」表記を削除し、「`average_bitrate` と `expected_frame_rate`」に書き換える
-- `README.md:33-35` を 1 行に圧縮し、`README.md:281-302` の本文と重複している箇所を削る
-- `README.md:339-345` の比較表 (`reconfigure()` の引数欄) も `ReconfigureParams` 名称で整合させる
+- 集約先に決めた rustdoc (`ReconfigureParams` または `Encoder::reconfigure`) へ本体説明を移し、
+  残り 2 ヶ所の rustdoc は `[...]` 参照に書き換える
+- `Encoder::config` rustdoc (`src/encoder.rs:373-381`) の列挙を対応関係の明記または
+  参照リンク化で整理する
+- `README.md:285-304` に正規化挙動と「分数 fps は `Encoder` 作り直し」の記述を追加する
+- `README.md:33-34` の「特徴」節を現仕様 (`data_rate_limits` を含む) に追随させるか、
+  個別項目の列挙をやめて「動的設定更新」節への誘導だけにする
