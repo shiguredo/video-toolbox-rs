@@ -31,7 +31,7 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
 - 動的設定更新
-  - エンコーダー: `Encoder::reconfigure()` でビットレート / フレームレートを動的に更新 (解像度・コーデック変更は `Encoder` 作り直し)
+  - エンコーダー: `Encoder::reconfigure()` で動的に更新 (対象項目は「動的設定更新」節を参照)
   - デコーダー: `Decoder::update_format()` でフォーマットを更新 (解像度変更を含む)
 - AVCC 形式の入出力
 
@@ -290,6 +290,9 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 動的に更新できる項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の 3 つです。
 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
 `Encoder` を作り直して対応します。
+
+`expected_frame_rate` を更新すると `fps_numerator` / `fps_denominator` は `expected_frame_rate / 1` に
+正規化されます (分数 fps は保持されません)。分数 fps を保持したい場合は `Encoder` を作り直してください。
 
 ```rust
 use shiguredo_video_toolbox::ReconfigureParams;
