@@ -154,9 +154,7 @@ pub struct EncodeOptions {
 /// [`Encoder::reconfigure`] で動的に更新可能なエンコードパラメータ
 ///
 /// `None` のフィールドは現在値を維持する。全項目 `None` の場合は no-op となる。
-///
-/// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
-/// 項目はここに含まれていない。これらを変更する場合は [`Encoder`] を作り直す。
+/// 動的に更新できない項目の扱いを含む詳細は [`Encoder::reconfigure`] の rustdoc を参照。
 ///
 /// `#[non_exhaustive]` は付けていないため、フィールド追加は破壊的変更 (メジャーバージョンアップ) となる。
 /// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新すると、
@@ -375,9 +373,10 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 戻り値は [`Encoder::new`] で渡した値、または直近の [`Encoder::reconfigure`] 呼び出しで
     /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
     ///
-    /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは `average_bitrate` /
-    /// `fps_numerator` / `fps_denominator` / `data_rate_limits` の 4 項目のみで、
-    /// その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
+    /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは [`ReconfigureParams`] に
+    /// 対応するフィールドのみである。`average_bitrate` / `data_rate_limits` は同名の
+    /// フィールドが、`fps_numerator` / `fps_denominator` は `expected_frame_rate` の指定に
+    /// よって書き換わる。その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -392,7 +391,8 @@ impl<H: EncodeHandler> Encoder<H> {
     /// `VTSessionSetProperties` が失敗した場合は `self.config` を変更せず、セッションも生かしたままエラーを返す。
     ///
     /// `expected_frame_rate` を更新した場合は `fps_numerator` / `fps_denominator` が
-    /// `expected_frame_rate / 1` に正規化される (分数 fps は保持されない)。また、内部の
+    /// `expected_frame_rate / 1` に正規化される (分数 fps は保持されない。分数 fps を
+    /// 保持したい場合は [`Encoder`] を作り直す)。また、内部の
     /// `next_input_pts` を新しい timescale に切り上げで再スケールし、直前出力フレームと
     /// 物理時間として単調増加するようにする。切り上げのため 1 回の更新につき最大
     /// 1/`expected_frame_rate` 秒だけ PTS が前倒しされ、頻繁に更新すると累積し得る。

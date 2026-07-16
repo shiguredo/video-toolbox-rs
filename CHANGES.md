@@ -45,6 +45,11 @@
 
 ### misc
 
+- [UPDATE] `Encoder::reconfigure` 関連の rustdoc を整理して説明の重複を解消する
+  - 「動的に更新できる項目 / できない項目」の本体説明を `Encoder::reconfigure` に集約し、
+    `ReconfigureParams` / `Encoder::config` からは参照で辿れるようにする
+  - @voluntas
+
 ## 2026.1.1
 
 **リリース日**: 2026-04-01
