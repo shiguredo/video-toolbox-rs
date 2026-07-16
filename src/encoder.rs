@@ -119,10 +119,11 @@ pub struct EncoderConfig {
     /// kVTCompressionPropertyKey_MaxFrameDelayCount
     pub max_frame_delay_count: Option<NonZeroU32>,
 
-    /// kVTCompressionPropertyKey_DataRateLimits (空 Vec は未設定)
+    /// kVTCompressionPropertyKey_DataRateLimits
     ///
+    /// `None` は未設定 (`Some(空 Vec)` も未設定と同じ扱いでプロパティを設定しない)。
     /// 詳細は [`DataRateLimit`] を参照。
-    pub data_rate_limits: Vec<DataRateLimit>,
+    pub data_rate_limits: Option<Vec<DataRateLimit>>,
 }
 
 /// データレートのハードリミット 1 個分
@@ -450,7 +451,12 @@ impl<H: EncodeHandler> Encoder<H> {
             self.config.fps_denominator = 1;
         }
         if let Some(limits) = params.data_rate_limits {
-            self.config.data_rate_limits = limits;
+            // 解除 (空 Vec) は「未設定」へ正規化し、`config()` の表現を一意にする
+            self.config.data_rate_limits = if limits.is_empty() {
+                None
+            } else {
+                Some(limits)
+            };
         }
         if let Some(new_pts) = rescaled_next_input_pts {
             self.next_input_pts = new_pts;
@@ -643,9 +649,11 @@ impl<H: EncodeHandler> Encoder<H> {
                 ));
             }
 
-            // データレートのハードリミット (指定時のみ設定)
-            if !config.data_rate_limits.is_empty() {
-                push_data_rate_limits_property(properties, cf_objects, &config.data_rate_limits)?;
+            // データレートのハードリミット (指定時のみ設定、空 Vec は未設定と同じ)
+            if let Some(limits) = &config.data_rate_limits
+                && !limits.is_empty()
+            {
+                push_data_rate_limits_property(properties, cf_objects, limits)?;
             }
         }
         Ok(())
@@ -700,7 +708,9 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(bitrate) = config.average_bitrate {
             validate_average_bitrate(bitrate)?;
         }
-        validate_data_rate_limits(&config.data_rate_limits)?;
+        if let Some(limits) = &config.data_rate_limits {
+            validate_data_rate_limits(limits)?;
+        }
         Ok(())
     }
 
@@ -1558,7 +1568,7 @@ mod tests {
             max_key_frame_interval: None,
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
-            data_rate_limits: Vec::new(),
+            data_rate_limits: None,
         }
     }
 

@@ -38,7 +38,7 @@ fn minimal_encoder_config() -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: Vec::new(),
+        data_rate_limits: None,
     }
 }
 
@@ -76,7 +76,7 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: Vec::new(),
+        data_rate_limits: None,
     }
 }
 
@@ -588,7 +588,7 @@ fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
         expected_frame_rate: None,
         data_rate_limits: Some(limits.clone()),
     })?;
-    assert_eq!(encoder.config().data_rate_limits, limits);
+    assert_eq!(encoder.config().data_rate_limits, Some(limits));
 
     // 空 Vec で上限を解除できる
     encoder.reconfigure(ReconfigureParams {
@@ -596,7 +596,7 @@ fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
         expected_frame_rate: None,
         data_rate_limits: Some(Vec::new()),
     })?;
-    assert!(encoder.config().data_rate_limits.is_empty());
+    assert!(encoder.config().data_rate_limits.is_none());
     Ok(())
 }
 
@@ -682,10 +682,10 @@ fn reconfigure_rejects_zero_window_data_rate_limit() -> Result<(), Error> {
 #[test]
 fn new_rejects_invalid_data_rate_limits() {
     let mut config = minimal_encoder_config();
-    config.data_rate_limits = vec![DataRateLimit {
+    config.data_rate_limits = Some(vec![DataRateLimit {
         bytes: 0,
         window: Duration::from_secs(1),
-    }];
+    }]);
     let err = Encoder::new(
         config,
         FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
@@ -742,10 +742,10 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     config.fps_denominator = 1;
     config.real_time = true;
     config.prioritize_encoding_speed_over_quality = true;
-    config.data_rate_limits = vec![DataRateLimit {
+    config.data_rate_limits = Some(vec![DataRateLimit {
         bytes: LIMIT_BYTES_PER_SEC,
         window: Duration::from_secs(1),
-    }];
+    }]);
 
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
     let mut encoder = Encoder::new(

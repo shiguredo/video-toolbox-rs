@@ -34,9 +34,10 @@ closed/0043 で「必要になった時点で別 issue で追加する」とス�
 
 - `DataRateLimit { bytes: u64, window: Duration }` 型を追加する
   - SDK 仕様上「0〜2 個のハードリミット」なので個数は最大 2 に検証する
-- `EncoderConfig::data_rate_limits: Vec<DataRateLimit>` を追加する (空 = 未設定)
+- `EncoderConfig::data_rate_limits: Option<Vec<DataRateLimit>>` を追加する
+  (None = 未設定。既存のオプショナル項目と同じ Option の流儀に揃える)
 - `ReconfigureParams::data_rate_limits: Option<Vec<DataRateLimit>>` を追加する
-  (None = 現在値を維持、Some(空 Vec) = 上限解除)
+  (None = 現在値を維持、Some(空 Vec) = 上限解除。解除後の `config()` は None に正規化する)
 - `types.rs` に `cf_array` ヘルパーを追加する
 - プロパティは「bytes (CFNumber SInt64), seconds (CFNumber Float64)」を交互に並べた
   CFArray として `VTSessionSetProperties` に渡す
