@@ -37,6 +37,11 @@
   - 従来は 0 がそのまま Video Toolbox に渡っていたが、`Encoder::reconfigure` と検証を共通化して
     構築時点で拒否する
   - @voluntas
+- [CHANGE] `Error` に `UnknownPixelFormat` バリアントを追加する
+  - `Encoder::encode_pixel_buffer` に I420 / Nv12 のいずれでもない FourCC が渡された場合に、
+    `PixelFormatMismatch` と区別して実際の FourCC を診断情報として返す
+  - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合は分岐の追加が必要になる
+  - @voluntas
 
 ### misc
 

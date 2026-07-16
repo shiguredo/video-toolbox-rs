@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-05-14
-- Completed:
+- Completed: 2026-07-16
 - Model: Opus 4.7
 - Branch: feature/fix-error-unknown-pixel-format
 
@@ -69,10 +69,15 @@
 
 ## 解決方法
 
-方針 A を採用する場合の具体的な変更:
+方針 A (バリアントを採用する) で対応した。バリアントと `Display` 実装は既に存在し、
+追加コミット (`36b0348`) の意図も「未知フォーマットには `UnknownPixelFormat` を返す」だったため、
+撤回 (方針 B) ではなく利用箇所の欠落を埋める方向とした。
 
-- `src/encoder.rs:914-928` の `_ => { ... }` 分岐を `Err(Error::UnknownPixelFormat { expected: self.config.pixel_format, fourcc: format_type })` に置換
-- `CHANGES.md` の `## develop` に `- [CHANGE] Error に UnknownPixelFormat バリアントを追加する` を追加し、担当者行 `- @ユーザー名` を追記
-- `tests/test_error.rs` に `error_display_unknown_pixel_format` を追加し、`fourcc=0x30323449` (FourCC `I420`) を入れたときの文字列が `0x30323449` と `expected` の Debug 表示を含むことを確認
-
-方針 B の場合: `src/error.rs` の該当 diff を巻き戻し、`Error` enum を develop 同等に戻す。
+- `src/encoder.rs` の `encode_pixel_buffer` の未知 FourCC 分岐を
+  `Err(Error::UnknownPixelFormat { expected: self.config.pixel_format, fourcc: format_type })` に置換し、
+  「期待値の逆を返す」ハックとそのコメントを削除した
+- `CHANGES.md` の `## develop` に `[CHANGE] Error に UnknownPixelFormat バリアントを追加する` を追記し、
+  網羅 `match` への影響 (`#[non_exhaustive]` ではないため分岐追加が必要) を明記した
+- `tests/test_error.rs` に `error_display_unknown_pixel_format` を追加し、
+  `fourcc = 0x30323449` (FourCC `I420`) のときの表示が `0x30323449` と `expected` の
+  Debug 表示 (`Nv12`) を含むことを確認した
