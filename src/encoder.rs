@@ -121,7 +121,8 @@ pub struct EncoderConfig {
 
     /// kVTCompressionPropertyKey_DataRateLimits
     ///
-    /// `None` は未設定 (`Some(空 Vec)` も未設定と同じ扱いでプロパティを設定しない)。
+    /// `None` は未設定。`Some(空 Vec)` も未設定と同じ扱いで、[`Encoder::new`] 時に `None` へ
+    /// 正規化される ([`Encoder::config`] が返す表現を一意にするため)。
     /// 詳細は [`DataRateLimit`] を参照。
     pub data_rate_limits: Option<Vec<DataRateLimit>>,
 }
@@ -157,8 +158,9 @@ pub struct EncodeOptions {
 /// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
 /// 項目はここに含まれていない。これらを変更する場合は [`Encoder`] を作り直す。
 ///
-/// 将来のフィールド追加は破壊的変更として扱う。
-/// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新する記述を推奨する。
+/// `#[non_exhaustive]` は付けていないため、フィールド追加は破壊的変更 (メジャーバージョンアップ) となる。
+/// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新すると、
+/// フィールド追加時の修正箇所を減らせる。
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
     /// kVTCompressionPropertyKey_AverageBitRate (bps 単位)
@@ -347,8 +349,16 @@ pub struct Encoder<H: EncodeHandler> {
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
+    pub fn new(mut config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
+        // `Some(空 Vec)` は未設定と同義なので `None` へ正規化し、`config()` が返す表現を一意にする
+        if config
+            .data_rate_limits
+            .as_deref()
+            .is_some_and(<[_]>::is_empty)
+        {
+            config.data_rate_limits = None;
+        }
         let handler = Box::new(handler);
         let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
@@ -381,33 +391,29 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 全項目 `None` の場合は no-op として `Ok(())` を返す。
     /// `VTSessionSetProperties` が失敗した場合は `self.config` を変更せず、セッションも生かしたままエラーを返す。
     ///
-    /// `expected_frame_rate` を更新した場合は、内部の `next_input_pts` を新しい timescale に切り上げで
-    /// 再スケールし、直前出力フレームと物理時間として単調増加するようにする。再スケール結果が
-    /// `i64` を超えた場合は [`Error::LimitExceeded`] を返す。
+    /// `expected_frame_rate` を更新した場合は `fps_numerator` / `fps_denominator` が
+    /// `expected_frame_rate / 1` に正規化される (分数 fps は保持されない)。また、内部の
+    /// `next_input_pts` を新しい timescale に切り上げで再スケールし、直前出力フレームと
+    /// 物理時間として単調増加するようにする。切り上げのため 1 回の更新につき最大
+    /// 1/`expected_frame_rate` 秒だけ PTS が前倒しされ、頻繁に更新すると累積し得る。
+    /// 再スケール結果が `i64` を超えた場合は [`Error::LimitExceeded`] を返す。
     ///
     /// 解像度・コーデック・ピクセルフォーマットの変更はこの API では対応しないため [`Encoder`] を作り直す。
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
-        // 全項目 `None` のときは API 呼び出し自体を省略する
-        if params.average_bitrate.is_none()
-            && params.expected_frame_rate.is_none()
-            && params.data_rate_limits.is_none()
-        {
-            return Ok(());
-        }
-
         Self::validate_reconfigure_params(&params)?;
 
         // VTSessionSetProperties 実行前に `next_input_pts` の再スケール値を確定させる。
         // FFI 呼び出しが失敗した場合はここまでで巻き戻し、self の状態を変更しない。
         // 直前出力フレームとの PTS 単調性を維持するため切り上げ (div_ceil) で再スケールする。
         // 切り捨てだと new_timescale < old_timescale 時に rescaled が潰れて逆行し得る。
+        // `next_input_pts` は 0 開始で加算しかされない非負値なので u128 で計算できる
+        // (符号付き整数の div_ceil は unstable のため)。
         let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
-            let old_timescale = self.config.fps_numerator as i128;
-            let new_timescale = fps as i128;
-            let old_pts = self.next_input_pts as i128;
-            let product = old_pts * new_timescale;
-            let rescaled = (product + old_timescale - 1) / old_timescale;
-            if !(i64::MIN as i128..=i64::MAX as i128).contains(&rescaled) {
+            let old_timescale = self.config.fps_numerator as u128;
+            let new_timescale = fps as u128;
+            let old_pts = self.next_input_pts as u128;
+            let rescaled = (old_pts * new_timescale).div_ceil(old_timescale);
+            if rescaled > i64::MAX as u128 {
                 return Err(Error::LimitExceeded {
                     reason: "rescaled presentation timestamp overflow",
                 });
@@ -433,6 +439,11 @@ impl<H: EncodeHandler> Encoder<H> {
             }
             if let Some(ref limits) = params.data_rate_limits {
                 push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
+            }
+
+            // 更新対象が無ければ no-op (パラメータのフィールド列挙で判定するとフィールド追加時に漏れる)
+            if properties.is_empty() {
+                return Ok(());
             }
 
             let properties_dict = cf_dictionary(&properties)?;
@@ -649,10 +660,8 @@ impl<H: EncodeHandler> Encoder<H> {
                 ));
             }
 
-            // データレートのハードリミット (指定時のみ設定、空 Vec は未設定と同じ)
-            if let Some(limits) = &config.data_rate_limits
-                && !limits.is_empty()
-            {
+            // データレートのハードリミット (指定時のみ設定。空 Vec は `Encoder::new` で `None` に正規化済み)
+            if let Some(limits) = &config.data_rate_limits {
                 push_data_rate_limits_property(properties, cf_objects, limits)?;
             }
         }
@@ -1607,15 +1616,12 @@ mod tests {
         assert_eq!(encoder.next_input_pts, 2 * 1001);
 
         encoder.reconfigure(ReconfigureParams {
-            average_bitrate: None,
             expected_frame_rate: Some(60),
-            data_rate_limits: None,
+            ..Default::default()
         })?;
 
         // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004。
         // PTS の単調性を保つため切り上げ (div_ceil) を採用しているので 5 となる。
-        assert_eq!(encoder.config().fps_numerator, 60);
-        assert_eq!(encoder.config().fps_denominator, 1);
         assert_eq!(encoder.next_input_pts, 5);
         Ok(())
     }
@@ -1638,8 +1644,7 @@ mod tests {
 
         encoder.reconfigure(ReconfigureParams {
             average_bitrate: Some(500_000),
-            expected_frame_rate: None,
-            data_rate_limits: None,
+            ..Default::default()
         })?;
 
         assert_eq!(encoder.next_input_pts, before);
@@ -1649,9 +1654,8 @@ mod tests {
     #[test]
     fn reconfigure_overflows_when_rescaled_pts_exceeds_i64_max() -> Result<(), Error> {
         // i64 の上限を意図的に超える条件で再スケールし、`Error::LimitExceeded` が返ることを確認する。
-        // 初期 timescale を 1 にしておくと encode を 1 回するごとに next_input_pts が +1 進む。
-        // ここでは VTCompressionSession を起動するコストを避けるため、構築後に next_input_pts を
-        // 直接 i64::MAX に書き込んでから reconfigure を呼ぶ (private フィールドなのでこのモジュールから可能)。
+        // 公開 API 経由で next_input_pts を i64::MAX にするには encode を i64::MAX 回呼ぶ必要があるため、
+        // private フィールドへ直接書き込んで境界条件を作る (このモジュールからのみ可能)。
         let config = base_encoder_config();
         let mut encoder = Encoder::new(config, noop_handler())?;
 
@@ -1660,9 +1664,8 @@ mod tests {
         // new_timescale > old_timescale となる組合せで `i64::MAX * 2 / 1` が i64 範囲を超える。
         let err = encoder
             .reconfigure(ReconfigureParams {
-                average_bitrate: None,
                 expected_frame_rate: Some(2),
-                data_rate_limits: None,
+                ..Default::default()
             })
             .expect_err("rescale should overflow");
         assert!(matches!(

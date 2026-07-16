@@ -287,7 +287,7 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 `reconfigure()` で `ReconfigureParams` を渡し、動的に変更可能な項目だけを更新します。
 `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映するため、セッション再作成は行われません。
 
-動的に更新できる項目は `average_bitrate` と `expected_frame_rate` のみです。
+動的に更新できる項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の 3 つです。
 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
 `Encoder` を作り直して対応します。
 
@@ -295,9 +295,11 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 use shiguredo_video_toolbox::ReconfigureParams;
 
 // ビットレートとフレームレートを動的に更新
+// 未指定 (None) の項目は現在値を維持する
 encoder.reconfigure(ReconfigureParams {
     average_bitrate: Some(2_000_000),
     expected_frame_rate: Some(60),
+    ..Default::default()
 })?;
 ```
 
