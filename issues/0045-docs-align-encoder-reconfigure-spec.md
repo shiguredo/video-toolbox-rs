@@ -2,7 +2,7 @@
 
 - Priority: High
 - Created: 2026-05-14
-- Completed:
+- Completed: 2026-07-16
 - Model: Opus 4.7
 - Branch: feature/fix-encoder-reconfigure-docs
 - Updated: 2026-07-16
@@ -115,10 +115,17 @@
 
 ## 解決方法
 
-- 集約先に決めた rustdoc (`ReconfigureParams` または `Encoder::reconfigure`) へ本体説明を移し、
-  残り 2 ヶ所の rustdoc は `[...]` 参照に書き換える
-- `Encoder::config` rustdoc (`src/encoder.rs:373-381`) の列挙を対応関係の明記または
-  参照リンク化で整理する
-- `README.md:285-304` に正規化挙動と「分数 fps は `Encoder` 作り直し」の記述を追加する
-- `README.md:33-34` の「特徴」節を現仕様 (`data_rate_limits` を含む) に追随させるか、
-  個別項目の列挙をやめて「動的設定更新」節への誘導だけにする
+- 集約先は現状構造どおり `Encoder::reconfigure` の rustdoc に決定した。正規化・再スケールは
+  メソッド呼び出しの副作用であり、メソッド側を本体とする方が自然なため
+- `ReconfigureParams` の rustdoc から「解像度・コーデック・ピクセルフォーマットは作り直す」の
+  重複説明を削除し、`Encoder::reconfigure` への参照に書き換えた
+- `Encoder::config` の rustdoc を `ReconfigureParams` フィールドとの対応が分かる形に書き換えた
+  (`average_bitrate` / `data_rate_limits` は同名フィールド、`fps_numerator` / `fps_denominator` は
+  `expected_frame_rate` の指定で書き換わる、と明記)
+- `Encoder::reconfigure` の rustdoc と README「動的設定更新」節に「分数 fps は保持されない。
+  保持したい場合は `Encoder` を作り直す」を明記し、README には `fps_denominator = 1` への
+  正規化挙動も追記した
+- README「特徴」節は個別項目の列挙をやめ、「動的設定更新」節への誘導に変更した
+  (項目追加時の追随漏れを構造的に防ぐため)
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` /
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test --all` (43 件) の通過を確認した
