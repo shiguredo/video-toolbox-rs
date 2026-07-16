@@ -1042,15 +1042,10 @@ impl<H: EncodeHandler> Encoder<H> {
                 x if x == u32::from_be_bytes(*b"y420") => PixelFormat::I420,
                 x if x == sys::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => PixelFormat::Nv12,
                 _ => {
-                    // 未知のフォーマットは I420 でも Nv12 でもないので、
-                    // どちらを actual にしても不一致になる。期待値の逆を返す。
-                    let actual = match self.config.pixel_format {
-                        PixelFormat::I420 => PixelFormat::Nv12,
-                        PixelFormat::Nv12 => PixelFormat::I420,
-                    };
-                    return Err(Error::PixelFormatMismatch {
+                    // I420 / Nv12 のいずれでもない FourCC は不一致ではなく未知として区別する
+                    return Err(Error::UnknownPixelFormat {
                         expected: self.config.pixel_format,
-                        actual,
+                        fourcc: format_type,
                     });
                 }
             };
