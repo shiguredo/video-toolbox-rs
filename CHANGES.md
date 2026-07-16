@@ -11,6 +11,12 @@
 
 ## develop
 
+- [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型と
+  `EncoderConfig::data_rate_limits` / `ReconfigureParams::data_rate_limits` を追加する
+  - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
+    ウィンドウあたりの総バイト数のハード上限を併設できるようにする
+  - 指定できるリミットは Video Toolbox の仕様上 0〜2 個
+  - @voluntas
 - [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
   - @voluntas
 - [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する

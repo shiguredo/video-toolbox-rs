@@ -4,8 +4,8 @@ use crate::{
     error::Error,
     sys::{self, VTCompressionSessionCreate},
     types::{
-        CfPtr, CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_dictionary, cf_number_f64,
-        cf_number_i32, cf_number_i64, validate_video_dimensions_for_toolbox,
+        CfPtr, CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_array, cf_dictionary,
+        cf_number_f64, cf_number_i32, cf_number_i64, validate_video_dimensions_for_toolbox,
     },
 };
 
@@ -118,6 +118,29 @@ pub struct EncoderConfig {
 
     /// kVTCompressionPropertyKey_MaxFrameDelayCount
     pub max_frame_delay_count: Option<NonZeroU32>,
+
+    /// kVTCompressionPropertyKey_DataRateLimits
+    ///
+    /// `None` は未設定 (`Some(空 Vec)` も未設定と同じ扱いでプロパティを設定しない)。
+    /// 詳細は [`DataRateLimit`] を参照。
+    pub data_rate_limits: Option<Vec<DataRateLimit>>,
+}
+
+/// データレートのハードリミット 1 個分
+///
+/// `window` 秒間の任意の連続区間で、圧縮データの総量が `bytes` を超えないことを
+/// エンコーダーに要求する (kVTCompressionPropertyKey_DataRateLimits)。
+///
+/// VTCompressionProperties.h の discussion は、`AverageBitRate` で全体の目標を指定しつつ
+/// 本プロパティで短期ウィンドウのハード上限を併設する使い方を推奨している。
+/// 指定できるリミットは Video Toolbox の仕様上 0〜2 個で、コーデックによっては
+/// 指定レートに収まらないことがある (仕様は将来変更される可能性がある)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataRateLimit {
+    /// ウィンドウあたりの総バイト数の上限
+    pub bytes: u64,
+    /// ウィンドウの長さ
+    pub window: Duration,
 }
 
 /// VTCompressionSessionEncodeFrame の frameProperties に指定するオプション
@@ -134,7 +157,7 @@ pub struct EncodeOptions {
 /// 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない
 /// 項目はここに含まれていない。これらを変更する場合は [`Encoder`] を作り直す。
 ///
-/// 将来のフィールド追加 (例: `DataRateLimits`) は破壊的変更として扱う。
+/// 将来のフィールド追加は破壊的変更として扱う。
 /// 構築時は `ReconfigureParams::default()` を起点に必要なフィールドだけ更新する記述を推奨する。
 #[derive(Debug, Clone, Default)]
 pub struct ReconfigureParams {
@@ -145,6 +168,12 @@ pub struct ReconfigureParams {
     ///
     /// 詳細な正規化 / 再スケール挙動は [`Encoder::reconfigure`] の rustdoc を参照。
     pub expected_frame_rate: Option<u32>,
+
+    /// kVTCompressionPropertyKey_DataRateLimits
+    ///
+    /// `None` は現在値を維持する。`Some(空 Vec)` は設定済みの上限を解除する。
+    /// 詳細は [`DataRateLimit`] を参照。
+    pub data_rate_limits: Option<Vec<DataRateLimit>>,
 }
 
 // パラメータセット (VPS, SPS, PPS) のタプル型
@@ -163,6 +192,40 @@ fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
             field: "average_bitrate",
             reason: "must fit in i64 for CFNumber",
         });
+    }
+    Ok(())
+}
+
+/// `data_rate_limits` の境界を検証する
+///
+/// kVTCompressionPropertyKey_DataRateLimits は「0〜2 個のハードリミット」と規定されている
+/// (VTCompressionProperties.h)。
+fn validate_data_rate_limits(limits: &[DataRateLimit]) -> Result<(), Error> {
+    if limits.len() > 2 {
+        return Err(Error::InvalidConfig {
+            field: "data_rate_limits",
+            reason: "must contain at most two limits",
+        });
+    }
+    for limit in limits {
+        if limit.bytes == 0 {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "bytes must not be zero",
+            });
+        }
+        if limit.bytes > i64::MAX as u64 {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "bytes must fit in i64 for CFNumber",
+            });
+        }
+        if limit.window.is_zero() {
+            return Err(Error::InvalidConfig {
+                field: "data_rate_limits",
+                reason: "window must not be zero",
+            });
+        }
     }
     Ok(())
 }
@@ -198,6 +261,34 @@ fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
             reason: "must fit in i32 for CFNumber",
         });
     }
+    Ok(())
+}
+
+/// `data_rate_limits` を CFArray に変換して properties に追加する
+///
+/// kVTCompressionPropertyKey_DataRateLimits は「bytes, seconds を交互に並べた偶数個の
+/// CFNumber の CFArray」と規定されている (VTCompressionProperties.h)。
+/// CFArray は各要素を retain するため、要素の CFNumber は本関数内で drop してよい。
+fn push_data_rate_limits_property(
+    properties: &mut Vec<(sys::CFStringRef, *const c_void)>,
+    cf_objects: &mut Vec<CfPtr<c_void>>,
+    limits: &[DataRateLimit],
+) -> Result<(), Error> {
+    let mut elements: Vec<CfPtr<c_void>> = Vec::new();
+    let mut raw: Vec<*const c_void> = Vec::new();
+    for limit in limits {
+        let bytes = cf_number_i64(limit.bytes as i64)?;
+        let seconds = cf_number_f64(limit.window.as_secs_f64())?;
+        raw.push(bytes.0);
+        raw.push(seconds.0);
+        elements.push(bytes);
+        elements.push(seconds);
+    }
+    let array = cf_array(&raw)?;
+    unsafe {
+        properties.push((sys::kVTCompressionPropertyKey_DataRateLimits, array.0));
+    }
+    cf_objects.push(array);
     Ok(())
 }
 
@@ -275,8 +366,8 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
     ///
     /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは `average_bitrate` /
-    /// `fps_numerator` / `fps_denominator` の 3 項目のみで、その他のフィールドは
-    /// [`Encoder::new`] で渡した初期値のまま保持される。
+    /// `fps_numerator` / `fps_denominator` / `data_rate_limits` の 4 項目のみで、
+    /// その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -297,7 +388,10 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 解像度・コーデック・ピクセルフォーマットの変更はこの API では対応しないため [`Encoder`] を作り直す。
     pub fn reconfigure(&mut self, params: ReconfigureParams) -> Result<(), Error> {
         // 全項目 `None` のときは API 呼び出し自体を省略する
-        if params.average_bitrate.is_none() && params.expected_frame_rate.is_none() {
+        if params.average_bitrate.is_none()
+            && params.expected_frame_rate.is_none()
+            && params.data_rate_limits.is_none()
+        {
             return Ok(());
         }
 
@@ -337,6 +431,9 @@ impl<H: EncodeHandler> Encoder<H> {
                 properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
                 cf_objects.push(value);
             }
+            if let Some(ref limits) = params.data_rate_limits {
+                push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
+            }
 
             let properties_dict = cf_dictionary(&properties)?;
             let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
@@ -352,6 +449,14 @@ impl<H: EncodeHandler> Encoder<H> {
             // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
             self.config.fps_numerator = fps;
             self.config.fps_denominator = 1;
+        }
+        if let Some(limits) = params.data_rate_limits {
+            // 解除 (空 Vec) は「未設定」へ正規化し、`config()` の表現を一意にする
+            self.config.data_rate_limits = if limits.is_empty() {
+                None
+            } else {
+                Some(limits)
+            };
         }
         if let Some(new_pts) = rescaled_next_input_pts {
             self.next_input_pts = new_pts;
@@ -543,6 +648,13 @@ impl<H: EncodeHandler> Encoder<H> {
                     sys::kCFBooleanTrue.cast(),
                 ));
             }
+
+            // データレートのハードリミット (指定時のみ設定、空 Vec は未設定と同じ)
+            if let Some(limits) = &config.data_rate_limits
+                && !limits.is_empty()
+            {
+                push_data_rate_limits_property(properties, cf_objects, limits)?;
+            }
         }
         Ok(())
     }
@@ -596,6 +708,9 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(bitrate) = config.average_bitrate {
             validate_average_bitrate(bitrate)?;
         }
+        if let Some(limits) = &config.data_rate_limits {
+            validate_data_rate_limits(limits)?;
+        }
         Ok(())
     }
 
@@ -606,6 +721,9 @@ impl<H: EncodeHandler> Encoder<H> {
         }
         if let Some(fps) = params.expected_frame_rate {
             validate_expected_frame_rate(fps)?;
+        }
+        if let Some(ref limits) = params.data_rate_limits {
+            validate_data_rate_limits(limits)?;
         }
         Ok(())
     }
@@ -1450,6 +1568,7 @@ mod tests {
             max_key_frame_interval: None,
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
+            data_rate_limits: None,
         }
     }
 
@@ -1490,6 +1609,7 @@ mod tests {
         encoder.reconfigure(ReconfigureParams {
             average_bitrate: None,
             expected_frame_rate: Some(60),
+            data_rate_limits: None,
         })?;
 
         // 物理時間 2002/30000 ≒ 0.0667 秒に対応する新 timescale 60 での PTS は 4.004。
@@ -1519,6 +1639,7 @@ mod tests {
         encoder.reconfigure(ReconfigureParams {
             average_bitrate: Some(500_000),
             expected_frame_rate: None,
+            data_rate_limits: None,
         })?;
 
         assert_eq!(encoder.next_input_pts, before);
@@ -1541,6 +1662,7 @@ mod tests {
             .reconfigure(ReconfigureParams {
                 average_bitrate: None,
                 expected_frame_rate: Some(2),
+                data_rate_limits: None,
             })
             .expect_err("rescale should overflow");
         assert!(matches!(
