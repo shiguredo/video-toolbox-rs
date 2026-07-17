@@ -33,7 +33,8 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - 動的設定更新
   - エンコーダー: `Encoder::reconfigure()` で動的に更新 (対象項目は「動的設定更新」節を参照)
   - デコーダー: `Decoder::update_format()` でフォーマットを更新 (解像度変更を含む)
-- AVCC 形式の入出力
+- `Encoder::encode_pixel_buffer()` による CVPixelBuffer のゼロコピーエンコード
+- 圧縮映像フレーム単位の非同期入出力
 
 ## 動作要件
 
@@ -89,6 +90,7 @@ let config = EncoderConfig {
     max_key_frame_interval: None,
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
+    data_rate_limits: None,
 };
 
 let mut encoder = Encoder::new(config, FnEncodeHandler::new(
@@ -119,6 +121,22 @@ encoder.encode(&frame, &EncodeOptions {
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
+```
+
+#### CVPixelBuffer の直接エンコード
+
+`Encoder::encode_pixel_buffer()` へ CVPixelBuffer のポインターを渡すと、フレームデータをコピーせずにエンコードできます。
+この API はピクセルフォーマットだけを検証します。CVPixelBuffer の幅、高さ、プレーン構成を `EncoderConfig` と一致させ、エンコード前にアンロックすることは呼び出し側の責務です。
+
+```rust
+// pixel_buffer_ptr は有効かつアンロック済みの CVPixelBuffer ポインター
+unsafe {
+    encoder.encode_pixel_buffer(
+        pixel_buffer_ptr,
+        &EncodeOptions::default(),
+        2,
+    )?;
+}
 ```
 
 ### デコード
@@ -181,6 +199,20 @@ decoder.finish()?;
 | `max_key_frame_interval` | `Option<NonZeroU32>` | 最大キーフレーム間隔 (フレーム数) |
 | `max_key_frame_interval_duration` | `Option<Duration>` | 最大キーフレーム間隔 (秒数) |
 | `max_frame_delay_count` | `Option<NonZeroU32>` | フレーム遅延制限 |
+| `data_rate_limits` | `Option<Vec<DataRateLimit>>` | 短期ウィンドウごとのデータレート上限 |
+
+### `DataRateLimit`
+
+`kVTCompressionPropertyKey_DataRateLimits` に対応するデータレートのハードリミットです。
+`bytes` で `window` の期間内に生成できる圧縮データの総バイト数を指定します。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `bytes` | `u64` | ウィンドウあたりの総バイト数の上限 |
+| `window` | `Duration` | ウィンドウの長さ |
+
+指定できるリミットは最大 2 個です。`bytes` と `window` には 0 を指定できず、`bytes` は `i64::MAX` 以下である必要があります。
+`EncoderConfig::data_rate_limits` の `None` と空の `Vec` は未設定として扱われます。
 
 ### `DecoderConfig`
 
@@ -291,8 +323,13 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
 `Encoder` を作り直して対応します。
 
+`data_rate_limits` に空の `Vec` を指定すると、設定済みのデータレート上限を解除します。
+
 `expected_frame_rate` を更新すると `fps_numerator` / `fps_denominator` は `expected_frame_rate / 1` に
 正規化されます (分数 fps は保持されません)。分数 fps を保持したい場合は `Encoder` を作り直してください。
+
+`Encoder::config()` は、初期化時の設定に直近の動的更新を反映した値を返します。
+Video Toolbox が内部で丸めた実効値ではありません。
 
 ```rust
 use shiguredo_video_toolbox::ReconfigureParams;
