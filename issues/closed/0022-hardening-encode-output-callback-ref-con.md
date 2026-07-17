@@ -1,6 +1,6 @@
 # エンコード出力コールバックの `output_callback_ref_con` と `unsafe` 契約を実装側で明示する
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

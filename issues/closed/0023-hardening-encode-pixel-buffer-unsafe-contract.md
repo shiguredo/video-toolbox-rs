@@ -1,6 +1,6 @@
 # `Encoder::encode_pixel_buffer` の `pixel_buffer_ptr` 前提を公開 API で明確化する
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

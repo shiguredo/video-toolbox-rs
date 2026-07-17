@@ -1,7 +1,7 @@
 # `supported_codecs` のデコード可否がハードウェア判定のみであることを API ドキュメントに明記する
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

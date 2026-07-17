@@ -1,7 +1,7 @@
 # `CFDictionaryCreate` / `CFNumberCreate` の戻り NULL を扱っていない
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

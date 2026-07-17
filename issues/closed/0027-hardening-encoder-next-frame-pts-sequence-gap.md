@@ -1,6 +1,6 @@
 # `Encoder::next_frame` が期待する PTS 列と実出力にギャップがあるとフレームが取り出せず詰まる
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## 分類

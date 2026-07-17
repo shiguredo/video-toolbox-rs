@@ -1,7 +1,7 @@
 # `fps_numerator == 0` と `CMTimeMake` の組み合わせが検証されていない
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

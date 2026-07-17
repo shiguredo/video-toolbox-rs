@@ -1,7 +1,7 @@
 # `process_encoded_output` で `CMBlockBufferGetDataPointer` の戻り長を全データ長として扱うと非連続バッファでフレームが切り詰められる
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
