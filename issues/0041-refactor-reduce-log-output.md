@@ -1,6 +1,7 @@
 # ログ出力を削減し、エラー情報をユーザーに伝搬する
 
 Created: 2026-05-13
+Updated: 2026-07-21
 Model: deepseek-v4-pro
 
 ## 方針
@@ -15,7 +16,7 @@ Model: deepseek-v4-pro
 
 現在 `log::error!()` が存在する箇所（全 17 箇所）:
 
-- encoder.rs: 865, 876, 978, 1042, 1057, 1061, 1086, 1106, 1121, 1125, 1155, 1249, 1259
+- encoder.rs: 1119, 1130, 1232, 1296, 1311, 1315, 1340, 1360, 1375, 1379, 1409, 1503, 1513
 - decoder.rs: 408, 419, 507
 - types.rs: 53
 
@@ -36,7 +37,7 @@ Model: deepseek-v4-pro
 
 ### 1. Error 型の全 `&'static str` フィールドを `String` に変更する
 
-現状の `Error` 型（`src/error.rs:4-51`）では以下の全 7 フィールドが `&'static str` に制約されている:
+現状の `Error` 型（`src/error.rs:4-58`）では以下の全 7 フィールドが `&'static str` に制約されている:
 
 - `VideoToolbox.function`
 - `InsufficientFrameData.plane`
@@ -44,6 +45,8 @@ Model: deepseek-v4-pro
 - `InvalidConfig.field`, `InvalidConfig.reason`
 - `LimitExceeded.reason`
 - `CfObjectCreationFailed.function`
+
+なお `UnknownPixelFormat` バリアント（`expected: PixelFormat`, `fourcc: u32`）は文字列フィールドを持たないため本変更の対象外である。
 
 フィールド型を一律 `&'static str` のままにしておくと、今後動的な値を含めたくなったときに都度破壊的変更が必要になる。すべて `String` に一括変更する。
 
@@ -83,7 +86,7 @@ pub enum Error {
 
 #### Error::check() のシグネチャ変更
 
-`Error::check()` （error.rs:54）は `function: &'static str` を受け取り `Error::VideoToolbox { function }` を生成している。 `VideoToolbox.function` を `String` に変更するのに合わせ、パラメータ型を `function: impl Into<String>` に変更する:
+`Error::check()` （error.rs:61）は `function: &'static str` を受け取り `Error::VideoToolbox { function }` を生成している。 `VideoToolbox.function` を `String` に変更するのに合わせ、パラメータ型を `function: impl Into<String>` に変更する:
 
 ```rust
 // 変更前
@@ -100,7 +103,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 
 #### Display 実装への影響
 
-`Display` 実装（error.rs:62-108）は全フィールドを `write!(f, "...{field}...")` 形式で表示しており、 `&'static str` も `String` も `Display` を実装しているため、型変更後もコード修正は不要。
+`Display` 実装（error.rs:69-121）は全フィールドを `write!(f, "...{field}...")` 形式で表示しており、 `&'static str` も `String` も `Display` を実装しているため、型変更後もコード修正は不要。
 
 #### API 互換性
 
@@ -110,17 +113,23 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 
 `String` 化により `.to_string()` または `String::from(...)` が必要になる全箇所:
 
-- `types.rs:9-31` `validate_video_dimensions_for_toolbox` — 4 箇所（`InvalidConfig { field, reason }`）
-- `types.rs:93-97` `cf_dictionary` — 1 箇所（`CfObjectCreationFailed { function }`）
-- `types.rs:109-113` `cf_number_i32` — 1 箇所（同上）
-- `types.rs:126-130` `cf_number_i64` — 1 箇所（同上）
-- `types.rs:142-146` `cf_number_f64` — 1 箇所（同上）
-- `encoder.rs:451-477` `validate_config` — 4 箇所（`InvalidConfig { field, reason }`）
-- `encoder.rs:494-569` `copy_plane` — 10 箇所（`LimitExceeded { reason }`）
-- `encoder.rs:577-626` `validate_frame_data` — 6 箇所（`InsufficientFrameData { plane, expected, actual }`）
-- `encoder.rs:630-633` `frame_byte_len_checked` — 1 箇所（`LimitExceeded { reason }`）
-- `encoder.rs:955-1013` `process_encoded_output` — 5 箇所（`LimitExceeded { reason }`）
-- `encoder.rs:751-752` `encode` / `encode_pixel_buffer` PTS overflow — 2 箇所（`LimitExceeded { reason }`）
+- `types.rs:6-33` `validate_video_dimensions_for_toolbox` — 4 箇所（`InvalidConfig { field, reason }`）
+- `types.rs:78-99` `cf_dictionary` — 1 箇所（`CfObjectCreationFailed { function }`）
+- `types.rs:105-120` `cf_array` — 1 箇所（同上）
+- `types.rs:122-136` `cf_number_i32` — 1 箇所（同上）
+- `types.rs:138-152` `cf_number_i64` — 1 箇所（同上）
+- `types.rs:154-168` `cf_number_f64` — 1 箇所（同上）
+- `encoder.rs:183-197` `validate_average_bitrate` — 2 箇所（`InvalidConfig { field, reason }`）
+- `encoder.rs:203-231` `validate_data_rate_limits` — 4 箇所（同上）
+- `encoder.rs:234-248` `validate_fps_numerator` — 2 箇所（同上）
+- `encoder.rs:251-265` `validate_expected_frame_rate` — 2 箇所（`reconfigure` 経路のみ、同上）
+- `encoder.rs:708-724` `validate_config` — 1 箇所（`fps_denominator`、上記 validators に大半が切り出し済み）
+- `encoder.rs:744-829` `copy_plane` — 10 箇所（`LimitExceeded { reason }`）
+- `encoder.rs:832-885` `validate_frame_data` — 5 箇所（`InsufficientFrameData { plane, expected, actual }`）
+- `encoder.rs:888-892` `frame_byte_len_checked` — 1 箇所（`LimitExceeded { reason }`）
+- `encoder.rs:402-477` `Encoder::reconfigure` — 1 箇所（`LimitExceeded { reason: "rescaled presentation timestamp overflow" }`）
+- `encoder.rs:1183-1286` `process_encoded_output` — 5 箇所（`LimitExceeded { reason }`）
+- `encoder.rs:1012, 1096` `encode` / `encode_pixel_buffer` PTS overflow — 2 箇所（`LimitExceeded { reason }`）
 - `decoder.rs:153,157` `wrap_unsupported_codec_error` — 2 箇所（`UnsupportedCodec { codec }`）
 - `decoder.rs:467-468` `output_callback` — 1 箇所（`LimitExceeded { reason }`）
 
@@ -128,7 +137,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 
 現状 `Option` を返しつつ `log::error!()` でエラー内容を出力している関数を `Result` に変更し、エラー情報を呼び出し元に伝搬する。
 
-#### 2.1 `vec_u8_from_raw_parts_safe` (encoder.rs:1243)
+#### 2.1 `vec_u8_from_raw_parts_safe` (encoder.rs:1497)
 
 現在の戻り値: `Option<Vec<u8>>`
 
@@ -137,7 +146,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 | `len > MAX_PARAMETER_SET_COPY_BYTES` | `LimitExceeded { reason: format!("{context}: parameter set length {len} exceeds defensive maximum {max}", max = MAX_PARAMETER_SET_COPY_BYTES) }` |
 | `ptr.is_null() && len > 0` | `LimitExceeded { reason: format!("{context}: null pointer with non-zero length") }` |
 
-#### 2.2 `extract_h264_params` (encoder.rs:1037)
+#### 2.2 `extract_h264_params` (encoder.rs:1291)
 
 現在の戻り値: `Option<ParameterSets>`
 
@@ -151,7 +160,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 
 関数ポインタ型の変更: `process_encoded_output` の引数 `extract_params` の型を `unsafe fn(sys::CMVideoFormatDescriptionRef) -> Option<ParameterSets>` から `unsafe fn(sys::CMVideoFormatDescriptionRef) -> Result<ParameterSets, Error>` に変更する。
 
-#### 2.3 `extract_h265_params` (encoder.rs:1101)
+#### 2.3 `extract_h265_params` (encoder.rs:1355)
 
 現在の戻り値: `Option<ParameterSets>`
 
@@ -163,7 +172,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 | CMVideoFormatDescriptionGetHEVCParameterSetAtIndex 失敗 (2 回目以降) | `VideoToolbox { status, function: "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex".into() }` |
 | vec_u8_from_raw_parts_safe 失敗 | 伝搬（`?` 演算子） |
 
-#### 2.4 `take_user_data` (encoder.rs:860)
+#### 2.4 `take_user_data` (encoder.rs:1114)
 
 現在の戻り値: `Option<H::UserData>`
 
@@ -186,7 +195,7 @@ pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self
 処理順序を `callback_from_ref_con` → `take_user_data`/`take_pending_decode` に変更し、 `take_user_data`/`take_pending_decode` の失敗をハンドラ経由でユーザーに伝搬できるようにする。
 
 対象箇所:
-- encoder.rs: `process_encoded_output`（929 行付近）
+- encoder.rs: `process_encoded_output`（1183 行付近）
 - decoder.rs: `output_callback`（433 行付近）
 
 #### 安全性の検証
@@ -352,30 +361,30 @@ unsafe extern "C" fn output_callback(
 
 | ファイル | 行 | 理由 |
 |---|---|---|
-| encoder.rs | 865 | `take_user_data` → `Result` 化でハンドラ経由伝搬 |
-| encoder.rs | 978 | `LimitExceeded.reason` に動的値を含めて伝搬 |
-| encoder.rs | 1042 | `extract_h264_params` → `Result` 化で伝搬 |
-| encoder.rs | 1057 | 同上 |
-| encoder.rs | 1061 | 同上 |
-| encoder.rs | 1086 | 同上 |
-| encoder.rs | 1106 | `extract_h265_params` → `Result` 化で伝搬 |
-| encoder.rs | 1121 | 同上 |
-| encoder.rs | 1125 | 同上 |
-| encoder.rs | 1155 | 同上 |
-| encoder.rs | 1249 | `vec_u8_from_raw_parts_safe` → `Result` 化で伝搬 |
-| encoder.rs | 1259 | 同上 |
+| encoder.rs | 1119 | `take_user_data` → `Result` 化でハンドラ経由伝搬 |
+| encoder.rs | 1232 | `LimitExceeded.reason` に動的値を含めて伝搬 |
+| encoder.rs | 1296 | `extract_h264_params` → `Result` 化で伝搬 |
+| encoder.rs | 1311 | 同上 |
+| encoder.rs | 1315 | 同上 |
+| encoder.rs | 1340 | 同上 |
+| encoder.rs | 1360 | `extract_h265_params` → `Result` 化で伝搬 |
+| encoder.rs | 1375 | 同上 |
+| encoder.rs | 1379 | 同上 |
+| encoder.rs | 1409 | 同上 |
+| encoder.rs | 1503 | `vec_u8_from_raw_parts_safe` → `Result` 化で伝搬 |
+| encoder.rs | 1513 | 同上 |
 | decoder.rs | 408 | `take_pending_decode` → `Result` 化で伝搬（順序入れ替え後） |
 
 ## 対象外
 
 以下はエラーの伝搬先が存在しないため、ログ出力を残す:
 
-- `callback_from_ref_con` の null チェック（encoder.rs:876 / decoder.rs:419）: ハンドラポインタ自体が null であり伝搬先がない
+- `callback_from_ref_con` の null チェック（encoder.rs:1130 / decoder.rs:419）: ハンドラポインタ自体が null であり伝搬先がない
 - Drop 実装内のエラー:
   - decoder.rs:507（`Decoder::drop` 内の `self.finish()` 失敗）
   - types.rs:53（`CvPixelBufferUnlockGuard::drop` 内のアンロック失敗）
 
-エンコーダー側の Drop 実装（encoder.rs:1169-1176）は `VTCompressionSessionInvalidate` + `CFRelease` のみで `log::error!()` を含んでおらず、対応不要。
+エンコーダー側の Drop 実装（encoder.rs:1423-1430）は `VTCompressionSessionInvalidate` + `CFRelease` のみで `log::error!()` を含んでおらず、対応不要。
 
 ## テスト戦略
 
@@ -384,8 +393,8 @@ unsafe extern "C" fn output_callback(
 `Error` の `String` フィールド化に伴い、以下のテスト修正が必要:
 
 - **`tests/test_encoder.rs`**: `matches!()` マクロでのパターンマッチを修正する
-  - `Error::InvalidConfig { field: "width", .. }` 等、 `reason` を `..` で無視している 9 箇所は変更不要
-  - `Error::InvalidConfig { field: "fps_numerator", reason: "must not be zero" }` （1 箇所）: `reason` が `String` になるため `&str` リテラルと直接マッチできなくなる。 match guard を用いて `reason if reason == "must not be zero"` に変更する
+  - `Error::InvalidConfig { field: "width", .. }` 等、 `reason` を `..` で無視している 7 箇所は変更不要
+  - `Error::InvalidConfig { field: ..., reason: "..." }` の形で `reason` にリテラルを書いている箇所（11 箇所: `fps_numerator` / `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の各 must not be zero / must fit in ... / must contain at most two limits 系）: `reason` が `String` になるため `&str` リテラルと直接マッチできなくなる。 match guard を用いて `reason if reason == "must not be zero"` 形式に変更する
 - **`tests/test_decoder.rs`**: `Error::InvalidConfig { field: "width", .. }` 等 `reason` を無視している 2 箇所は変更不要
 - **`tests/test_error.rs`**: リテラルによる `Error` 構築箇所に `.into()` を追加する
 - **手戻り防止**: テスト修正後に `cargo test` で全テストがパスすることを確認する
