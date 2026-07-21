@@ -1,19 +1,20 @@
-# `src/encoder.rs` (1557 行) のモジュール分割を検討する
+# `src/encoder.rs` (1677 行) のモジュール分割を検討する
 
 - Priority: Low
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/change-split-encoder-module
 
 ## 目的
 
-`src/encoder.rs` が 1557 行に達しており、CLAUDE.md の「テストが長くなるのはモジュール自体が大きすぎるサイン → `src/<module>.rs` 側の分割を検討する」目安に該当する。1 ファイルに以下の責務が同居している:
+`src/encoder.rs` が 1677 行に達しており、CLAUDE.md の「テストが長くなるのはモジュール自体が大きすぎるサイン → `src/<module>.rs` 側の分割を検討する」目安に該当する。1 ファイルに以下の責務が同居している:
 
-1. 公開型定義 (`EncoderConfig` / `ReconfigureParams` / `EncodeOptions` / `H264EncoderConfig` / `HevcEncoderConfig` / `CodecConfig` / `FrameData` / `EncodedFrame` / `EncodeHandler` trait / `FnEncodeHandler`)
-2. バリデーション (`validate_config` / `validate_reconfigure_params` / `validate_*` ヘルパー)
+1. 公開型定義 (`EncoderConfig` / `ReconfigureParams` / `EncodeOptions` / `DataRateLimit` / `H264EncoderConfig` / `HevcEncoderConfig` / `CodecConfig` / `FrameData` / `EncodedFrame` / `EncodeHandler` trait / `FnEncodeHandler`)
+2. バリデーション (`validate_config` / `validate_reconfigure_params` / `validate_average_bitrate` / `validate_fps_numerator` / `validate_expected_frame_rate` / `validate_data_rate_limits`)
 3. `Encoder<H>` の lifecycle (`new` / `reconfigure` / `finish` / `Drop`)
-4. FFI セッション生成 (`create_compression_session` / `add_common_properties` / `add_h264_specific_properties` / `add_h265_specific_properties`)
+4. FFI セッション生成 (`create_compression_session` / `add_common_properties` / `add_h264_specific_properties` / `add_h265_specific_properties` / `push_data_rate_limits_property`)
 5. CVPixelBuffer 操作 (`copy_plane` / `validate_frame_data`)
 6. 出力コールバック (`output_callback_h264` / `output_callback_h265` / 各種パラメータセット抽出)
 
@@ -34,13 +35,15 @@
 - `HevcProfile` / `HevcEncoderConfig`
 - `CodecConfig`
 - `EncoderConfig`
+- `DataRateLimit`
 - `EncodeOptions`
 - `ReconfigureParams`
-- `validate_average_bitrate` / `validate_fps_numerator` / `validate_expected_frame_rate`
+- `validate_average_bitrate` / `validate_data_rate_limits` / `validate_fps_numerator` / `validate_expected_frame_rate`
+- `push_data_rate_limits_property` (フリー関数)
 - `FrameData<'a>`
 - `EncodedFrame<T>`
 - `EncodeHandler` trait + `FnEncodeHandler`
-- `Encoder<H>` 構造体 + impl ブロック (約 1100 行)
+- `Encoder<H>` 構造体 + impl ブロック (約 1070 行)
   - `new` / `config` / `reconfigure` / `finish` / `Drop`
   - `create_compression_session`
   - `add_common_properties` / `add_h264_specific_properties` / `add_h265_specific_properties`
@@ -48,9 +51,10 @@
   - `copy_plane` / `validate_frame_data` / `frame_byte_len_checked`
   - `encode` / `encode_pixel_buffer`
   - `output_callback_h264` / `output_callback_h265`
-  - `extract_h264_params` / `extract_h265_params` (おそらく)
-  - `process_encoded_output`
-  - `is_keyframe`
+  - `extract_h264_params` / `extract_h265_params`
+  - `process_encoded_output` / `take_user_data` / `callback_from_ref_con` / `invoke_callback`
+- `is_keyframe` / `vec_u8_from_raw_parts_safe` (フリー関数)
+- `MAX_PARAMETER_SET_COPY_BYTES` / `MAX_ENCODED_BLOCK_COPY_BYTES` (定数)
 - `#[cfg(test)] mod tests`
 
 ## 設計方針
