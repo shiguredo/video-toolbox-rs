@@ -2,15 +2,16 @@
 
 - Priority: Low
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/fix-share-encoder-property-builders
 
 ## 目的
 
-`Encoder` 内で `kVTCompressionPropertyKey_AverageBitRate` と `kVTCompressionPropertyKey_ExpectedFrameRate` を CFNumber 化して `properties` Vec に push する処理が、`add_common_properties` (`src/encoder.rs:446-548` 付近) と `reconfigure` (`src/encoder.rs:323-346` 付近) の 2 ヶ所に重複している。さらに `reconfigure` 側では `cf_objects: Vec<CfPtr<c_void>>` の使い方が `add_common_properties` の慣習と乖離している。
+`Encoder` 内で `kVTCompressionPropertyKey_AverageBitRate` と `kVTCompressionPropertyKey_ExpectedFrameRate` を CFNumber 化して `properties` Vec に push する処理が、`add_common_properties` (`src/encoder.rs:562-669` 付近) と `reconfigure` (`src/encoder.rs:402-477` 付近) の 2 ヶ所に重複している。さらに `reconfigure` 側では `cf_objects: Vec<CfPtr<c_void>>` の使い方が `add_common_properties` の慣習と乖離している。
 
-将来 `DataRateLimits` などの動的更新可能項目を増やすと、3 ヶ所目以降の追記が発生する前兆。
+将来 `DataRateLimits` などの動的更新可能項目を増やすと、3 ヶ所目以降の追記が発生する前兆（実際に `DataRateLimits` は `push_data_rate_limits_property` として共通化ヘルパー化されており、`add_common_properties` と `reconfigure` の両方から呼ばれている）。
 
 ## 優先度根拠
 
