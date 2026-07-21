@@ -2,41 +2,45 @@
 
 - Priority: Medium
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/add-pts-rescale-downscale-boundary-test
 
 ## 目的
 
-`Encoder::reconfigure` は `expected_frame_rate` 更新時に `next_input_pts` を新 timescale に **切り上げ (`div_ceil`)** で再スケールする (`src/encoder.rs:307-321`)。この切り上げを採用した理由はコメントで「切り捨てだと `new_timescale < old_timescale` 時に rescaled が潰れて逆行し得る」と明示されている。しかし、それを **回帰テスト** で押さえる検証ケースが現状無い。
+`Encoder::reconfigure` は `expected_frame_rate` 更新時に `next_input_pts` を新 timescale に **切り上げ (`div_ceil`)** で再スケールする (`src/encoder.rs:411-424`)。この切り上げを採用した理由はコメントで「切り捨てだと `new_timescale < old_timescale` 時に rescaled が潰れて逆行し得る」と明示されている。しかし、それを **回帰テスト** で押さえる検証ケースが現状無い。
 
-既存の `reconfigure_rescales_next_input_pts_on_frame_rate_change` (`src/encoder.rs:1471-1501` 内部テスト) は 30000/1001 → 60 の `new_timescale > old_timescale` 方向だけを確認しており、切り下げ方向 (`new_timescale < old_timescale`) は未検証。将来誰かが `div_ceil` を `/` に書き戻しても、現テストではすり抜ける。
+既存の `reconfigure_rescales_next_input_pts_on_frame_rate_change` (`src/encoder.rs:1593-1622` 内部テスト) は 30000/1001 → 60 の `new_timescale > old_timescale` 方向だけを確認しており、切り下げ方向 (`new_timescale < old_timescale`) は未検証。将来誰かが `div_ceil` を `/` に書き戻しても、現テストではすり抜ける。
 
 ## 優先度根拠
 
 - 切り上げの逆行防止効果は公開 API の品質保証として重要 (PTS 単調性は WebRTC 受信側の前提)
 - 現状すり抜ける可能性があるが、即座のバグではないので Medium
-- 切り上げを採用した設計判断 (`src/encoder.rs:308-309` のコメント参照) を保護するテストとして必須
+- 切り上げを採用した設計判断 (`src/encoder.rs:407-408` のコメント参照) を保護するテストとして必須
 
 ## 現状
 
-`src/encoder.rs:307-321` の再スケール本体:
+`src/encoder.rs:411-424` の再スケール本体:
 
 ```rust
 let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
-    let old_timescale = self.config.fps_numerator as i128;
-    let new_timescale = fps as i128;
-    let old_pts = self.next_input_pts as i128;
-    let product = old_pts * new_timescale;
-    let rescaled = (product + old_timescale - 1) / old_timescale; // div_ceil
-    if !(i64::MIN as i128..=i64::MAX as i128).contains(&rescaled) {
-        return Err(Error::LimitExceeded { reason: "rescaled presentation timestamp overflow" });
+    let old_timescale = self.config.fps_numerator as u128;
+    let new_timescale = fps as u128;
+    let old_pts = self.next_input_pts as u128;
+    let rescaled = (old_pts * new_timescale).div_ceil(old_timescale);
+    if rescaled > i64::MAX as u128 {
+        return Err(Error::LimitExceeded {
+            reason: "rescaled presentation timestamp overflow",
+        });
     }
     Some(rescaled as i64)
 } else {
     None
 };
 ```
+
+`next_input_pts` は 0 開始で加算しかされない非負値なので `u128` で計算し、上限のみを `i64::MAX` と比較している。
 
 `new_timescale < old_timescale` のときに切り捨て (`/`) を使うと、`old_pts > 0` の小さい値で `rescaled == 0` になり、直前出力フレームより小さい PTS になって逆行する。それを切り上げで防いでいる。
 
@@ -84,8 +88,8 @@ fn reconfigure_rescales_next_input_pts_ceils_when_new_timescale_smaller() -> Res
     encoder.next_input_pts = 1;
 
     encoder.reconfigure(ReconfigureParams {
-        average_bitrate: None,
         expected_frame_rate: Some(30),
+        ..Default::default()
     })?;
 
     assert_eq!(encoder.config().fps_numerator, 30);
