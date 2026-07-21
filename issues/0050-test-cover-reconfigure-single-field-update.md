@@ -2,15 +2,16 @@
 
 - Priority: Medium
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/add-reconfigure-single-field-update-tests
 
 ## 目的
 
-`Encoder::reconfigure` の成功系 integration test (`tests/test_encoder.rs:420-436` の `reconfigure_updates_config_on_success`) は `average_bitrate` と `expected_frame_rate` を **両方同時に** 指定するケースのみを検証している。「`average_bitrate` のみ更新 (fps は不変)」「`expected_frame_rate` のみ更新 (bitrate は不変)」という単独更新パスが `tests/` 側に存在しない。
+`Encoder::reconfigure` の成功系 integration test (`tests/test_encoder.rs:411-425` の `reconfigure_updates_config_on_success`) は `average_bitrate` と `expected_frame_rate` を **両方同時に** 指定するケースのみを検証している。「`average_bitrate` のみ更新 (fps は不変)」「`expected_frame_rate` のみ更新 (bitrate は不変)」という単独更新パスが `tests/` 側に存在しない。
 
-`src/encoder.rs:347-355` 付近の `if let Some(bitrate)` / `if let Some(fps)` 片肺更新パスを独立に保護する回帰テストが不足している。
+`src/encoder.rs:456-463` 付近の `if let Some(bitrate)` / `if let Some(fps)` 片肺更新パスを独立に保護する回帰テストが不足している。
 
 ## 優先度根拠
 
@@ -20,17 +21,18 @@
 
 ## 現状
 
-- `tests/test_encoder.rs:420-436` の `reconfigure_updates_config_on_success` は両方更新のみを検証
-- `tests/test_encoder.rs:438-452` の `reconfigure_is_noop_when_all_none` は両方 `None` のみを検証
-- 片肺更新を行うテストは無い
+- `tests/test_encoder.rs:411-425` の `reconfigure_updates_config_on_success` は両方更新のみを検証
+- `tests/test_encoder.rs:427-439` の `reconfigure_is_noop_when_all_none` は両方 `None` のみを検証
+- 片肺更新を行うテストは無い（`data_rate_limits` 単独更新については `reconfigure_updates_data_rate_limits` が別途カバーしているが、bitrate / fps の単独更新は未カバー）
 
-実装側 (`src/encoder.rs:347-355` 付近):
+実装側 (`src/encoder.rs:456-463` 付近):
 
 ```rust
 if let Some(bitrate) = params.average_bitrate {
     self.config.average_bitrate = Some(bitrate);
 }
 if let Some(fps) = params.expected_frame_rate {
+    // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
     self.config.fps_numerator = fps;
     self.config.fps_denominator = 1;
 }
@@ -70,7 +72,7 @@ fn reconfigure_updates_only_average_bitrate() -> Result<(), Error> {
     )?;
     encoder.reconfigure(ReconfigureParams {
         average_bitrate: Some(250_000),
-        expected_frame_rate: None,
+        ..Default::default()
     })?;
     assert_eq!(encoder.config().average_bitrate, Some(250_000));
     assert_eq!(encoder.config().fps_numerator, initial_fps_num);
@@ -87,8 +89,8 @@ fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
         FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {}),
     )?;
     encoder.reconfigure(ReconfigureParams {
-        average_bitrate: None,
         expected_frame_rate: Some(60),
+        ..Default::default()
     })?;
     assert_eq!(encoder.config().average_bitrate, initial_bitrate);
     assert_eq!(encoder.config().fps_numerator, 60);
