@@ -2,6 +2,7 @@
 
 - Priority: Low
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/fix-tighten-encoder-test-assertions
@@ -11,10 +12,10 @@
 `tests/test_encoder.rs` のテストでスタイル不統一とアサーション強度不足が混在している。
 
 1. **`encoder_rejects_*` 系の `reason` 文字列が固定されていない**
-  - 新規追加された `reconfigure_rejects_*` 系 (`tests/test_encoder.rs:455-552`) は `reason` 文字列まで `matches!` で固定している
-  - 既存の `encoder_rejects_fps_numerator_above_i32_max` (`tests/test_encoder.rs:233-246`)、`encoder_rejects_average_bitrate_above_i64_max` (`tests/test_encoder.rs:278-291`) は `field` までしか固定していない
+  - 新規追加された `reconfigure_rejects_*` 系 (`tests/test_encoder.rs:441-614`、`data_rate_limits` 系まで含む) は `reason` 文字列まで `matches!` で固定している
+  - 既存の `encoder_rejects_fps_numerator_above_i32_max` (`tests/test_encoder.rs:242-253`)、`encoder_rejects_average_bitrate_above_i64_max` (`tests/test_encoder.rs:278-289`) は `field` までしか固定していない
   - `validate_*` ヘルパー化 (0046 で更に統合予定) により `reason` 文字列が独立した契約になったので、固定する方が回帰検出力が上がる
-2. **`reconfigure_is_noop_when_all_none` (`tests/test_encoder.rs:438-452`) は config 不変のみ確認**
+2. **`reconfigure_is_noop_when_all_none` (`tests/test_encoder.rs:427-439`) は config 不変のみ確認**
   - issue 0043 の当初設計では「no-op 後に `encode` が成功する」も期待値として書かれていたが、現状実装には反映されていない
   - VTSessionSetProperties が呼ばれていない確認は FFI 内部に踏み込めないので妥当として、最低限「その後の `encode` が成功する」ことを追加検証することでセッション破壊が起きていないことを保証できる
 
@@ -31,8 +32,8 @@
 固定されている例 (新規追加):
 
 ```rust
-// tests/test_encoder.rs:455-474
-let err = encoder.reconfigure(ReconfigureParams { average_bitrate: Some(0), ... }).unwrap_err();
+// tests/test_encoder.rs:441-453
+let err = encoder.reconfigure(ReconfigureParams { average_bitrate: Some(0), ..Default::default() }).unwrap_err();
 assert!(matches!(
     err,
     Error::InvalidConfig {
@@ -45,7 +46,7 @@ assert!(matches!(
 固定されていない例 (既存):
 
 ```rust
-// tests/test_encoder.rs:233-246
+// tests/test_encoder.rs:242-253
 assert!(matches!(
     Encoder::new(c, ...),
     Err(Error::InvalidConfig { field: "fps_numerator", .. })
@@ -55,7 +56,7 @@ assert!(matches!(
 ### 2. `reconfigure_is_noop_when_all_none` の検証
 
 ```rust
-// tests/test_encoder.rs:438-452
+// tests/test_encoder.rs:427-439
 encoder.reconfigure(ReconfigureParams::default())?;
 assert_eq!(encoder.config().average_bitrate, before_bitrate);
 assert_eq!(encoder.config().fps_numerator, before_fps_num);
