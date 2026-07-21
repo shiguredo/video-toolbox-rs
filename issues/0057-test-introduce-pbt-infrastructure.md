@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-16
+- Updated: 2026-07-21
 - Completed:
 - Model: Fable 5
 - Branch: feature/add-pbt-infrastructure
@@ -15,15 +16,15 @@ AGENTS.md は「PBT(Property-Based Testing) や Fuzzing でテストを行うこ
 
 本クレートは実ハードウェア (Video Toolbox) を叩く FFI クレートのため PBT の適用範囲は純ロジックに限られるが、その純ロジックが直近の変更で増えている:
 
-- `validate_average_bitrate` (`src/encoder.rs:185-199`)
-- `validate_data_rate_limits` (`src/encoder.rs:205-233`)
-- `validate_fps_numerator` (`src/encoder.rs:236-250`)
-- `validate_expected_frame_rate` (`src/encoder.rs:253-267`)
+- `validate_average_bitrate` (`src/encoder.rs:183-197`)
+- `validate_data_rate_limits` (`src/encoder.rs:203-231`)
+- `validate_fps_numerator` (`src/encoder.rs:234-248`)
+- `validate_expected_frame_rate` (`src/encoder.rs:251-265`)
 - `validate_video_dimensions_for_toolbox` (`src/types.rs:6-33`)
-- `validate_frame_data` / `frame_byte_len_checked` (`src/encoder.rs:832-893`)
+- `validate_frame_data` / `frame_byte_len_checked` (`src/encoder.rs:832-892`)
 - `Encoder::reconfigure` 内の PTS 再スケール演算 (`src/encoder.rs:411-424` の `div_ceil` による切り上げ)
 
-特に PTS 再スケールは「物理時間としての単調性 (rescaled / new_timescale >= old_pts / old_timescale)」「切り上げの最小性」という PBT 向きのプロパティを持つのに、`Encoder` のメソッド内に埋め込まれているため実機セッション無しではテストできず、現状は example ベースの内部テスト 3 本 (`src/encoder.rs:1599-1683`) しか無い。
+特に PTS 再スケールは「物理時間としての単調性 (rescaled / new_timescale >= old_pts / old_timescale)」「切り上げの最小性」という PBT 向きのプロパティを持つのに、`Encoder` のメソッド内に埋め込まれているため実機セッション無しではテストできず、現状は example ベースの内部テスト 3 本 (`src/encoder.rs:1594-1676`) しか無い。
 
 ## 優先度根拠
 
