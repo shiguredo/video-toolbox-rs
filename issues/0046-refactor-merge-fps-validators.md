@@ -2,13 +2,14 @@
 
 - Priority: Low
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/fix-merge-fps-validators
 
 ## 目的
 
-`validate_fps_numerator` (`src/encoder.rs:175-190`) と `validate_expected_frame_rate` (`src/encoder.rs:192-207`) が同一ロジック (`u32` 値の「ゼロ拒否 + `i32::MAX` 上限拒否」) を持ち、差分はエラー時の `field` / `reason` 文字列のみ。コピペで増殖した状態を放置すると、将来 `i32` 上限境界の判定をひとつ変えるときに片方を直し忘れる典型的な保守事故が起きる。
+`validate_fps_numerator` (`src/encoder.rs:234-248`) と `validate_expected_frame_rate` (`src/encoder.rs:251-265`) が同一ロジック (`u32` 値の「ゼロ拒否 + `i32::MAX` 上限拒否」) を持ち、差分はエラー時の `field` / `reason` 文字列のみ。コピペで増殖した状態を放置すると、将来 `i32` 上限境界の判定をひとつ変えるときに片方を直し忘れる典型的な保守事故が起きる。
 
 ## 優先度根拠
 
@@ -19,7 +20,7 @@
 ## 現状
 
 ```rust
-// src/encoder.rs:175-190
+// src/encoder.rs:234-248
 fn validate_fps_numerator(value: u32) -> Result<(), Error> {
     if value == 0 {
         return Err(Error::InvalidConfig {
@@ -36,7 +37,7 @@ fn validate_fps_numerator(value: u32) -> Result<(), Error> {
     Ok(())
 }
 
-// src/encoder.rs:192-207
+// src/encoder.rs:251-265
 fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
     if value == 0 {
         return Err(Error::InvalidConfig {
