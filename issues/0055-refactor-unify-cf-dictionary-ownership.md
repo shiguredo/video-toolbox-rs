@@ -2,6 +2,7 @@
 
 - Priority: Low
 - Created: 2026-07-16
+- Updated: 2026-07-21
 - Completed:
 - Model: Fable 5
 - Branch: feature/refactor-unify-cf-dictionary-ownership
@@ -19,7 +20,7 @@
 
 - `src/encoder.rs:449-450` (`reconfigure`): `cf_dictionary` の直後に `CfPtr(properties_dict.cast::<c_void>())`
 - `src/encoder.rs:552-553` (`create_compression_session`): 同上
-- `src/encoder.rs:979` / `src/encoder.rs:1069` (`encode` / `encode_pixel_buffer` の `frame_properties`): `Option<CfPtr<c_void>>` による条件付きガード
+- `src/encoder.rs:979` / `src/encoder.rs:1064` (`encode` / `encode_pixel_buffer` の `frame_properties`): `Option<CfPtr<c_void>>` による条件付きガード
 - `src/decoder.rs:319-320` (`create_decompression_session`): `cf_dictionary` の直後に `CfPtr(dest_attrs.cast::<c_void>())`
 
 ## 優先度根拠
