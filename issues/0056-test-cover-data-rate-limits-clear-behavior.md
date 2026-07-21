@@ -2,6 +2,7 @@
 
 - Priority: Medium
 - Created: 2026-07-16
+- Updated: 2026-07-21
 - Completed:
 - Model: Fable 5
 - Branch: feature/add-data-rate-limits-clear-behavior-test
@@ -11,9 +12,9 @@
 
 `ReconfigureParams::data_rate_limits` に `Some(空 Vec)` を渡すと「設定済みの上限を解除する」と rustdoc (`src/encoder.rs:174-176`) で公開 API の契約として明記しているが、この解除の実挙動を検証するテストが無い。
 
-既存テスト `reconfigure_updates_data_rate_limits` (`tests/test_encoder.rs:525-545`) は「`reconfigure` が `Ok` を返し、`config()` が `None` になる」という記帳の確認のみで、Video Toolbox 側で上限が実際に外れた (出力レートが上限を超えて戻る) ことは観測していない。
+既存テスト `reconfigure_updates_data_rate_limits` (`tests/test_encoder.rs:525-544`) は「`reconfigure` が `Ok` を返し、`config()` が `None` になる」という記帳の確認のみで、Video Toolbox 側で上限が実際に外れた (出力レートが上限を超えて戻る) ことは観測していない。
 
-解除の実装は空の CFArray を `kVTCompressionPropertyKey_DataRateLimits` に設定する方式 (`src/encoder.rs:445-447` と `push_data_rate_limits_property`) だが、一次資料の裏付けは間接的である:
+解除の実装は空の CFArray を `kVTCompressionPropertyKey_DataRateLimits` に設定する方式 (`src/encoder.rs:440-442` と `push_data_rate_limits_property`) だが、一次資料の裏付けは間接的である:
 
 - VTCompressionProperties.h の abstract は「Zero, one or two hard limits on data rate.」と 0 個 (空配列) をプロパティ値として許容している
 - 一方 VTSession.h:79 は「Setting a property value to NULL restores the default value.」と、デフォルト復帰の正規手段を NULL 設定と規定している
@@ -28,7 +29,7 @@
 
 ## 現状
 
-- `tests/test_encoder.rs:694-766` に `data_rate_limits_cap_windowed_output` があり、「合成フレーム負荷 + 750 kbps ハード上限 + 2 Mbps の `average_bitrate`」でウィンドウあたりの出力バイト数が上限に抑えられることを実測検証している
+- `tests/test_encoder.rs:694-765` に `data_rate_limits_cap_windowed_output` があり、「合成フレーム負荷 + 750 kbps ハード上限 + 2 Mbps の `average_bitrate`」でウィンドウあたりの出力バイト数が上限に抑えられることを実測検証している
 - 解除方向 (上限あり → 空 Vec で解除 → 出力レートが上限超えに戻る) の実測は存在しない
 
 ## 設計方針
