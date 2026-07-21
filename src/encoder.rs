@@ -341,7 +341,10 @@ pub struct Encoder<H: EncodeHandler> {
     next_input_pts: i64,
     // FFI の outputCallbackRefCon にこの Box の中身ポインタを渡しているため、
     // Encoder の生存期間中は保持し続ける必要がある。Rust 側からは直接参照しない。
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "FFI コールバックが Box の中身を借用するので Rust からは触らない"
+    )]
     handler: Box<H>,
 }
 
