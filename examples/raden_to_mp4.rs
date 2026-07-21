@@ -353,7 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w = width as f64;
     let h = height as f64;
     let dt = 1.0 / fps as f64;
-    let timescale = NonZeroU32::new(fps).unwrap();
+    let timescale = NonZeroU32::new(fps).expect("fps must be non-zero (validated by CLI parser)");
     let mut first_keyframe = true;
 
     // エンコード済みフレームを MP4 に書き込む共通処理

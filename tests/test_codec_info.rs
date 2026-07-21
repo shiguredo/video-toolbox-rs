@@ -15,7 +15,7 @@ fn test_supported_codecs() {
     let h264 = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::H264)
-        .unwrap();
+        .expect("H.264 のコーデック情報が返ってくること");
     assert!(h264.decoding.supported);
     assert!(h264.encoding.supported);
 
@@ -23,7 +23,7 @@ fn test_supported_codecs() {
     let hevc = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::Hevc)
-        .unwrap();
+        .expect("HEVC のコーデック情報が返ってくること");
     assert!(hevc.decoding.supported);
     assert!(hevc.encoding.supported);
 
@@ -31,13 +31,13 @@ fn test_supported_codecs() {
     let vp9 = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::Vp9)
-        .unwrap();
+        .expect("VP9 のコーデック情報が返ってくること");
     assert!(!vp9.encoding.supported);
 
     // AV1 エンコードは VideoToolbox ではサポートされていない
     let av1 = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::Av1)
-        .unwrap();
+        .expect("AV1 のコーデック情報が返ってくること");
     assert!(!av1.encoding.supported);
 }
