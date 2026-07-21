@@ -50,7 +50,7 @@ impl Drop for CvPixelBufferUnlockGuard {
         unsafe {
             let status = sys::CVPixelBufferUnlockBaseAddress(self.0, 0);
             if status != 0 {
-                log::error!("CVPixelBufferUnlockBaseAddress failed: status={status}");
+                tracing::error!("CVPixelBufferUnlockBaseAddress failed: status={status}");
             }
         }
     }

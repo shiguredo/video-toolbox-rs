@@ -405,7 +405,7 @@ impl<H: DecodeHandler> Decoder<H> {
         callback_name: &'static str,
     ) -> Option<Box<PendingDecode<H::UserData>>> {
         if source_frame_ref_con.is_null() {
-            log::error!("{callback_name}: source_frame_ref_con is null");
+            tracing::error!("{callback_name}: source_frame_ref_con is null");
             return None;
         }
         Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>()) })
@@ -416,7 +416,7 @@ impl<H: DecodeHandler> Decoder<H> {
         callback_name: &'static str,
     ) -> Option<&'a mut H> {
         if output_callback_ref_con.is_null() {
-            log::error!("{callback_name}: output_callback_ref_con is null");
+            tracing::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
         // SAFETY:
@@ -504,7 +504,7 @@ impl<H: DecodeHandler> Decoder<H> {
 impl<H: DecodeHandler> Drop for Decoder<H> {
     fn drop(&mut self) {
         if let Err(e) = self.finish() {
-            log::error!("{e}");
+            tracing::error!("{e}");
         }
 
         unsafe {

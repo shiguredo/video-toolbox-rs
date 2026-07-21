@@ -1116,7 +1116,7 @@ impl<H: EncodeHandler> Encoder<H> {
         callback_name: &'static str,
     ) -> Option<H::UserData> {
         if source_frame_ref_con.is_null() {
-            log::error!("{callback_name}: source_frame_ref_con is null");
+            tracing::error!("{callback_name}: source_frame_ref_con is null");
             return None;
         }
         Some(unsafe { *Box::from_raw(source_frame_ref_con.cast::<H::UserData>()) })
@@ -1127,7 +1127,7 @@ impl<H: EncodeHandler> Encoder<H> {
         callback_name: &'static str,
     ) -> Option<&'a mut H> {
         if output_callback_ref_con.is_null() {
-            log::error!("{callback_name}: output_callback_ref_con is null");
+            tracing::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
         // SAFETY:
@@ -1229,7 +1229,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 let e = Error::LimitExceeded {
                     reason: "encoded block length exceeds defensive maximum",
                 };
-                log::error!(
+                tracing::error!(
                     "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
                     max = MAX_ENCODED_BLOCK_COPY_BYTES
                 );
@@ -1293,7 +1293,7 @@ impl<H: EncodeHandler> Encoder<H> {
     ) -> Option<ParameterSets> {
         unsafe {
             if description.is_null() {
-                log::error!("CMVideoFormatDescription is null in extract_h264_params");
+                tracing::error!("CMVideoFormatDescription is null in extract_h264_params");
                 return None;
             }
             let mut nalu_header_length = 0;
@@ -1308,11 +1308,11 @@ impl<H: EncodeHandler> Encoder<H> {
             if let Err(e) =
                 Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")
             {
-                log::error!("{e}");
+                tracing::error!("{e}");
                 return None;
             }
             if nalu_header_length != 4 {
-                log::error!("unexpected NAL unit header length: {nalu_header_length}");
+                tracing::error!("unexpected NAL unit header length: {nalu_header_length}");
                 return None;
             }
 
@@ -1337,7 +1337,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 if let Err(e) =
                     Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")
                 {
-                    log::error!("{e}");
+                    tracing::error!("{e}");
                     return None;
                 }
             }
@@ -1357,7 +1357,7 @@ impl<H: EncodeHandler> Encoder<H> {
     ) -> Option<ParameterSets> {
         unsafe {
             if description.is_null() {
-                log::error!("CMVideoFormatDescription is null in extract_h265_params");
+                tracing::error!("CMVideoFormatDescription is null in extract_h265_params");
                 return None;
             }
             let mut nalu_header_length = 0;
@@ -1372,11 +1372,11 @@ impl<H: EncodeHandler> Encoder<H> {
             if let Err(e) =
                 Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")
             {
-                log::error!("{e}");
+                tracing::error!("{e}");
                 return None;
             }
             if nalu_header_length != 4 {
-                log::error!("unexpected NAL unit header length: {nalu_header_length}");
+                tracing::error!("unexpected NAL unit header length: {nalu_header_length}");
                 return None;
             }
 
@@ -1406,7 +1406,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 if let Err(e) =
                     Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")
                 {
-                    log::error!("{e}");
+                    tracing::error!("{e}");
                     return None;
                 }
             }
@@ -1500,7 +1500,7 @@ fn vec_u8_from_raw_parts_safe(
     context: &'static str,
 ) -> Option<Vec<u8>> {
     if len > MAX_PARAMETER_SET_COPY_BYTES {
-        log::error!(
+        tracing::error!(
             "{context}: parameter set length {len} exceeds defensive maximum {max}",
             max = MAX_PARAMETER_SET_COPY_BYTES
         );
@@ -1510,7 +1510,7 @@ fn vec_u8_from_raw_parts_safe(
         return Some(Vec::new());
     }
     if ptr.is_null() {
-        log::error!("{context}: null pointer with non-zero length");
+        tracing::error!("{context}: null pointer with non-zero length");
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })

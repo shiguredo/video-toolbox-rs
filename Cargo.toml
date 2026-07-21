@@ -13,7 +13,7 @@ include = ["/LICENSE", "/README.md", "/build.rs", "/src/**"]
 
 [dependencies]
 # コールバック内などで呼び出し元へエラーを返せない箇所のエラーログ用
-log = "0.4"
+tracing = "0.1"
 
 [dev-dependencies]
 # テストフィクスチャ用の 2D ベクターグラフィックスライブラリ

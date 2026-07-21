@@ -11,6 +11,10 @@
 
 ## develop
 
+- [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
+  - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
+  - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える
+  - @voluntas
 - [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型と
   `ReconfigureParams::data_rate_limits` を追加する
   - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
