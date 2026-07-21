@@ -2,13 +2,14 @@
 
 - Priority: Medium
 - Created: 2026-05-14
+- Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
 - Branch: feature/add-encoder-config-getter-test
 
 ## 目的
 
-`Encoder::config(&self) -> &EncoderConfig` getter は本ブランチで新規追加された公開 API (`src/encoder.rs:272-282`) だが、`tests/test_encoder.rs` 内で独立に検証されているテストが存在しない。`reconfigure_*` 系テストの過程で間接的に呼ばれているのみで、「`Encoder::new` 直後に `encoder.config()` が初期 `EncoderConfig` を変更なしで返す」という基本契約の回帰テストが無い。
+`Encoder::config(&self) -> &EncoderConfig` getter は本ブランチで新規追加された公開 API (`src/encoder.rs:371-382`) だが、`tests/test_encoder.rs` 内で独立に検証されているテストが存在しない。`reconfigure_*` 系テストや `new_normalizes_empty_data_rate_limits_to_none` などの過程で個別フィールドが間接的に確認されているのみで、「`Encoder::new` 直後に `encoder.config()` が初期 `EncoderConfig` を主要フィールド網羅で変更なしで返す」という基本契約の回帰テストが無い。
 
 ## 優先度根拠
 
@@ -18,9 +19,9 @@
 
 ## 現状
 
-- `src/encoder.rs:272-282`: `pub fn config(&self) -> &EncoderConfig` 定義
-- `tests/test_encoder.rs`: `encoder.config()` は `reconfigure_updates_config_on_success` (`tests/test_encoder.rs:420-436`) と `reconfigure_is_noop_when_all_none` (`tests/test_encoder.rs:438-452`) でしか呼ばれない
-- 「`Encoder::new` 直後の config が引数と同等」「`config()` が `&` 参照を返す」基本検証は無い
+- `src/encoder.rs:371-382`: `pub fn config(&self) -> &EncoderConfig` 定義（rustdoc 含む）
+- `tests/test_encoder.rs`: `encoder.config()` は `reconfigure_updates_config_on_success` (`tests/test_encoder.rs:411-425`)、`reconfigure_is_noop_when_all_none` (`tests/test_encoder.rs:427-439`)、`reconfigure_updates_data_rate_limits` (`tests/test_encoder.rs:535, 542`)、`new_normalizes_empty_data_rate_limits_to_none` (`tests/test_encoder.rs:657`) でしか呼ばれない（いずれも個別フィールドの検証にとどまる）
+- 「`Encoder::new` 直後の config が引数と同等」「`config()` が `&` 参照を返す」主要フィールド網羅の基本検証は無い
 
 ## 設計方針
 
