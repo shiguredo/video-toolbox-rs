@@ -11,6 +11,8 @@
 
 ## develop
 
+- [CHANGE] MSRV (rust-version) を 1.93 に上げる
+  - @voluntas
 - [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
   - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
   - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える

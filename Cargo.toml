@@ -2,7 +2,7 @@
 name = "shiguredo_video_toolbox"
 version = "2026.2.0-canary.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.93"
 description = "Rust bindings for Apple Video Toolbox hardware video encoders and decoders"
 readme = "README.md"
 homepage = "https://github.com/shiguredo/video-toolbox-rs"
