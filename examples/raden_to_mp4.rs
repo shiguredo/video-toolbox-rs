@@ -43,8 +43,11 @@ fn prgb32_to_i420(
     stride: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut y_plane = vec![0u8; width * height];
-    let mut u_plane = vec![0u8; (width / 2) * (height / 2)];
-    let mut v_plane = vec![0u8; (width / 2) * (height / 2)];
+    // 奇数幅・高さでも 4:2:0 のクロマ寸法を正しく計算する
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
+    let mut u_plane = vec![0u8; uv_width * uv_height];
+    let mut v_plane = vec![0u8; uv_width * uv_height];
 
     for row in 0..height {
         for col in 0..width {
@@ -60,15 +63,17 @@ fn prgb32_to_i420(
         }
     }
 
-    // U/V プレーンは 2x2 ブロック平均
-    for row in 0..(height / 2) {
-        for col in 0..(width / 2) {
+    // U/V プレーンは 2x2 ブロック平均（奇数寸法では画面外ピクセルを clamp で処理）
+    for row in 0..uv_height {
+        for col in 0..uv_width {
             let mut sum_r = 0u32;
             let mut sum_g = 0u32;
             let mut sum_b = 0u32;
             for dy in 0..2 {
                 for dx in 0..2 {
-                    let offset = (row * 2 + dy) * stride + (col * 2 + dx) * 4;
+                    let src_row = (row * 2 + dy).min(height - 1);
+                    let src_col = (col * 2 + dx).min(width - 1);
+                    let offset = src_row * stride + src_col * 4;
                     sum_b += data[offset] as u32;
                     sum_g += data[offset + 1] as u32;
                     sum_r += data[offset + 2] as u32;
@@ -81,8 +86,8 @@ fn prgb32_to_i420(
             let u = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).clamp(0.0, 255.0) as u8;
             let v = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).clamp(0.0, 255.0) as u8;
 
-            u_plane[row * (width / 2) + col] = u;
-            v_plane[row * (width / 2) + col] = v;
+            u_plane[row * uv_width + col] = u;
+            v_plane[row * uv_width + col] = v;
         }
     }
 

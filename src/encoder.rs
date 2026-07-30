@@ -723,6 +723,23 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(limits) = &config.data_rate_limits {
             validate_data_rate_limits(limits)?;
         }
+        // NonZeroU32 から i32 へのキャストで負値に切り詰まるのを防ぐ
+        if let Some(interval) = config.max_key_frame_interval
+            && interval.get() > i32::MAX as u32
+        {
+            return Err(Error::InvalidConfig {
+                field: "max_key_frame_interval",
+                reason: "must fit in i32 for CFNumber",
+            });
+        }
+        if let Some(delay_count) = config.max_frame_delay_count
+            && delay_count.get() > i32::MAX as u32
+        {
+            return Err(Error::InvalidConfig {
+                field: "max_frame_delay_count",
+                reason: "must fit in i32 for CFNumber",
+            });
+        }
         Ok(())
     }
 

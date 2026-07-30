@@ -256,10 +256,11 @@ fn query_encoding_profiles(codec: VideoCodecType, fourcc: u32) -> EncodingProfil
         if status != 0 || props.is_null() {
             return EncodingProfiles::None;
         }
+        // 型チェックより前にガードを生成し、失敗パスでのリークを防ぐ
+        let _props_guard = CfPtr(props as *const c_void);
         if sys::CFGetTypeID(props as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
             return EncodingProfiles::None;
         }
-        let _props_guard = CfPtr(props as *const c_void);
 
         let profile_entry = sys::CFDictionaryGetValue(
             props,

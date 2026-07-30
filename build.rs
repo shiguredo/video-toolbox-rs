@@ -55,6 +55,12 @@ fn main() {
         .arg("--show-sdk-path")
         .output()
         .expect("failed to execute `xcrun` command");
+    if !output.status.success() {
+        panic!(
+            "xcrun --show-sdk-path failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let sdk_dir = PathBuf::from(
         String::from_utf8(output.stdout)
             .expect("invalid path")

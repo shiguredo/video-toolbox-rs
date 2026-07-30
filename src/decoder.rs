@@ -171,7 +171,8 @@ impl<H: DecodeHandler> Decoder<H> {
         self.finish()?;
 
         unsafe {
-            let new_description = Self::create_format_description(&codec)?;
+            let new_description = Self::create_format_description(&codec)
+                .map_err(|e| Self::wrap_unsupported_codec_error(&codec, e))?;
 
             let can_accept = sys::VTDecompressionSessionCanAcceptFormatDescription(
                 self.session,
@@ -193,7 +194,7 @@ impl<H: DecodeHandler> Decoder<H> {
                     Ok(session) => session,
                     Err(e) => {
                         sys::CFRelease(new_description as *const c_void);
-                        return Err(e);
+                        return Err(Self::wrap_unsupported_codec_error(&codec, e));
                     }
                 };
 
@@ -235,6 +236,20 @@ impl<H: DecodeHandler> Decoder<H> {
                     pps,
                     nalu_len_bytes,
                 } => {
+                    // Apple のドキュメントで有効値は 1, 2, 4 のみ
+                    if !matches!(nalu_len_bytes, 1 | 2 | 4) {
+                        return Err(Error::InvalidConfig {
+                            field: "nalu_len_bytes",
+                            reason: "must be 1, 2, or 4",
+                        });
+                    }
+                    // 空スライスの as_ptr() は dangling pointer になるため拒否する
+                    if sps.is_empty() || pps.is_empty() {
+                        return Err(Error::InvalidConfig {
+                            field: "parameter_sets",
+                            reason: "sps and pps must not be empty",
+                        });
+                    }
                     let status = sys::CMVideoFormatDescriptionCreateFromH264ParameterSets(
                         std::ptr::null_mut(),
                         2,
@@ -254,6 +269,20 @@ impl<H: DecodeHandler> Decoder<H> {
                     pps,
                     nalu_len_bytes,
                 } => {
+                    // Apple のドキュメントで有効値は 1, 2, 4 のみ
+                    if !matches!(nalu_len_bytes, 1 | 2 | 4) {
+                        return Err(Error::InvalidConfig {
+                            field: "nalu_len_bytes",
+                            reason: "must be 1, 2, or 4",
+                        });
+                    }
+                    // 空スライスの as_ptr() は dangling pointer になるため拒否する
+                    if vps.is_empty() || sps.is_empty() || pps.is_empty() {
+                        return Err(Error::InvalidConfig {
+                            field: "parameter_sets",
+                            reason: "vps, sps, and pps must not be empty",
+                        });
+                    }
                     let status = sys::CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                         std::ptr::null_mut(),
                         3,
