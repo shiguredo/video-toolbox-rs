@@ -5,25 +5,26 @@
 - Updated: 2026-07-21
 - Completed:
 - Model: Opus 4.7
-- Branch: feature/fix-share-encoder-property-builders
+- Branch: feature/refactor-share-encoder-property-builders
+- Polished: 2026-07-31
 
 ## 目的
 
-`Encoder` 内で `kVTCompressionPropertyKey_AverageBitRate` と `kVTCompressionPropertyKey_ExpectedFrameRate` を CFNumber 化して `properties` Vec に push する処理が、`add_common_properties` (`src/encoder.rs:562-669` 付近) と `reconfigure` (`src/encoder.rs:402-477` 付近) の 2 ヶ所に重複している。さらに `reconfigure` 側では `cf_objects: Vec<CfPtr<c_void>>` の使い方が `add_common_properties` の慣習と乖離している。
-
-将来 `DataRateLimits` などの動的更新可能項目を増やすと、3 ヶ所目以降の追記が発生する前兆（実際に `DataRateLimits` は `push_data_rate_limits_property` として共通化ヘルパー化されており、`add_common_properties` と `reconfigure` の両方から呼ばれている）。
+`Encoder` 内で `kVTCompressionPropertyKey_AverageBitRate` と `kVTCompressionPropertyKey_ExpectedFrameRate` を CFNumber 化して `properties` Vec に push する処理が、`src/encoder.rs` の `add_common_properties` と `reconfigure` の 2 ヶ所に重複している。`kVTCompressionPropertyKey_DataRateLimits` は既に `push_data_rate_limits_property` として共通化ヘルパー化されており、bitrate / fps だけが 2 ヶ所重複のまま取り残されている。次の動的更新可能項目を追加するときに 3 ヶ所目の追記が発生する前兆である。
 
 ## 優先度根拠
 
 - 機能面に影響のない構造改善であり、緊急度は低い
-- 直近の reconfigure 拡張 (例えば `DataRateLimits` を `ReconfigureParams` に足す) で再度同じ重複を生み出す危険があるため、追加が出る前にやっておくと得策
+- 次の動的更新項目を追加する際に同じ重複を生み出す危険があるため、追加が出る前にやっておくと得策
 - Low 相当
 
 ## 現状
 
-### `add_common_properties` の該当抜粋
+### `add_common_properties` の該当抜粋（実ソースの順序どおり）
 
 ```rust
+let fps = cf_number_i32(config.fps_numerator.div_ceil(config.fps_denominator) as i32)?;
+
 // ビットレート (指定時のみ設定)
 if let Some(bitrate) = config.average_bitrate {
     let target_bitrate = cf_number_i64(bitrate as i64)?;
@@ -34,7 +35,6 @@ if let Some(bitrate) = config.average_bitrate {
     cf_objects.push(target_bitrate);
 }
 
-let fps = cf_number_i32(config.fps_numerator.div_ceil(config.fps_denominator) as i32)?;
 properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, fps.0));
 cf_objects.push(fps);
 ```
@@ -42,9 +42,6 @@ cf_objects.push(fps);
 ### `reconfigure` の該当抜粋
 
 ```rust
-let mut properties: Vec<(sys::CFStringRef, *const c_void)> = Vec::new();
-let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
-
 if let Some(bitrate) = params.average_bitrate {
     let value = cf_number_i64(bitrate as i64)?;
     properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
@@ -57,7 +54,7 @@ if let Some(fps) = params.expected_frame_rate {
 }
 ```
 
-CFNumber 型 (`i64` / `i32`) とキー名はそれぞれ完全に一致しており、構造を切り出せば 1 ヶ所で扱える。
+CFNumber 型 (`i64` / `i32`) とキー名はそれぞれ完全に一致しており、構造を切り出せば 1 ヶ所で扱える。bitrate ブロックは同一構造だが、fps は push の条件（`add_common_properties` は必ず設定、`reconfigure` は `Option` 指定時のみ）が異なる。
 
 注意: `add_common_properties` 側は分数 fps から整数 fps を `div_ceil` で導出するが、`reconfigure` 側は `ReconfigureParams::expected_frame_rate: u32` をそのまま使う。共通化する際は、整数 fps を受ける形のヘルパーにして、呼び出し側が事前に丸めるのが素直。
 
@@ -82,6 +79,7 @@ fn push_expected_frame_rate_property(
 これにより呼び出し側は以下のように圧縮される:
 
 ```rust
+// reconfigure 側（fps は指定時のみ）
 if let Some(bitrate) = params.average_bitrate {
     push_bitrate_property(&mut properties, &mut cf_objects, bitrate)?;
 }
@@ -90,18 +88,28 @@ if let Some(fps) = params.expected_frame_rate {
 }
 ```
 
-`reconfigure` 側で「`cf_objects` に push するパターン」が `add_common_properties` と統一されるため、コードを横に読む保守性が向上する。
+```rust
+// add_common_properties 側（fps は必ず設定する）
+let fps = config.fps_numerator.div_ceil(config.fps_denominator);
+push_expected_frame_rate_property(&mut properties, &mut cf_objects, fps)?;
+if let Some(bitrate) = config.average_bitrate {
+    push_bitrate_property(&mut properties, &mut cf_objects, bitrate)?;
+}
+```
+
+bitrate / fps の CFNumber 構築 + push の手続きが 1 箇所に集約され、コードを横に読む保守性が向上する。
 
 ## 完了条件
 
-- bitrate / fps の CFNumber 構築 + push が 1 ヶ所のヘルパー関数に集約されている
+- bitrate / fps の CFNumber 構築 + push がヘルパー関数群（`push_bitrate_property` / `push_expected_frame_rate_property`）に集約されている
 - `Encoder::create_compression_session` 経由の初期化と `Encoder::reconfigure` の両方が同じヘルパーを使う
+- `CHANGES.md` の `## develop` に `[UPDATE]` としてリファクタリングのエントリを追記する（公開 API の変更を伴わないため `### misc` サブセクション）
 - `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` が通る
 - 既存テスト (`encode_h264_black`、`encode_h265_black`、`reconfigure_updates_config_on_success` 等) で挙動回帰がない
 
 ## 解決方法
 
-- `Encoder<H>` の impl ブロック内に上記 2 つの `fn push_*_property` を追加 (関連関数として `Self::` 経由でアクセス可)
+- `push_data_rate_limits_property` と同じモジュールレベルのフリー関数として、上記 2 つの `fn push_*_property` を追加する
 - `add_common_properties` 内の bitrate / fps ブロックをヘルパー呼び出しに置換
 - `reconfigure` 内の bitrate / fps ブロックをヘルパー呼び出しに置換
-- `unsafe` ブロックの範囲はヘルパー関数側に閉じ込め、呼び出し側を安全な呼び出しにする
+- ヘルパーは安全関数とし、`unsafe` はヘルパー内部のキー参照（`sys::kVTCompressionPropertyKey_*`）に閉じ込める（`push_data_rate_limits_property` と同じ構成。呼び出し側の `unsafe` ブロックは他のプロパティ設定のため残る）
