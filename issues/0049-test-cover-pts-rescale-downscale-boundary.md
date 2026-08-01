@@ -3,7 +3,7 @@
 - Priority: Medium
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-01
 - Model: Opus 4.7
 - Branch: feature/add-pts-rescale-downscale-boundary-test
 
@@ -76,26 +76,4 @@ let rescaled_next_input_pts = if let Some(fps) = params.expected_frame_rate {
 
 ## 解決方法
 
-```rust
-#[test]
-fn reconfigure_rescales_next_input_pts_ceils_when_new_timescale_smaller() -> Result<(), Error> {
-    // 60 → 30 の切り下げで `next_input_pts = 1` が 0 に潰れず 1 のまま保たれることを確認する。
-    let mut config = base_encoder_config();
-    config.fps_numerator = 60;
-    config.fps_denominator = 1;
-    let mut encoder = Encoder::new(config, noop_handler())?;
-
-    encoder.next_input_pts = 1;
-
-    encoder.reconfigure(ReconfigureParams {
-        expected_frame_rate: Some(30),
-        ..Default::default()
-    })?;
-
-    assert_eq!(encoder.config().fps_numerator, 30);
-    assert_eq!(encoder.config().fps_denominator, 1);
-    // ceil(1 * 30 / 60) = ceil(0.5) = 1
-    assert_eq!(encoder.next_input_pts, 1);
-    Ok(())
-}
-```
+本 issue は polish-issue の不要判定でスキップされた（実装しない）。既存の `reconfigure_rescales_next_input_pts_on_frame_rate_change`（30000/1001 → 60 は実は切り下げ方向）が `div_ceil` を保護しており、切り下げ方向の検証は既にカバーされている。また issue 0076 の PBT インフラ導入が拒否域を包含する。独立したテスト追加は不要と判断した。
