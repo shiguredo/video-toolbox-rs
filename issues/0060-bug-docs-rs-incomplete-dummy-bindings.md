@@ -1,9 +1,8 @@
 # docs.rs 向けダミーバインディングが不完全でビルドが失敗する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-01
 - Branch: feature/fix-docs-rs-dummy-bindings
-- Polished: {YYYY-MM-DD}
 
 ## 目的
 
@@ -26,3 +25,7 @@ CI の `docs-rs` ジョブ（`.github/workflows/ci.yml`）が実際に通過し�
 ## 完了条件
 
 `DOCS_RS=1 cargo doc --no-deps` が Linux 上で成功すること。
+
+## 解決方法
+
+本 issue は polish-issue の不要判定でスキップされた（実装しない）。`DOCS_RS=1 cargo doc --no-deps` は実測で成功しており（rustdoc は関数本体の型チェックをしないため）、CI の docs-rs ジョブも success を継続している。完了条件は既に満たされており、docs.rs 本番のビルド（`cargo rustdoc` のみ実行）も失敗しない。crates.io 未公開のため本番ビルドは未発生。ダミーバインディングの不足は `DOCS_RS=1 cargo check` でのみ発現するが、どこも実行しないため実害はない。
