@@ -230,35 +230,27 @@ fn validate_data_rate_limits(limits: &[DataRateLimit]) -> Result<(), Error> {
     Ok(())
 }
 
-/// `fps_numerator` の境界を検証する (CMTimeMake の timescale 用)
-fn validate_fps_numerator(value: u32) -> Result<(), Error> {
+/// `field` で示す設定値の境界を検証する
+///
+/// `u32` 値のゼロ拒否 (reason は `"must not be zero"` に固定) と `i32::MAX` 上限拒否を行う。
+/// 上限超過時の `reason_overflow` は呼び出し側が用途に応じて指定する
+/// (CMTimeMake の timescale 用 / CFNumber 用など)。i32 上限が不要なフィールド
+/// (例: `fps_denominator`) には使わない。
+fn validate_positive_i32_field(
+    field: &'static str,
+    reason_overflow: &'static str,
+    value: u32,
+) -> Result<(), Error> {
     if value == 0 {
         return Err(Error::InvalidConfig {
-            field: "fps_numerator",
+            field,
             reason: "must not be zero",
         });
     }
     if value > i32::MAX as u32 {
         return Err(Error::InvalidConfig {
-            field: "fps_numerator",
-            reason: "must fit in i32 for CMTime timescale",
-        });
-    }
-    Ok(())
-}
-
-/// `expected_frame_rate` の境界を検証する
-fn validate_expected_frame_rate(value: u32) -> Result<(), Error> {
-    if value == 0 {
-        return Err(Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must not be zero",
-        });
-    }
-    if value > i32::MAX as u32 {
-        return Err(Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must fit in i32 for CFNumber",
+            field,
+            reason: reason_overflow,
         });
     }
     Ok(())
@@ -729,13 +721,19 @@ impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダー設定を検証する
     fn validate_config(config: &EncoderConfig) -> Result<(), Error> {
         validate_video_dimensions_for_toolbox(config.width, config.height)?;
+        // fps_denominator は CMTimeMake の timescale には使われず、div_ceil の除数と
+        // PTS 計算の加数としてのみ使われるため、i32 上限は不要 (ゼロ拒否のみ)
         if config.fps_denominator == 0 {
             return Err(Error::InvalidConfig {
                 field: "fps_denominator",
                 reason: "must not be zero",
             });
         }
-        validate_fps_numerator(config.fps_numerator)?;
+        validate_positive_i32_field(
+            "fps_numerator",
+            "must fit in i32 for CMTime timescale",
+            config.fps_numerator,
+        )?;
         if let Some(bitrate) = config.average_bitrate {
             validate_average_bitrate(bitrate)?;
         }
@@ -768,7 +766,11 @@ impl<H: EncodeHandler> Encoder<H> {
             validate_average_bitrate(bitrate)?;
         }
         if let Some(fps) = params.expected_frame_rate {
-            validate_expected_frame_rate(fps)?;
+            validate_positive_i32_field(
+                "expected_frame_rate",
+                "must fit in i32 for CFNumber",
+                fps,
+            )?;
         }
         if let Some(ref limits) = params.data_rate_limits {
             validate_data_rate_limits(limits)?;

@@ -56,6 +56,10 @@
 
 ### misc
 
+- [UPDATE] `fps_numerator` と `expected_frame_rate` の検証ロジックを共通関数 `validate_positive_i32_field` に統合する
+  - ゼロ拒否と `i32::MAX` 上限拒否が 2 関数に重複していたため、`field` / `reason_overflow` を引数化して 1 本に集約する
+  - エラーメッセージは従来と同一で、挙動は変わらない
+  - @voluntas
 - [UPDATE] `Encoder::reconfigure` 関連の rustdoc を整理して説明の重複を解消する
   - 「動的に更新できる項目 / できない項目」の本体説明を `Encoder::reconfigure` に集約し、
     `ReconfigureParams` / `Encoder::config` からは参照で辿れるようにする
