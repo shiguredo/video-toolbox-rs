@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-01
 - Model: Opus 4.7
 - Branch: feature/refactor-merge-fps-validators
 - Polished: 2026-07-31
@@ -114,3 +114,13 @@ fn validate_positive_i32_field(
 validate_positive_i32_field("fps_numerator", "must fit in i32 for CMTime timescale", config.fps_numerator)?;
 validate_positive_i32_field("expected_frame_rate", "must fit in i32 for CFNumber", fps)?;
 ```
+
+## 解決方法
+
+`src/encoder.rs` の `validate_fps_numerator` と `validate_expected_frame_rate` を削除し、設計方針どおりのシグネチャ `validate_positive_i32_field(field: &'static str, reason_overflow: &'static str, value: u32)` を持つ共通関数 1 本に統合した。
+
+- ゼロ拒否時の `reason: "must not be zero"` は関数内に固定し、`field` / `reason_overflow` のみ呼び出し側から指定する
+- `Encoder::validate_config` の `fps_numerator` 検証と `Encoder::validate_reconfigure_params` の `expected_frame_rate` 検証の 2 箇所を新関数の呼び出しに置き換えた
+- エラーメッセージ (`field` / `reason`) は従来と完全に同一のため、既存テストは無変更で通る
+- `CHANGES.md` の `## develop` に `[UPDATE]` として `### misc` サブセクションへ追記した
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test --workspace -- --test-threads=1` が通ることを確認した
