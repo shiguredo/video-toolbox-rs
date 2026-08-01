@@ -1,7 +1,7 @@
 # `create_compression_session` でプロパティ設定失敗時にセッションがリークする
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-01
 - Branch: feature/fix-encoder-session-leak
 - Polished: 2026-08-01
 
@@ -40,3 +40,15 @@
 ## 関連 issue
 
 - issue 0076（reconfigure の data_rate_limits がエンコード開始後に実効しない）: 0076 が「実効化する」（セッション再作成ベースへの変更）を採る場合、`create_compression_session` を再作成経路で呼ぶため、本 issue の修正が先行して必要になる
+
+## 解決方法
+
+`src/encoder.rs` の `create_compression_session` 関数を修正し、`VTCompressionSessionCreate` 成功直後に生成されたセッションを `CfPtrMut` でガードした。
+
+- `VTCompressionSessionCreate` 成功直後に `session` を `CfPtrMut`（`session_guard`）でガードし、以降のプロパティ設定（`add_common_properties` / `add_h264_specific_properties` / `add_h265_specific_properties` / `cf_dictionary` / `VTSessionSetProperties`）のどのエラーパスで早期リターンしても、`Drop` が `CFRelease` でセッションを確実に解放するようにした
+- 成功パスでは `std::mem::forget` でガードを解除し、`Encoder::drop`（`VTCompressionSessionInvalidate` + `CFRelease`）に解放を委ねることで、二重解放・use-after-free を防いだ
+- エラーパスのセッションは一度もエンコードしていない未使用セッションのため、`VTCompressionSessionInvalidate` なしの `CFRelease` のみで解放してよい旨をコメントに明記した（`Encoder::drop` の解放方法との非対称性の説明）
+- 関数の doc コメントに所有権契約（成功時は呼び出し元が所有、失敗時は関数内で解放済み）を追記した
+- エラーパスは実機で誘発困難なため単体テストは追加せず、既存のエンコードテスト（`encode_h264_black` / `encode_h265_black`）で成功パスの回帰確認を行った。`Baseline + Cabac` の組み合わせによるエラーパス実機誘発も試したが、Video Toolbox が `Ok` を返し誘発できなかった
+- `CHANGES.md` の `## develop` に `[FIX]` エントリを追加した
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が全て通ることを確認した
