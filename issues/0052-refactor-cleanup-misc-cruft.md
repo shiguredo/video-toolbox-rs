@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-01
 - Model: Opus 4.7
 - Branch: feature/fix-cleanup-misc-cruft
 
@@ -70,14 +70,4 @@ pub struct Encoder<H: EncodeHandler> {
 
 ## 解決方法
 
-1. `src/encoder.rs:1547-1551` のコメントを 1 行に縮約:
-
-   ```rust
-   //! `next_input_pts` など private フィールド検証専用のテスト。通常系は tests/test_encoder.rs。
-   ```
-
-2. `src/encoder.rs:344` の `#[allow(dead_code)]` を以下に置換:
-
-   ```rust
-   #[expect(dead_code, reason = "FFI outputCallbackRefCon にポインタを渡すため Box で生存させる")]
-   ```
+本 issue は polish-issue の不要判定でスキップされた（実装しない）。項目 2（`#[allow(dead_code)]` の `#[expect(dead_code, reason = "...")]` 化）は commit 3d39e72 で実装済みであり、残る項目 1（`mod tests` 直下コメントの縮約）は極小作業で放置しても害がないため、独立した対応は不要と判断した。
