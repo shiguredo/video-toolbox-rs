@@ -56,6 +56,13 @@
 
 ### misc
 
+- [UPDATE] `average_bitrate` / `expected_frame_rate` の CFNumber 構築と push をヘルパー関数に共通化する
+  - `push_bitrate_property` / `push_expected_frame_rate_property` を追加し、
+    `add_common_properties` と `reconfigure` の 2 箇所の重複を解消する
+  - `push_data_rate_limits_property` と同じ構成のモジュールレベルフリー関数とし、
+    `unsafe` はヘルパー内部のキー参照に閉じ込める
+  - 挙動は変わらない
+  - @voluntas
 - [UPDATE] `fps_numerator` と `expected_frame_rate` の検証ロジックを共通関数 `validate_positive_i32_field` に統合する
   - ゼロ拒否と `i32::MAX` 上限拒否が 2 関数に重複していたため、`field` / `reason_overflow` を引数化して 1 本に集約する
   - エラーメッセージは従来と同一で、挙動は変わらない
