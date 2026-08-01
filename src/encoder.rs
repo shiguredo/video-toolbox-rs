@@ -480,6 +480,9 @@ impl<H: EncodeHandler> Encoder<H> {
     }
 
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
+    ///
+    /// 成功時はセッションの所有権が呼び出し元に移り、`Encoder::drop` が解放する。
+    /// 失敗時は生成済みセッションを関数内で解放してから `Err` を返す。
     unsafe fn create_compression_session(
         config: &EncoderConfig,
         handler: &H,
@@ -531,6 +534,15 @@ impl<H: EncodeHandler> Encoder<H> {
             );
             Error::check(status, "VTCompressionSessionCreate")?;
 
+            // 生成したセッションをガードし、以降のプロパティ設定が失敗して早期リターンしても
+            // `session_guard` の `Drop` で `CFRelease` する。エラーパスは実機で誘発困難なため
+            // 単体テストの対象外とし、このガードによる構造的な解放とコードレビューで担保する。
+            // `Encoder::drop` は `VTCompressionSessionInvalidate` + `CFRelease` を行うため
+            // エラーパスの解放方法とは非対称だが、ここで解放するセッションは一度も
+            // エンコードしていない未使用のセッションであり、invalidate なしの `CFRelease`
+            // のみで解放してよい。
+            let session_guard = CfPtrMut(session);
+
             // 共通のプロパティ設定
             let mut properties = Vec::new();
             let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
@@ -557,6 +569,13 @@ impl<H: EncodeHandler> Encoder<H> {
             let status = sys::VTSessionSetProperties(session.cast(), properties_dict);
             Error::check(status, "VTSessionSetProperties")?;
 
+            // 成功パスではガードを forget して、`Encoder::drop` に解放を委ねる。
+            // forget を書き忘れると `session_guard` の `Drop` が `CFRelease` し、
+            // `Encoder::drop` の `VTCompressionSessionInvalidate` + `CFRelease` と合わせて
+            // 二重解放や use-after-free になるため、成功パスでは必ず forget する。
+            // forget の後で `Err` を返すコードを追加するとリークするため、この後に
+            // エラーパスを追加しないこと。
+            std::mem::forget(session_guard);
             Ok(session)
         }
     }
