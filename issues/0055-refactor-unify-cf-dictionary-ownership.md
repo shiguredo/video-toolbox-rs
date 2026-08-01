@@ -6,22 +6,22 @@
 - Completed:
 - Model: Fable 5
 - Branch: feature/refactor-unify-cf-dictionary-ownership
-- Polished: {YYYY-MM-DD}
+- Polished: 2026-07-31
 
 ## 目的
 
 `src/types.rs` の CF オブジェクト生成ヘルパー間で、所有権の扱いが不統一になっている。
 
-- `cf_array` (`src/types.rs:105-120`) は `CfPtr<c_void>` (Drop で `CFRelease` するガード) を返す
-- `cf_number_i32` / `cf_number_i64` / `cf_number_f64` (`src/types.rs:122-168`) も `CfPtr<c_void>` を返す
-- `cf_dictionary` (`src/types.rs:78-99`) だけが生の `CFDictionaryRef` を返し、呼び出し側が毎回手動で `CfPtr` に包んでいる
+- `cf_array` は `CfPtr<c_void>` (Drop で `CFRelease` するガード) を返す
+- `cf_number_i32` / `cf_number_i64` / `cf_number_f64` も `CfPtr<c_void>` を返す
+- `cf_dictionary` だけが生の `CFDictionaryRef` を返し、呼び出し側が毎回手動で `CfPtr` に包んでいる
 
 呼び出し側の手動ラップは以下の 5 箇所に散在しており、いずれも「生成 → 直後に手動ガード」という同じ定型を繰り返している。将来の呼び出し追加時にガードを書き忘れるとリークする構造のため、生成ヘルパー側でガードを返す形に統一する。
 
-- `src/encoder.rs:449-450` (`reconfigure`): `cf_dictionary` の直後に `CfPtr(properties_dict.cast::<c_void>())`
-- `src/encoder.rs:552-553` (`create_compression_session`): 同上
-- `src/encoder.rs:979` / `src/encoder.rs:1064` (`encode` / `encode_pixel_buffer` の `frame_properties`): `Option<CfPtr<c_void>>` による条件付きガード
-- `src/decoder.rs:319-320` (`create_decompression_session`): `cf_dictionary` の直後に `CfPtr(dest_attrs.cast::<c_void>())`
+- `src/encoder.rs` の `Encoder::reconfigure`: `cf_dictionary` の直後に `CfPtr(properties_dict.cast::<c_void>())`
+- `src/encoder.rs` の `create_compression_session`: 同上
+- `src/encoder.rs` の `encode` / `encode_pixel_buffer` の `frame_properties`: `Option<CfPtr<c_void>>` による条件付きガード
+- `src/decoder.rs` の `create_decompression_session`: `cf_dictionary` の直後に `CfPtr(dest_attrs.cast::<c_void>())`
 
 ## 優先度根拠
 
@@ -32,7 +32,7 @@
 
 ## 現状
 
-`cf_dictionary` の定義 (`src/types.rs:78-99`):
+`cf_dictionary` の定義 (`src/types.rs`):
 
 ```rust
 pub(crate) fn cf_dictionary(
@@ -43,7 +43,7 @@ pub(crate) fn cf_dictionary(
 }
 ```
 
-呼び出し側の定型 (`src/encoder.rs:449-450` の例):
+呼び出し側の定型 (`src/encoder.rs` の `Encoder::reconfigure` の例):
 
 ```rust
 let properties_dict = cf_dictionary(&properties)?;
@@ -53,12 +53,29 @@ let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
 
 ## 設計方針
 
-`cf_dictionary` の返り値を `CfPtr<c_void>` に変更し、`cf_array` / `cf_number_*` と揃える。FFI 関数へ渡す箇所では `guard.0` から生ポインタを取り出す (必要に応じて `.cast()` する)。
+`cf_dictionary` の返り値を `CfPtr<c_void>` に変更し、`cf_array` / `cf_number_*` と揃える。FFI 関数へ渡す箇所では `guard.0` から生ポインタを取り出し、`.cast()` する（FFI 引数はすべて `CFDictionaryRef` のため、全箇所で `.cast()` が必要になる）。あわせて、返り値がガード済みで drop 時に `CFRelease` される旨の所有権 doc コメントを `cf_dictionary` に付ける。
 
-`encode` / `encode_pixel_buffer` の `frame_properties` は「`force_key_frame` 時のみ辞書を作り、それ以外は NULL を渡す」分岐があるため、`Option<CfPtr<c_void>>` を組み立ててから `as_ref().map_or(std::ptr::null(), |g| g.0.cast())` のような形で生ポインタを導出する。
+`encode` / `encode_pixel_buffer` の `frame_properties` は「`force_key_frame` 時のみ辞書を作り、それ以外は NULL を渡す」分岐があるため、`Option<CfPtr<c_void>>` を組み立ててから生ポインタを別変数に導出する。ガード（`Option<CfPtr>`）は FFI 呼び出しまで生存させる必要があるため、シャドーイングで同名変数に潰すとガードが早期 drop され use-after-free になる点に注意する。例:
+
+```rust
+let frame_properties = if options.force_key_frame {
+    Some(cf_dictionary(&[...])?)
+} else {
+    None
+};
+let frame_properties_guard = frame_properties;
+let frame_properties_ptr =
+    frame_properties_guard.as_ref().map_or(std::ptr::null(), |g| g.0.cast());
+```
+
+## 関連 issue
+
+- issue 0053（`src/encoder.rs` のモジュール分割）: 本 issue の変更対象のうち encoder 側の 4 箇所は分割後は `mod.rs`（`reconfigure`）/ `session.rs`（`create_compression_session`）/ `pixel_buffer.rs`（`encode` / `encode_pixel_buffer`）に分散する。どちらを先に実施しても成立する（先に 0053 を実施する場合は、本 issue の変更対象は分割後のモジュール内の関数になる）
+- issue 0073（`encode` / `encode_pixel_buffer` の重複解消）: `frame_properties` の構築と同じ行域を対象とする。どちらを先に実施しても成立する（先に 0073 を実施する場合は、本 issue の変更対象のうち `frame_properties` 構築は抽出後の共通メソッド内の 1 箇所に減る）
 
 ## 完了条件
 
 - `cf_dictionary` が `CfPtr<c_void>` を返し、全呼び出し箇所 (encoder 4 箇所 + decoder 1 箇所) から手動の `CfPtr(...)` ラップが消えている
-- `cargo test --all` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `CHANGES.md` の `## develop` に `[UPDATE]` としてリファクタリングのエントリを追記する（公開 API の変更を伴わないため `### misc` サブセクション）
+- `cargo test --workspace` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check` が通る
 - 挙動変更が無いこと (リファクタリングのみ)
