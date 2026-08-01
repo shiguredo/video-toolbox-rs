@@ -48,6 +48,11 @@
     `PixelFormatMismatch` と区別して実際の FourCC を診断情報として返す
   - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合は分岐の追加が必要になる
   - @voluntas
+- [FIX] 圧縮セッションのプロパティ設定が失敗したときにセッションがリークする問題を修正する
+  - `VTCompressionSessionCreate` 成功後のセッションを `CfPtrMut` でガードし、エラーパスでは `Drop` が
+    `CFRelease` で解放する
+  - 成功パスでは `forget` でガードを解除し、`Encoder::drop` の解放処理との二重解放を防ぐ
+  - @voluntas
 
 ### misc
 
