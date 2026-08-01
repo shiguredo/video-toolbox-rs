@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-01
 - Model: Opus 4.7
 - Branch: feature/refactor-share-encoder-property-builders
 - Polished: 2026-07-31
@@ -113,3 +113,14 @@ bitrate / fps の CFNumber 構築 + push の手続きが 1 箇所に集約され
 - `add_common_properties` 内の bitrate / fps ブロックをヘルパー呼び出しに置換
 - `reconfigure` 内の bitrate / fps ブロックをヘルパー呼び出しに置換
 - ヘルパーは安全関数とし、`unsafe` はヘルパー内部のキー参照（`sys::kVTCompressionPropertyKey_*`）に閉じ込める（`push_data_rate_limits_property` と同じ構成。呼び出し側の `unsafe` ブロックは他のプロパティ設定のため残る）
+
+## 解決方法
+
+`src/encoder.rs` に `push_bitrate_property` / `push_expected_frame_rate_property` を追加し、`add_common_properties` と `reconfigure` の bitrate / fps ブロックをヘルパー呼び出しに置換した。
+
+- ヘルパーは `push_data_rate_limits_property` と同じ構成のモジュールレベルフリー関数で、`unsafe` はヘルパー内部のキー参照 (push 部分) に閉じ込めた
+- `add_common_properties` 側は `div_ceil` で整数 fps を導出してからヘルパーへ渡し、`reconfigure` 側は `ReconfigureParams::expected_frame_rate` をそのまま渡す (設計方針どおり)
+- ヘルパーの doc コメントに `cf_objects` への所有移行の必要性 (use-after-free 防止) と検証済みキャストの前提を明記した
+- 挙動は従来と同一で、既存テストは無変更で通る
+- `CHANGES.md` の `## develop` に `[UPDATE]` として `### misc` サブセクションへ追記した
+- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test --workspace -- --test-threads=1` が通ることを確認した

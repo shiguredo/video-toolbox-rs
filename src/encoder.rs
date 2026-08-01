@@ -284,6 +284,47 @@ fn push_data_rate_limits_property(
     Ok(())
 }
 
+/// `average_bitrate` を CFNumber 化して `kVTCompressionPropertyKey_AverageBitRate` に設定する
+///
+/// properties に積んだ生ポインタが辞書生成まで有効でいるためには、生成した CFNumber の
+/// 所有を `cf_objects` に移して保持し続ける必要がある。`cf_objects` への push を忘れると
+/// use-after-free になる (呼び出し側スコープ末尾の drop で CFRelease する)。
+/// `bitrate_bps` は `validate_average_bitrate` で `i64::MAX` 以下に検証済みのため、
+/// `as i64` の切り詰めは発生しない。
+fn push_bitrate_property(
+    properties: &mut Vec<(sys::CFStringRef, *const c_void)>,
+    cf_objects: &mut Vec<CfPtr<c_void>>,
+    bitrate_bps: u64,
+) -> Result<(), Error> {
+    let value = cf_number_i64(bitrate_bps as i64)?;
+    unsafe {
+        properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
+    }
+    cf_objects.push(value);
+    Ok(())
+}
+
+/// 整数 fps を CFNumber 化して `kVTCompressionPropertyKey_ExpectedFrameRate` に設定する
+///
+/// properties に積んだ生ポインタが辞書生成まで有効でいるためには、生成した CFNumber の
+/// 所有を `cf_objects` に移して保持し続ける必要がある。`cf_objects` への push を忘れると
+/// use-after-free になる (呼び出し側スコープ末尾の drop で CFRelease する)。
+/// `fps` は呼び出し側で `i32::MAX` 以下に検証済み (`validate_positive_i32_field`。
+/// `add_common_properties` 側は検証済みの `fps_numerator` を `div_ceil` で丸めた値) のため、
+/// `as i32` の切り詰めは発生しない。
+fn push_expected_frame_rate_property(
+    properties: &mut Vec<(sys::CFStringRef, *const c_void)>,
+    cf_objects: &mut Vec<CfPtr<c_void>>,
+    fps: u32,
+) -> Result<(), Error> {
+    let value = cf_number_i32(fps as i32)?;
+    unsafe {
+        properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
+    }
+    cf_objects.push(value);
+    Ok(())
+}
+
 /// エンコード結果を通知するためのハンドラー
 ///
 /// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
@@ -423,14 +464,10 @@ impl<H: EncodeHandler> Encoder<H> {
             let mut cf_objects: Vec<CfPtr<c_void>> = Vec::new();
 
             if let Some(bitrate) = params.average_bitrate {
-                let value = cf_number_i64(bitrate as i64)?;
-                properties.push((sys::kVTCompressionPropertyKey_AverageBitRate, value.0));
-                cf_objects.push(value);
+                push_bitrate_property(&mut properties, &mut cf_objects, bitrate)?;
             }
             if let Some(fps) = params.expected_frame_rate {
-                let value = cf_number_i32(fps as i32)?;
-                properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, value.0));
-                cf_objects.push(value);
+                push_expected_frame_rate_property(&mut properties, &mut cf_objects, fps)?;
             }
             if let Some(ref limits) = params.data_rate_limits {
                 push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
@@ -580,20 +617,13 @@ impl<H: EncodeHandler> Encoder<H> {
     ) -> Result<(), Error> {
         unsafe {
             // 基本設定
-            let fps = cf_number_i32(config.fps_numerator.div_ceil(config.fps_denominator) as i32)?;
+            let fps = config.fps_numerator.div_ceil(config.fps_denominator);
+            push_expected_frame_rate_property(properties, cf_objects, fps)?;
 
             // ビットレート (指定時のみ設定)
             if let Some(bitrate) = config.average_bitrate {
-                let target_bitrate = cf_number_i64(bitrate as i64)?;
-                properties.push((
-                    sys::kVTCompressionPropertyKey_AverageBitRate,
-                    target_bitrate.0,
-                ));
-                cf_objects.push(target_bitrate);
+                push_bitrate_property(properties, cf_objects, bitrate)?;
             }
-
-            properties.push((sys::kVTCompressionPropertyKey_ExpectedFrameRate, fps.0));
-            cf_objects.push(fps);
 
             // リアルタイムモード
             properties.push((
