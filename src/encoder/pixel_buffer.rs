@@ -195,6 +195,18 @@ impl<H: EncodeHandler> Encoder<H> {
         // 入力データの長さを検証
         Self::validate_frame_data(frame, width, height)?;
 
+        // PTS のオーバーフロー検査はリソース確保・送信より前に行う。オーバーフロー時はフレームを
+        // 送信せずに `next_input_pts` を変更しないままエラーを返す (送信後に検査すると、フレームが
+        // in-flight のまま失敗扱いになり、次回呼び出しで同一 PTS が再送される)。
+        // 入力検証 (pixel_format / データ長) を先に行い、その後に検査することで
+        // 無駄なバッファ確保・コピーを避けつつエラー優先順位を維持する。
+        let new_next_input_pts = self
+            .next_input_pts
+            .checked_add(self.config.fps_denominator as i64)
+            .ok_or(Error::LimitExceeded {
+                reason: "input presentation timestamp overflow".into(),
+            })?;
+
         unsafe {
             // CVPixelBufferCreate で CoreVideo にメモリを確保させ、入力データをコピーする。
             // CVPixelBufferCreateWithPlanarBytes を使うと外部メモリへの参照を渡すことになり、
@@ -276,12 +288,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 return Err(e);
             }
 
-            self.next_input_pts = self
-                .next_input_pts
-                .checked_add(self.config.fps_denominator as i64)
-                .ok_or(Error::LimitExceeded {
-                    reason: "input presentation timestamp overflow".into(),
-                })?;
+            self.next_input_pts = new_next_input_pts;
 
             Ok(())
         }
@@ -327,6 +334,18 @@ impl<H: EncodeHandler> Encoder<H> {
                 });
             }
 
+            // PTS のオーバーフロー検査はリソース確保・送信より前に行う。オーバーフロー時はフレームを
+            // 送信せずに `next_input_pts` を変更しないままエラーを返す (送信後に検査すると、フレームが
+            // in-flight のまま失敗扱いになり、次回呼び出しで同一 PTS が再送される)。
+            // 入力検証 (ピクセルフォーマット) を先に行い、その後に検査することで
+            // 無駄な CFRetain を避けつつエラー優先順位を維持する。
+            let new_next_input_pts = self
+                .next_input_pts
+                .checked_add(self.config.fps_denominator as i64)
+                .ok_or(Error::LimitExceeded {
+                    reason: "input presentation timestamp overflow".into(),
+                })?;
+
             // CFRetain して CfPtrMut でラップ（スコープ終了時に CFRelease される）
             sys::CFRetain(pixel_buffer_ptr.cast());
             let image_buffer = CfPtrMut(pixel_buffer_ptr.cast::<sys::__CVBuffer>());
@@ -358,12 +377,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 return Err(e);
             }
 
-            self.next_input_pts = self
-                .next_input_pts
-                .checked_add(self.config.fps_denominator as i64)
-                .ok_or(Error::LimitExceeded {
-                    reason: "input presentation timestamp overflow".into(),
-                })?;
+            self.next_input_pts = new_next_input_pts;
 
             Ok(())
         }
