@@ -621,6 +621,62 @@ fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
     Ok(())
 }
 
+#[test]
+fn encoder_config_returns_initial_value() -> Result<(), Error> {
+    let mut config = encoder_config(false);
+    // 既定値と区別できる値にする (ハードコードされた既定値を返す回帰を検出するため)
+    config.fps_numerator = 30;
+    config.real_time = true;
+    config.prioritize_encoding_speed_over_quality = true;
+    config.maximize_power_efficiency = true;
+    config.allow_frame_reordering = true;
+    config.max_key_frame_interval = std::num::NonZeroU32::new(60);
+    config.max_key_frame_interval_duration = Some(Duration::from_secs(2));
+    config.max_frame_delay_count = std::num::NonZeroU32::new(2);
+    config.data_rate_limits = Some(vec![DataRateLimit {
+        bytes: 93_750,
+        window: Duration::from_secs(1),
+    }]);
+    let encoder = Encoder::new(config.clone(), noop_encode_handler())?;
+    let got = encoder.config();
+    assert_eq!(got.width, config.width);
+    assert_eq!(got.height, config.height);
+    assert_eq!(got.fps_numerator, config.fps_numerator);
+    assert_eq!(got.fps_denominator, config.fps_denominator);
+    assert_eq!(got.average_bitrate, config.average_bitrate);
+    assert_eq!(got.pixel_format, config.pixel_format);
+    assert_eq!(got.real_time, config.real_time);
+    assert_eq!(got.allow_frame_reordering, config.allow_frame_reordering);
+    assert_eq!(
+        got.allow_temporal_compression,
+        config.allow_temporal_compression
+    );
+    assert_eq!(
+        got.prioritize_encoding_speed_over_quality,
+        config.prioritize_encoding_speed_over_quality
+    );
+    assert_eq!(
+        got.maximize_power_efficiency,
+        config.maximize_power_efficiency
+    );
+    assert_eq!(got.max_key_frame_interval, config.max_key_frame_interval);
+    assert_eq!(
+        got.max_key_frame_interval_duration,
+        config.max_key_frame_interval_duration
+    );
+    assert_eq!(got.max_frame_delay_count, config.max_frame_delay_count);
+    assert_eq!(got.data_rate_limits, config.data_rate_limits);
+    // codec はバリアントと中身を確認する
+    match (&got.codec, &config.codec) {
+        (CodecConfig::H264(a), CodecConfig::H264(b)) => {
+            assert_eq!(a.profile, b.profile);
+            assert_eq!(a.entropy_mode, b.entropy_mode);
+        }
+        _ => panic!("codec variant mismatch"),
+    }
+    Ok(())
+}
+
 /// スクロールするグラデーションと下部ノイズ帯で構成された合成フレームを生成する
 ///
 /// グラデーション部は圧縮が効き、ノイズ帯 (下部 1/4) がビット消費を押し上げるため、

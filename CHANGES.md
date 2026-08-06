@@ -60,6 +60,10 @@
 
 ### misc
 
+- [UPDATE] `Encoder::config` getter の単体テストを追加する
+  - `Encoder::new` 直後の `config()` が入力した全フィールドを変更なしで返すことを検証する
+    (`Some(空 Vec)` の `data_rate_limits` が `None` に正規化されるケースを除く)
+  - @voluntas
 - [UPDATE] `average_bitrate` / `expected_frame_rate` の CFNumber 構築と push をヘルパー関数に共通化する
   - `push_bitrate_property` / `push_expected_frame_rate_property` を追加し、
     `add_common_properties` と `reconfigure` の 2 箇所の重複を解消する

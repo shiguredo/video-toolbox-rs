@@ -3,7 +3,7 @@
 - Priority: Medium
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Opus 4.7
 - Branch: feature/add-encoder-config-getter-test
 - Polished: 2026-07-31
@@ -94,3 +94,9 @@ fn encoder_config_returns_initial_value() -> Result<(), Error> {
 ```
 
 `EncoderConfig` は `Clone` 派生済みであることを前提にする（`src/encoder.rs` の `#[derive(Debug, Clone)]`）。
+
+## 解決方法
+
+`tests/test_encoder.rs` に `encoder_config_returns_initial_value` テストを追加した。`Encoder::new` 直後に `encoder.config()` を呼び、入力した `EncoderConfig` の全 16 フィールドをフィールド単位で比較する。`codec` は `PartialEq` 未実装のためバリアント分解して `H264EncoderConfig` の中身 (`profile` / `entropy_mode`) を比較する。
+
+ハードコードされた既定値を返す回帰を検出できるよう、bool / Option / 数値フィールドを既定値と区別できる値に変更してから検証する。`data_rate_limits` は `Some(空 Vec)` の `None` 正規化の対象を避けるため非空の `Some` を使う。`CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した。`cargo test --workspace` は全 44 テストがパスする。
