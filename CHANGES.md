@@ -48,6 +48,10 @@
     `PixelFormatMismatch` と区別して実際の FourCC を診断情報として返す
   - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合は分岐の追加が必要になる
   - @voluntas
+- [CHANGE] `Error` 型の全 `&'static str` フィールドを `String` に変更し、エラーメッセージに動的な値を含められるようにする
+  - `Option` を返していた内部関数を `Result<_, Error>` に変更し、エラー情報をコールバック経由でユーザーに伝搬する
+  - 不要になった `tracing::error!()` を削除する
+  - @melpon
 - [FIX] 圧縮セッションのプロパティ設定が失敗したときにセッションがリークする問題を修正する
   - `VTCompressionSessionCreate` 成功後のセッションを `CfPtrMut` でガードし、エラーパスでは `Drop` が
     `CFRelease` で解放する
