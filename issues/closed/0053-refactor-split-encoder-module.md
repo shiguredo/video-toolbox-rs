@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Opus 4.7
 - Branch: feature/refactor-split-encoder-module
 - Polished: 2026-07-31
@@ -108,3 +108,18 @@ shiguredo-rust スキルの「`src/<module>/` のようにディレクトリモ�
 - `Encoder<H>` の impl ブロックをどう分割するか（同一型への impl ブロックを複数作って別モジュールに置く。`encode` / `encode_pixel_buffer` は `pixel_buffer.rs` の impl ブロックへ、`validate_config` / `validate_reconfigure_params` は `validation.rs` の impl ブロックへ移す）
 
 本 issue は上記の関連 issue とは独立して進められる。pending にはしない（完了条件まで定義済みの実装 issue であり、仕様的に対応が難しい issue ではない）。
+
+## 解決方法
+
+`src/encoder.rs` (1743 行) をディレクトリモジュール `src/encoder/` に分割した。shiguredo-rust 規約の「mod.rs を使わないこと」に従い、親は `src/encoder.rs` のままサブモジュールを `src/encoder/` 配下に置く構成とした (issue の設計方針の `src/encoder/mod.rs` は規約に合わせて変更)。
+
+- `src/encoder.rs`: モジュール宣言・re-export・`Encoder<H>` 構造体本体 (`new` / `config` / `reconfigure` / `finish`)・`Drop`・`Send`・内部テスト
+- `src/encoder/config.rs`: 設定型 (`EncoderConfig` / `ReconfigureParams` / `EncodeOptions` / `CodecConfig` 等)
+- `src/encoder/handler.rs`: `EncodeHandler` trait / `FnEncodeHandler`
+- `src/encoder/frame.rs`: `FrameData` / `EncodedFrame`
+- `src/encoder/validation.rs`: バリデーション (`validate_config` / `validate_reconfigure_params` 等)
+- `src/encoder/session.rs`: FFI セッション生成とプロパティ構築
+- `src/encoder/pixel_buffer.rs`: CVPixelBuffer 操作とフレーム送信 (`encode` / `encode_pixel_buffer`)
+- `src/encoder/callback.rs`: 出力コールバックとパラメータセット抽出
+
+`Encoder<H>` の impl ブロックは複数モジュールに分割し、親の `new` / `reconfigure` から呼ばれる関数は `pub(super)` 化した。公開 API のパスは不変 (`src/lib.rs` の `pub use encoder::{...}` は変更なし)。re-export の許可理由を `CODEBASE.md` に追記した。`CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した。`cargo test --workspace` は全 46 テストがパスし、`cargo doc --no-deps` も警告なしで通る。

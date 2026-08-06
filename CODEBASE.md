@@ -23,6 +23,20 @@
   本クレート単独で変更してはならない
 - 新たにトレイトを追加する場合は、必ず本ドキュメントに理由と共に追記すること
 
+## re-export の許可
+
+- `shiguredo-rust` 規約は原則として re-export を禁止しているが、本クレートでは
+  `encoder` モジュールのサブモジュール分割に伴い、公開 API のパス維持のため
+  `src/encoder.rs` での `pub use` による再公開を**許可済み**とする
+- 許可の根拠
+  - `src/encoder.rs` をディレクトリモジュール (`src/encoder/`) に分割した際、
+    `EncoderConfig` / `ReconfigureParams` / `FrameData` / `EncodeHandler` 等の公開型が
+    サブモジュール (`config` / `frame` / `handler`) に移動した
+  - `src/lib.rs` の `pub use encoder::{...}` と外部呼び出し側 (`use shiguredo_video_toolbox::Encoder`)
+    のパスを変えずに分割を実現するため、親モジュールでの re-export が必要
+  - モジュール構造の内部変更（分割）で公開 API のパスを維持するための例外的な許可であり、
+    新たな re-export を追加する場合は、必ず本ドキュメントに理由と共に追記すること
+
 ## テストの前提
 
 - 本クレートは Video Toolbox の実 FFI を叩くため、テスト実行には macOS が必須

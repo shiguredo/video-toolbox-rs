@@ -60,6 +60,10 @@
 
 ### misc
 
+- [UPDATE] `src/encoder.rs` をディレクトリモジュール `src/encoder/` に分割する
+  - `config` / `handler` / `frame` / `validation` / `session` / `pixel_buffer` / `callback` の 7 サブモジュールに責務を分離する
+  - 公開 API のパスは変更しない (re-export の許可理由は `CODEBASE.md` に追記)
+  - @voluntas
 - [UPDATE] `encoder_rejects_*` と `reconfigure_is_noop_when_all_none` のテストアサーションを強化する
   - `encoder_rejects_*` 系が `Error::InvalidConfig` の `reason` 文字列まで検証するようにする
   - `reconfigure_is_noop_when_all_none` が no-op 後に `encode` が成功することも検証するようにする
