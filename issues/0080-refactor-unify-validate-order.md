@@ -32,7 +32,7 @@ fps と bitrate の検証順序が経路ごとに異なる。
 - `Encoder::new` と `Encoder::reconfigure` の両方で、fps と bitrate を同時に不正にした場合に fps のエラーが先に返る
 - 検証順序を検証するテストが追加されている
 - `CHANGES.md` の `## develop` に `[UPDATE]` としてリファクタリングのエントリを追記する（`### misc` サブセクション）
-- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` が通る
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace -- --test-threads=1` が通る
 
 ## 解決方法
 

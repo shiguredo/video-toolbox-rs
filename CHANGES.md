@@ -72,6 +72,14 @@
 
 ### misc
 
+- [UPDATE] CI / Makefile / prek.toml のコマンドフラグを統一する
+  - clippy を `cargo clippy --workspace --all-targets -- -D warnings` に統一し、テストコードの
+    警告を全経路で検出できるようにする
+  - test を `cargo test --workspace -- --test-threads=1` に統一する
+    （ハードウェアリソース競合回避のため直列実行）
+  - fmt を `cargo fmt --all -- --check` に統一し、書き換えなしの検出のみにする
+  - 既存 open issue の完了条件に記載のコマンドも統一後の形式に追従させる
+  - @voluntas
 - [UPDATE] テスト関数に doc コメントを追加する
   - `tests/test_encoder.rs` / `tests/test_decoder.rs` / `tests/test_error.rs` の全 `#[test]`
     関数に「何を検証するか・なぜその値を使うか」を日本語の doc コメントで追記する

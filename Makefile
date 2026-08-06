@@ -1,8 +1,8 @@
 .PHONY: test cover pbt pbt-with-cover fuzzing fuzzing-list check clippy fmt clean
 
-# 全テストを実行する
+# 全テストを実行する (ハードウェアリソース競合回避のため直列)
 test:
-	cargo test --workspace
+	cargo test --workspace -- --test-threads=1
 
 # 全テストカバレッジ付きで実行する
 cover:
@@ -31,13 +31,13 @@ fuzzing-list:
 check:
 	cargo check --workspace
 
-# cargo clippy を実行する
+# cargo clippy を実行する (テスト・example・ベンチも対象)
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
-# cargo fmt を実行する
+# cargo fmt の未フォーマットを検出する (書き換えはしない)
 fmt:
-	cargo fmt --all
+	cargo fmt --all -- --check
 
 # ビルド成果物を削除する
 clean:

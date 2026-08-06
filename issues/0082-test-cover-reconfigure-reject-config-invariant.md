@@ -27,4 +27,4 @@
 - `reconfigure_err` ヘルパー（または同等の仕組み）が拒否後の `config()` の不変性を検証している
 - `reconfigure_rejects_*` 系テストがすべて通過する
 - `cargo test --test test_encoder` で全テストが通る
-- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` が通る
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` が通る

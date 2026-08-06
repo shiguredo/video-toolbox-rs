@@ -34,7 +34,7 @@
 - `I420Frame` / `Nv12Frame` の `Drop` 実装が削除されていること（二重アンロックの防止）
 - `I420Frame` / `Nv12Frame` の公開 API の変更がないこと
 - `CHANGES.md` の `## develop` に `[UPDATE]`（`### misc`）としてエントリを追記する
-- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
 
 ## 関連 issue
 

@@ -23,4 +23,4 @@
 
 - `src/types.rs` の `CfPtrMut` に `into_raw` メソッドを追加する
 - `src/encoder.rs` の `create_compression_session` の成功パスを `into_raw` を使う形に置き換える
-- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
