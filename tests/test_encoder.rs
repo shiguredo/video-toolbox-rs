@@ -1,7 +1,12 @@
 //! `encoder` モジュール (src/encoder.rs と src/encoder/) に対応する単体テスト
 
+mod helpers;
+
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -875,4 +880,76 @@ fn data_rate_limits_cap_windowed_output_h264() -> Result<(), Error> {
 #[test]
 fn data_rate_limits_cap_windowed_output_h265() -> Result<(), Error> {
     data_rate_limits_cap_windowed_output(true)
+}
+
+/// ユーザーハンドラが 1 回目に panic してもプロセスが abort せず、
+/// panic 捕捉後にセッションが継続して後続フレームが届くことを確認する
+///
+/// 1 回目のコールバックで panic し、2 回目 (user_data = 2) だけが届くことを期待している。
+/// `allow_frame_reordering: false` のため投入順でコールバックされる (Video Toolbox の
+/// 保証ではなく実測前提であり、既存テストも同じ前提)。
+#[test]
+fn handler_panic_is_caught_and_encode_continues() -> Result<(), Error> {
+    // コールバックは Video Toolbox の別スレッドで実行されるため、グローバル subscriber で
+    // ログを収集する (with_default はスレッドローカルで届かない)
+    let logs = helpers::init_global_log_collector();
+    helpers::clear_logs(&logs);
+
+    encode_with_panicking_handler()?;
+
+    let log = helpers::take_logs(&logs);
+    helpers::assert_log_contains(&log, "output_callback_h264: user handler panicked");
+    helpers::assert_log_contains(&log, "intentional panic in test handler");
+    Ok(())
+}
+
+fn encode_with_panicking_handler() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            let panicked = Arc::clone(&panicked);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                // 1 回目のコールバックだけ panic して、後続は正常に結果を返す
+                if !panicked.swap(true, Ordering::Relaxed) {
+                    panic!("intentional panic in test handler");
+                }
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        2,
+    )?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match &callbacks[0] {
+        Ok(frame) => assert_eq!(frame.user_data, 2),
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+    }
+    Ok(())
 }

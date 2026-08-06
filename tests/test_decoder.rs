@@ -1,6 +1,11 @@
 //! `src/decoder.rs` に対応する単体テスト
 
-use std::sync::{Arc, Mutex};
+mod helpers;
+
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use shiguredo_video_toolbox::{
     DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat,
@@ -9,6 +14,23 @@ use shiguredo_video_toolbox::{
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
+
+/// H.264 デコードテスト用の SPS パラメータセット
+const H264_SPS: &[u8] = &[
+    103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22, 45, 150,
+];
+
+/// H.264 デコードテスト用の PPS パラメータセット
+const H264_PPS: &[u8] = &[104, 235, 227, 203, 34, 192];
+
+/// H.264 デコードテスト用の NAL ユニット (I フレーム 1 枚分)
+const H264_NAL_UNIT: &[u8] = &[
+    101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247, 102,
+    163, 229, 208, 146, 229, 251, 16, 96, 250, 208, 0, 0, 3, 0, 0, 3, 0, 0, 16, 15, 210, 222, 245,
+    204, 98, 91, 229, 32, 0, 0, 9, 216, 2, 56, 13, 16, 118, 133, 116, 69, 196, 32, 71, 6, 120, 150,
+    16, 161, 210, 50, 128, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3,
+    0, 0, 3, 0, 37, 225,
+];
 
 enum DecodeEvent {
     I420 {
@@ -25,6 +47,14 @@ enum DecodeEvent {
 }
 
 type SharedDecodeResults = Arc<Mutex<Vec<DecodeEvent>>>;
+
+/// H.264 の長さプレフィクス (4 バイト) 付き NAL ユニットのデータを構築する
+fn h264_nalu_data() -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&(H264_NAL_UNIT.len() as u32).to_be_bytes());
+    data.extend_from_slice(H264_NAL_UNIT);
+    data
+}
 
 fn push_decode_event(results: &SharedDecodeResults, result: Result<DecodedFrame<u64>, Error>) {
     let event = match result {
@@ -84,17 +114,12 @@ fn decoder_av1_rejects_height_above_i32_max() {
 
 #[test]
 fn h264_decoder() -> Result<(), Error> {
-    let sps = [
-        103, 100, 0, 30, 172, 217, 64, 160, 61, 176, 17, 0, 0, 3, 0, 1, 0, 0, 3, 0, 50, 15, 22, 45,
-        150,
-    ];
-    let pps = [104, 235, 227, 203, 34, 192];
     let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
     let mut decoder = Decoder::new(
         DecoderConfig {
             codec: DecoderCodec::H264 {
-                sps: &sps,
-                pps: &pps,
+                sps: H264_SPS,
+                pps: H264_PPS,
                 nalu_len_bytes: 4,
             },
             pixel_format: PixelFormat::I420,
@@ -107,16 +132,7 @@ fn h264_decoder() -> Result<(), Error> {
         }),
     )?;
 
-    let nal_unit = [
-        101, 136, 132, 0, 43, 255, 254, 246, 115, 124, 10, 107, 109, 176, 149, 46, 5, 118, 247,
-        102, 163, 229, 208, 146, 229, 251, 16, 96, 250, 208, 0, 0, 3, 0, 0, 3, 0, 0, 16, 15, 210,
-        222, 245, 204, 98, 91, 229, 32, 0, 0, 9, 216, 2, 56, 13, 16, 118, 133, 116, 69, 196, 32,
-        71, 6, 120, 150, 16, 161, 210, 50, 128, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0,
-        3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 37, 225,
-    ];
-    let mut data = Vec::new();
-    data.extend_from_slice(&(nal_unit.len() as u32).to_be_bytes());
-    data.extend_from_slice(&nal_unit);
+    let data = h264_nalu_data();
     decoder.decode(&data, 7)?;
     decoder.finish()?;
 
@@ -467,5 +483,71 @@ fn vp9_decoder() -> Result<(), Error> {
     }
     assert!(seen.iter().all(|v| *v), "some callbacks are missing");
 
+    Ok(())
+}
+
+/// ユーザーハンドラが 1 回目に panic してもプロセスが abort せず、
+/// panic 捕捉後にセッションが継続して後続フレームが届くことを確認する
+///
+/// 1 回目のコールバックで panic し、2 回目 (user_data = 2) だけが届くことを期待している。
+/// 本テストは I フレームのみを投入するため表示順 = 投入順でコールバックされ、同一の
+/// IDR フレームを 2 回 decode すると Video Toolbox は各 decode につき 1 フレーム出力する
+/// (いずれも実測前提で、Video Toolbox のドキュメント保証ではない)。
+#[test]
+fn handler_panic_is_caught_and_decode_continues() -> Result<(), Error> {
+    // コールバックは Video Toolbox の別スレッドで実行されるため、グローバル subscriber で
+    // ログを収集する (with_default はスレッドローカルで届かない)
+    let logs = helpers::init_global_log_collector();
+    helpers::clear_logs(&logs);
+
+    decode_with_panicking_handler()?;
+
+    let log = helpers::take_logs(&logs);
+    helpers::assert_log_contains(&log, "output_callback: user handler panicked");
+    helpers::assert_log_contains(&log, "intentional panic in test handler");
+    Ok(())
+}
+
+fn decode_with_panicking_handler() -> Result<(), Error> {
+    let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::H264 {
+                sps: H264_SPS,
+                pps: H264_PPS,
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::I420,
+        },
+        FnDecodeHandler::new({
+            let results = Arc::clone(&results);
+            let panicked = Arc::clone(&panicked);
+            move |result: Result<DecodedFrame<u64>, Error>| {
+                // 1 回目のコールバックだけ panic して、後続は正常に結果を返す
+                if !panicked.swap(true, Ordering::Relaxed) {
+                    panic!("intentional panic in test handler");
+                }
+                push_decode_event(&results, result);
+            }
+        }),
+    )?;
+
+    let data = h264_nalu_data();
+    decoder.decode(&data, 1)?;
+    decoder.decode(&data, 2)?;
+    decoder.finish()?;
+
+    let callbacks = take_results(&results);
+    assert_eq!(callbacks.len(), 1);
+    match callbacks
+        .into_iter()
+        .next()
+        .expect("コールバック結果が届いていない")
+    {
+        DecodeEvent::I420 { user_data, .. } => assert_eq!(user_data, 2),
+        DecodeEvent::Nv12 { .. } => unreachable!("I420 を期待したが NV12 が届いた"),
+        DecodeEvent::Err(e) => panic!("想定外のデコードコールバックエラー: {e}"),
+    }
     Ok(())
 }

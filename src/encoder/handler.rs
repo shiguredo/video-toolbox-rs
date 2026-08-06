@@ -5,6 +5,10 @@ use crate::{encoder::frame::EncodedFrame, error::Error};
 /// エンコード結果を通知するためのハンドラー
 ///
 /// エンコード処理が完了するたびに [`EncodeHandler::on_encoded`] が呼ばれる。
+/// `on_encoded` 内で panic してもプロセスは abort せず、panic は捕捉されて
+/// エラーログ（コールバック名 + panic メッセージ）が出力され、エンコードセッションは継続する。
+/// ただし、ホストアプリが abort するカスタム panic hook をインストールしている場合や
+/// `panic=abort` ビルドでは捕捉されず abort する。
 pub trait EncodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;

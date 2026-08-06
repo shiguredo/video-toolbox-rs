@@ -25,6 +25,8 @@ raden = "2026.1"
 shiguredo_libvpx = "2026.1"
 # サンプル / テストで MP4 を扱うために使用
 shiguredo_mp4 = "2026.3"
+# コールバックの panic 捕捉時のログ出力をテストで検証するために使用
+tracing-subscriber = "0.3"
 
 [build-dependencies]
 # Video Toolbox の C API から Rust バインディングを生成するために使用

@@ -1,7 +1,7 @@
 # `extern "C"` コールバック内の panic でプロセスが abort する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-06
 - Branch: feature/fix-extern-c-callback-panic
 - Polished: 2026-08-01
 
@@ -31,12 +31,13 @@ shiguredo-rust 規約の「`std::panic::catch_unwind` を使わないこと」�
 
 ### 保護範囲
 
-保護対象は `on_encoded` / `on_decoded` 内の panic のみ。エラーパスで drop される `H::UserData` の `Drop` 実装内の panic は `catch_unwind` の対象外であり、`extern "C"` 境界を越えて abort し得る。これは本 issue の保証の範囲外とする。
+保護対象は `on_encoded` / `on_decoded` 内の panic のみ。ユーザーハンドラがフレームを即時 drop する典型的な使い方では `H::UserData` の `Drop` は `catch_unwind` 内で実行されるため、その `Drop` 実装内の panic は二重 panic で abort し得る（エラーパス・成功パスを問わない）。エラーパスで drop される `H::Error` の `Drop` 実装内の panic も同様。これらは本 issue の保証の範囲外とする。
 
 ### 変更対象
 
-- `src/encoder.rs`: `invoke_callback` 内の `handler.on_encoded` 呼び出しを `catch_unwind` で包む（`&mut H` は `UnwindSafe` でないため `AssertUnwindSafe` が必要）。panic 捕捉時のエラーログにコールバック名を含めるため、`invoke_callback` へ `callback_name` 引数を追加し、呼び出し箇所（8 箇所）を更新する
-- `src/decoder.rs`: 同様（`handler.on_decoded` を包み、`callback_name` 引数を追加して呼び出し箇所（4 箇所）を更新する）
+- `src/encoder.rs`: `invoke_callback` 内の `handler.on_encoded` 呼び出しを `catch_unwind` で包む（`&mut H` は `UnwindSafe` でないため `AssertUnwindSafe` が必要）。panic 捕捉時のエラーログにコールバック名を含めるため、`invoke_callback` へ `callback_name` 引数を追加し、呼び出し箇所（9 箇所）を更新する
+- `src/decoder.rs`: 同様（`handler.on_decoded` を包み、`callback_name` 引数を追加して呼び出し箇所（5 箇所）を更新する）
+- `src/types.rs`: `catch_user_panic`（encoder / decoder 共通の panic 捕捉関数）と `panic_payload_message`（panic メッセージ抽出）を追加
 - `Cargo.toml`: テストのログ検証用に `tracing-subscriber` を dev-dependencies へ追加
 - `CODEBASE.md`: `catch_unwind` 例外の根拠付き記載
 - `CHANGES.md`: `[FIX]` エントリ
@@ -54,3 +55,33 @@ shiguredo-rust 規約の「`std::panic::catch_unwind` を使わないこと」�
 
 - issue 0041: 同一のコールバック経路（`process_encoded_output` / `invoke_callback`）を変更対象とするため、実装順序と差分衝突に注意する
 - issue 0053: `encoder.rs` のモジュール分割で `output_callback_h264` / `output_callback_h265` / `process_encoded_output` / `invoke_callback` が別ファイルへ移動するため、実装順序と差分衝突に注意する
+
+## 解決方法
+
+- `src/types.rs` に `catch_user_panic`（encoder / decoder 共通の panic 捕捉関数）を追加した
+  - `std::panic::catch_unwind` + `AssertUnwindSafe` でユーザーハンドラの呼び出しを包み、捕捉した panic は
+    `panic_payload_message` でメッセージを取り出して `tracing::error!` で「コールバック名 + panic メッセージ」のエラーログを出力する
+  - 捕捉後のセッションは継続し、後続フレームのコールバックでハンドラは再度呼ばれる
+  - `&Box<dyn Any + Send>` を `&(dyn Any + Send)` に渡すと deref されず Box 構造体自体が unsize されて
+    downcast が失敗するため、`&*payload` で明示的に deref している
+- `src/encoder/callback.rs` / `src/decoder.rs` の `invoke_callback` に `callback_name` 引数を追加し、
+  `handler.on_encoded` / `handler.on_decoded` の呼び出しを `catch_user_panic` 経由に置き換えた
+  （encoder 9 箇所 / decoder 5 箇所の呼び出し箇所を更新）
+- 公開 API の `EncodeHandler` / `DecodeHandler` の doc に「panic しても abort せずエラーログが出て
+  セッションが継続する」旨の保証を追記した（`panic=abort` ビルド等では成立しない但し書き付き）
+- テスト
+  - `tests/test_encoder.rs` に `handler_panic_is_caught_and_encode_continues` を追加した
+    （H.264 エンコーダーで 1 回目のコールバックを panic させ、2 回目のフレームが届くことと
+     `output_callback_h264: user handler panicked` のエラーログを検証）
+  - `tests/test_decoder.rs` に `handler_panic_is_caught_and_decode_continues` を追加した
+    （H.264 デコーダーで同様の検証）
+  - `src/types.rs` に `panic_payload_message` の 3 分岐（`&str` / `String` / unknown）のテストを追加した
+  - ログ収集は `tests/helpers.rs` の `LogCollector` / `init_global_log_collector`（グローバル subscriber）
+    で行う（Video Toolbox のコールバックは別スレッドで実行されるため）
+- `tracing-subscriber` を dev-dependencies に追加し、`CODEBASE.md` に「catch_unwind の許可」を
+  根拠付きで追記した
+- 完了条件の確認結果
+  - panic するハンドラを登録した encoder / decoder のテストで、abort せずに panic が捕捉されることを確認
+  - panic 捕捉後もセッションが継続し、後続フレームの結果がハンドラに届くことを確認
+  - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` /
+    `cargo fmt --all -- --check` がすべて通ることを確認
