@@ -2,6 +2,8 @@
 
 use shiguredo_video_toolbox::{Error, PixelFormat};
 
+/// Error::LimitExceeded と Error::CfObjectCreationFailed の Display 出力が、
+/// reason / function を含む英語メッセージになることを検証する
 #[test]
 fn error_display_limit_exceeded_and_cf_object_creation_failed() {
     let e = Error::LimitExceeded {
@@ -18,9 +20,11 @@ fn error_display_limit_exceeded_and_cf_object_creation_failed() {
     assert!(s.contains("null"));
 }
 
+/// Error::UnknownPixelFormat の Display 出力が、FourCC と期待フォーマットを含む
+/// 英語メッセージになることを検証する。FourCC 0x30323449 は 'I420' の
+/// リトルエンディアン表現で、Nv12 期待時に I420 バッファを渡した状況を再現する
 #[test]
 fn error_display_unknown_pixel_format() {
-    // FourCC `I420` (0x30323449) を未知フォーマットとして渡した場合の表示を確認する
     let e = Error::UnknownPixelFormat {
         expected: PixelFormat::Nv12,
         fourcc: 0x3032_3449,
