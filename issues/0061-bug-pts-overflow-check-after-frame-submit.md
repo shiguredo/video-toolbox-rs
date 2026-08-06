@@ -1,7 +1,7 @@
 # PTS オーバーフロー検査がフレーム送信後に行われる
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-06
 - Branch: feature/fix-pts-overflow-check-order
 - Polished: 2026-08-01
 
@@ -47,3 +47,29 @@
 - issue 0073: `encode` / `encode_pixel_buffer` の重複解消を対象とし、同一のコード領域を変更する。0073 側から本 issue の修正（両関数への適用）を前提としているため、本 issue を先に実施し、その後 0073 を実施する
 - issue 0053: `encode` 系の `pixel_buffer.rs` への移動が同一領域に触れる
 - issue 0055: `cf_dictionary` の所有権統一が同一領域に触れる
+
+## 解決方法
+
+- `src/encoder/pixel_buffer.rs` の `Encoder::encode` / `Encoder::encode_pixel_buffer` で、
+  `next_input_pts` の `checked_add` を `VTCompressionSessionEncodeFrame` 呼び出し前に移動した
+  - 入力検証（ピクセルフォーマット / データ長）を先に行い、その後に PTS 検査を実行する。
+    オーバーフロー時はフレームを送信せずに `Error::LimitExceeded`
+    （`reason: "input presentation timestamp overflow"`）を返し、`next_input_pts` を変更しない
+  - 送信 PTS は従来どおり現在の `self.next_input_pts` を渡し、`VTCompressionSessionEncodeFrame`
+    成功後にのみ `self.next_input_pts = new_next_input_pts` を代入する（送信失敗時は進めない）
+  - 検査が `Box::into_raw` より前にあるため、オーバーフロー時に `user_data` は通常の drop で
+    解放される（旧実装では送信後に検査するため、Box 化済みの `user_data` がリークし得た）
+- テスト（`src/encoder.rs` の `#[cfg(test)]` モジュール）
+  - `encode_rejects_pts_overflow_before_frame_submit` / `encode_pixel_buffer_rejects_pts_overflow_before_frame_submit`
+    を追加した。`next_input_pts` へ直接 `i64::MAX` を書き込み、オーバーフロー時に
+    送信 API がエラーを返すこと・`next_input_pts` が不変であること・以後の呼び出しも
+    同じエラーを返すこと・出力コールバックが発火しないことを検証する
+  - コールバック非発火の検証は「一定時間待ってカウント 0」のため、陽性対照
+    （正常フレーム 1 枚を送ってコールバックが届くこと）を併設し、基準値は陽性対照の
+    完了後に取得する
+  - `encode_pixel_buffer` のテストは `sys::CVPixelBufferCreate` で有効な CVPixelBuffer を
+    生成して実行する
+- 完了条件の確認結果
+  - オーバーフロー時にフレームが送信されないこと（コールバック非発火）をテストで確認
+  - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` /
+    `cargo fmt --all -- --check` がすべて通ることを確認
