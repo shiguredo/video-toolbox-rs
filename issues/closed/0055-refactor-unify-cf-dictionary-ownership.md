@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-07-16
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Fable 5
 - Branch: feature/refactor-unify-cf-dictionary-ownership
 - Polished: 2026-07-31
@@ -79,3 +79,16 @@ let frame_properties_ptr =
 - `CHANGES.md` の `## develop` に `[UPDATE]` としてリファクタリングのエントリを追記する（公開 API の変更を伴わないため `### misc` サブセクション）
 - `cargo test --workspace` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check` が通る
 - 挙動変更が無いこと (リファクタリングのみ)
+
+## 解決方法
+
+`src/types.rs` の `cf_dictionary` の返り値を `sys::CFDictionaryRef` から `CfPtr<c_void>` に変更し、`cf_array` / `cf_number_*` と同じく drop 時に `CFRelease` されるガードを返すようにした。あわせて所有権 doc コメント (要素 retain・ガードの生存契約) を追加した。
+
+呼び出し側 5 箇所の手動ラップを削除した:
+
+- `src/encoder.rs` の `Encoder::reconfigure`: `properties_dict.0.cast()` を直接 FFI に渡す
+- `src/encoder/session.rs` の `create_compression_session`: 同上
+- `src/encoder/pixel_buffer.rs` の `encode` / `encode_pixel_buffer`: `Option<CfPtr<c_void>>` を組み立て、`map_or` で生ポインタを導出して FFI に渡す (ガードは FFI 呼び出しまで生存)
+- `src/decoder.rs` の `create_decompression_session`: `dest_attrs.0.cast()` を直接 FFI に渡す
+
+挙動変更はなく、全パスでガードの生存期間が FFI 呼び出しを跨ぐことを確認した。`CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した。`cargo test --workspace` は全 46 テストがパスする。

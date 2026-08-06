@@ -6,7 +6,7 @@ use crate::{
     encoder::{Encoder, config::EncodeOptions, frame::FrameData, handler::EncodeHandler},
     error::Error,
     sys,
-    types::{CfPtr, CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_dictionary},
+    types::{CfPtrMut, CvPixelBufferUnlockGuard, PixelFormat, cf_dictionary},
 };
 
 impl<H: EncodeHandler> Encoder<H> {
@@ -249,18 +249,16 @@ impl<H: EncodeHandler> Encoder<H> {
             }
 
             let frame_properties = if options.force_key_frame {
-                cf_dictionary(&[(
+                Some(cf_dictionary(&[(
                     sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
                     sys::kCFBooleanTrue as *const c_void,
-                )])?
-            } else {
-                std::ptr::null()
-            };
-            let _frame_properties_guard = if !frame_properties.is_null() {
-                Some(CfPtr(frame_properties.cast::<c_void>()))
+                )])?)
             } else {
                 None
             };
+            let frame_properties_ptr = frame_properties
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g.0.cast());
             let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
 
             let status = sys::VTCompressionSessionEncodeFrame(
@@ -268,7 +266,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 image_buffer.0,
                 sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
                 sys::kCMTimeInvalid,
-                frame_properties,
+                frame_properties_ptr,
                 source_frame_ref_con,
                 std::ptr::null_mut(),
             );
@@ -334,18 +332,16 @@ impl<H: EncodeHandler> Encoder<H> {
             let image_buffer = CfPtrMut(pixel_buffer_ptr.cast::<sys::__CVBuffer>());
 
             let frame_properties = if options.force_key_frame {
-                cf_dictionary(&[(
+                Some(cf_dictionary(&[(
                     sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
                     sys::kCFBooleanTrue as *const c_void,
-                )])?
-            } else {
-                std::ptr::null()
-            };
-            let _frame_properties_guard = if !frame_properties.is_null() {
-                Some(CfPtr(frame_properties.cast::<c_void>()))
+                )])?)
             } else {
                 None
             };
+            let frame_properties_ptr = frame_properties
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g.0.cast());
             let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
 
             let status = sys::VTCompressionSessionEncodeFrame(
@@ -353,7 +349,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 image_buffer.0,
                 sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
                 sys::kCMTimeInvalid,
-                frame_properties,
+                frame_properties_ptr,
                 source_frame_ref_con,
                 std::ptr::null_mut(),
             );

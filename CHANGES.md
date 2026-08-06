@@ -60,6 +60,9 @@
 
 ### misc
 
+- [UPDATE] `cf_dictionary` の返り値を `CfPtr` ガード付きに統一する
+  - `cf_array` / `cf_number_*` と同じく drop 時に `CFRelease` されるガードを返すようにし、呼び出し側での手動ラップを不要にする
+  - @voluntas
 - [UPDATE] `src/encoder.rs` をディレクトリモジュール `src/encoder/` に分割する
   - `config` / `handler` / `frame` / `validation` / `session` / `pixel_buffer` / `callback` の 7 サブモジュールに責務を分離する
   - 公開 API のパスは変更しない (re-export の許可理由は `CODEBASE.md` に追記)
