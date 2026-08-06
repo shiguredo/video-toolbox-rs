@@ -3,9 +3,9 @@
 - Priority: Low
 - Created: 2026-05-13
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: deepseek-v4-pro
-- Branch: feature/refactor-reduce-log-output
+- Branch: feature/change-reduce-log-output
 - Polished: 2026-07-31
 
 ## 方針
@@ -414,3 +414,18 @@ unsafe extern "C" fn output_callback(
 - 「対象外」に挙げた 4 箇所以外の `tracing::error!()` がすべて削除されていること
 - 関連するテストの修正が完了し、 `cargo test` がパスすること
 - `CHANGES.md` の `## develop` セクションに `[CHANGE]` エントリが追記されていること
+
+## 解決方法
+
+`Error` 型の全 `&'static str` フィールドを `String` に変更し、動的な値（実測値・異常値等）をエラーメッセージに含められるようにした。
+
+- `src/error.rs`: 全 7 フィールドを `String` に変更、`Error::check()` の引数を `impl Into<String>` に変更、`LimitExceeded` の rustdoc を「防御的な上限超過や異常値（null ポインタ等）」に更新
+- `src/encoder.rs`: `take_user_data` / `extract_h264_params` / `extract_h265_params` / `vec_u8_from_raw_parts_safe` を `Result<_, Error>` に変更、`process_encoded_output` の処理順序を `callback_from_ref_con` → `take_user_data` に入れ替え、全構築箇所に `.into()` を追加、`tracing::error!()` 12 箇所を削除
+- `src/decoder.rs`: `take_pending_decode` を `Result<_, Error>` に変更、`output_callback` の処理順序を入れ替え、全構築箇所に `.into()` を追加、`tracing::error!()` 1 箇所を削除
+- `src/types.rs`: `Error` 構築箇所に `.into()` を追加
+- `tests/test_encoder.rs`: リテラルパターンマッチ 21 箇所を match guard に変更
+- `tests/test_decoder.rs`: リテラルパターンマッチ 2 箇所を match guard に変更
+- `tests/test_error.rs`: `Error` 構築箇所に `.into()` を追加
+- `CHANGES.md`: `[CHANGE]` エントリを追記
+
+なお、`LimitExceeded` への null ポインタ等の異常値の割り当ては `copy_plane` と同じ既存の慣行に従う。ブランチ名は後方互換のない変更を含むため `feature/change-reduce-log-output` とした。`cargo test --workspace` は全 33 テストがパスする。
