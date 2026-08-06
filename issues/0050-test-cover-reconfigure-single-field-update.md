@@ -3,7 +3,7 @@
 - Priority: Medium
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Opus 4.7
 - Branch: feature/add-reconfigure-single-field-update-tests
 - Polished: 2026-07-31
@@ -99,3 +99,12 @@ fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
     Ok(())
 }
 ```
+
+## 解決方法
+
+`tests/test_encoder.rs` に以下 2 件の integration test を追加した:
+
+- `reconfigure_updates_only_average_bitrate`: `average_bitrate: Some(250_000)` のみ指定し、fps (30_000/1_001) が初期値のまま保たれることを検証する
+- `reconfigure_updates_only_expected_frame_rate`: `expected_frame_rate: Some(60)` のみ指定し、bitrate が初期値のまま保たれ、`fps_denominator` が 1 に正規化されることを検証する
+
+両テストとも初期 fps を分数 (30_000/1_001) にすることで、既定値 (1/1) への巻き戻りや分母の誤正規化を検出できるようにした。テスト 2 は初期 bitrate を既定値と区別できる値 (250_000) にし、fps 更新時に bitrate が初期値へ上書きされる回帰も検出できるようにした。`CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した。`cargo test --workspace` は全 46 テストがパスする。
