@@ -26,4 +26,4 @@
 - `reconfigure_updates_data_rate_limits`（または同等のテスト）が更新後に `average_bitrate` / `fps_numerator` / `fps_denominator` の不変を検証している
 - `data_rate_limits` の反映・解除の検証が維持されている
 - `cargo test --test test_encoder` で全テストが通る
-- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` が通る
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` が通る

@@ -30,7 +30,7 @@
 - `expected_frame_rate` と `fps_numerator` の上限エラー reason が実用途 (CMTimeMake の timescale と CFNumber) を述べる文面になっている
 - `tests/test_encoder.rs` の `reconfigure_rejects_expected_frame_rate_above_i32_max` 等、reason を検証しているテストの期待値が更新されている
 - `CHANGES.md` の `## develop` に `[UPDATE]` としてエントリを追記する
-- `cargo fmt --all -- --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test` が通る
+- `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace -- --test-threads=1` が通る
 
 ## 解決方法
 

@@ -57,7 +57,7 @@ shiguredo-rust スキルは「PBT(Property-Based Testing) や Fuzzing でテス�
 - `Encoder::new` / `Encoder::reconfigure` が不正入力を必ず `Err` で拒否することを検証する PBT が `pbt/tests/prop_encoder.rs` に存在する（拒否域のみ。「不正フィールドを 1 個だけ固定し、残りは有効範囲から生成する」戦略。受理域は実 FFI セッション依存のため対象外）
 - 既存の単体テストのうち、追加する PBT で完全に代替できるものは削除されている（既存の `encoder_rejects_*` / `reconfigure_rejects_*` テストは field / reason 文字列まで検証しており、PBT の性質検証では代替されない。`src/encoder.rs` の内部テスト 3 本も FFI 経路・制御フロー・失敗時の状態不変を検証しており、PBT では代替されない）
 - `CHANGES.md` の `## develop` に `[UPDATE]` としてエントリを追記する（`### misc` サブセクション）
-- `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る（clippy / fmt のフラグは issue 0070 の統一後に追従する）
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
 
 ## 解決方法
 

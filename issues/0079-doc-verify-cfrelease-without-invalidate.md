@@ -23,4 +23,4 @@ Apple の公式ドキュメント（`VTCompressionSession` のリファレンス
 
 - Apple の公式ドキュメントで、未使用セッションの `CFRelease` のみでの解放が安全である根拠（retain count が 0 になった時点の自動 invalidate）を確認する
 - 確認した根拠を `src/encoder.rs` のコメントに追記する
-- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る

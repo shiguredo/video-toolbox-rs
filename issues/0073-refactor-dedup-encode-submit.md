@@ -33,7 +33,7 @@
 - `VTCompressionSessionEncodeFrame` 呼び出し周りのロジックが 1 箇所に集約されていること
 - 公開 API の変更がないこと。挙動変更がないこと（リファクタリングのみ）
 - `CHANGES.md` の `## develop` に `[UPDATE]`（`### misc`）としてエントリを追記する
-- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
 
 ## 関連 issue
 

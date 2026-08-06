@@ -39,7 +39,7 @@
 - `PixelFormat::Nv12` でのデコードパスと `Nv12Frame` の全メソッドを検証するテストが存在すること
 - `Error` の Display の未テスト 5 バリアントを検証するテストが存在すること
 - `CHANGES.md` の `## develop` に `[UPDATE]`（`### misc`）としてエントリを追記する
-- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
 
 ## 関連 issue
 

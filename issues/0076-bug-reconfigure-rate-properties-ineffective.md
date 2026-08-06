@@ -76,4 +76,4 @@
 - 「実効化する」を採った場合: 修正が実施され、実測で「設定・解除が出力レートに反映される」ことを検証するテスト（`data_rate_limits_cap_windowed_output` の拡張等）が追加されている
 - 「契約を実態に合わせる」を採った場合: `ReconfigureParams` の rustdoc / CHANGES.md / README の契約を実態に合わせて修正している（エンコード開始前のみ有効であることを明記）
 - `CHANGES.md` にエントリを追記する
-- `cargo test --workspace` / `cargo clippy --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check` が通る
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
