@@ -4,8 +4,7 @@ use crate::{
     error::Error,
     sys::{self, OpaqueCMBlockBuffer, opaqueCMSampleBuffer},
     types::{
-        CfPtr, CfPtrMut, PixelFormat, cf_dictionary, cf_number_i32,
-        validate_video_dimensions_for_toolbox,
+        CfPtrMut, PixelFormat, cf_dictionary, cf_number_i32, validate_video_dimensions_for_toolbox,
     },
 };
 
@@ -350,12 +349,11 @@ impl<H: DecodeHandler> Decoder<H> {
             };
             let pf = cf_number_i32(cv_pixel_format as i32)?;
             let dest_attrs = cf_dictionary(&[(sys::kCVPixelBufferPixelFormatTypeKey, pf.0)])?;
-            let _dest_attrs_guard = CfPtr(dest_attrs.cast::<c_void>());
             let status = sys::VTDecompressionSessionCreate(
                 std::ptr::null_mut(),
                 description,
                 std::ptr::null_mut(),
-                dest_attrs,
+                dest_attrs.0.cast(),
                 &record,
                 &mut session,
             );

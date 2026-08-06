@@ -141,8 +141,7 @@ impl<H: EncodeHandler> Encoder<H> {
             }
 
             let properties_dict = cf_dictionary(&properties)?;
-            let _properties_dict_guard = CfPtr(properties_dict.cast::<c_void>());
-            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict);
+            let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict.0.cast());
             Error::check(status, "VTSessionSetProperties")?;
         }
 

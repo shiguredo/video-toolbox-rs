@@ -75,9 +75,16 @@ impl<T> Drop for CfPtr<T> {
     }
 }
 
+/// CF のキーと値のペアから CFDictionary を生成する
+///
+/// `kCFTypeDictionaryKeyCallBacks` / `kCFTypeDictionaryValueCallBacks` を使うため、
+/// 生成された CFDictionary は各キーと値を retain する。
+/// 返り値は `CfPtr` ガードであり、drop 時に `CFRelease` される。
+/// 呼び出し側は FFI 関数に渡す際に `guard.0` から生ポインタを取り出し、
+/// ガードを FFI 呼び出しが終わるまで生存させること。
 pub(crate) fn cf_dictionary(
     kvs: &[(sys::CFStringRef, *const c_void)],
-) -> Result<sys::CFDictionaryRef, Error> {
+) -> Result<CfPtr<c_void>, Error> {
     let mut keys = kvs.iter().map(|(k, _)| k.cast()).collect::<Vec<_>>();
     let mut values = kvs.iter().map(|(_, v)| *v).collect::<Vec<_>>();
     let ptr = unsafe {
@@ -95,7 +102,7 @@ pub(crate) fn cf_dictionary(
             function: "CFDictionaryCreate".into(),
         });
     }
-    Ok(ptr)
+    Ok(CfPtr(ptr.cast()))
 }
 
 /// CF オブジェクトの配列から CFArray を生成する
