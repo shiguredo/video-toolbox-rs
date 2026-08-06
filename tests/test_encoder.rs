@@ -408,6 +408,49 @@ fn reconfigure_updates_config_on_success() -> Result<(), Error> {
 }
 
 #[test]
+fn reconfigure_updates_only_average_bitrate() -> Result<(), Error> {
+    // bitrate のみ更新で fps (30_000/1_001) が初期値のまま保たれることを確認する。
+    // 初期 fps を分数にすることで、既定値 (1/1) への巻き戻りや分母の誤正規化を検出できる。
+    // 検証対象は `self.config` への反映のみで、セッション側のプロパティ設定は対象外。
+    let mut config = encoder_config(false);
+    config.fps_numerator = 30_000;
+    config.fps_denominator = 1_001;
+    let initial_fps_num = config.fps_numerator;
+    let initial_fps_den = config.fps_denominator;
+    let mut encoder = Encoder::new(config, noop_encode_handler())?;
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(250_000),
+        ..Default::default()
+    })?;
+    assert_eq!(encoder.config().average_bitrate, Some(250_000));
+    assert_eq!(encoder.config().fps_numerator, initial_fps_num);
+    assert_eq!(encoder.config().fps_denominator, initial_fps_den);
+    Ok(())
+}
+
+#[test]
+fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
+    // fps のみ更新で bitrate が初期値のまま保たれ、分母が 1 に正規化されることを確認する。
+    // 初期 fps を分数にすることで、正規化漏れ (分母 1_001 のまま) を検出できる。
+    // 初期 bitrate は既定値と区別し、fps 更新時に bitrate が初期値へ上書きされる回帰を検出できるようにする。
+    // 検証対象は `self.config` への反映のみで、PTS の再スケールは対象外。
+    let mut config = encoder_config(false);
+    config.fps_numerator = 30_000;
+    config.fps_denominator = 1_001;
+    config.average_bitrate = Some(250_000);
+    let initial_bitrate = config.average_bitrate;
+    let mut encoder = Encoder::new(config, noop_encode_handler())?;
+    encoder.reconfigure(ReconfigureParams {
+        expected_frame_rate: Some(60),
+        ..Default::default()
+    })?;
+    assert_eq!(encoder.config().average_bitrate, initial_bitrate);
+    assert_eq!(encoder.config().fps_numerator, 60);
+    assert_eq!(encoder.config().fps_denominator, 1);
+    Ok(())
+}
+
+#[test]
 fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
     let config = encoder_config(false);
     let before_bitrate = config.average_bitrate;

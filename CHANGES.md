@@ -60,6 +60,9 @@
 
 ### misc
 
+- [UPDATE] `Encoder::reconfigure` の片肺更新 (bitrate のみ / fps のみ) の単体テストを追加する
+  - 片肺更新時に「対側が不変」「更新側が反映」と fps 更新時の `fps_denominator = 1` 正規化を検証する
+  - @voluntas
 - [UPDATE] `Encoder::config` getter の単体テストを追加する
   - `Encoder::new` 直後の `config()` が入力した全フィールドを変更なしで返すことを検証する
     (`Some(空 Vec)` の `data_rate_limits` が `None` に正規化されるケースを除く)
