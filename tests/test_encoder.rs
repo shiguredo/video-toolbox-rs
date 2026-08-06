@@ -1,4 +1,4 @@
-//! `src/encoder.rs` に対応する単体テスト
+//! `encoder` モジュール (src/encoder.rs と src/encoder/) に対応する単体テスト
 
 use std::{
     sync::{Arc, Mutex},
