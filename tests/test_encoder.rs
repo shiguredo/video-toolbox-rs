@@ -222,7 +222,8 @@ fn encoder_rejects_zero_width() {
     c.width = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "width"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "width" && reason == "must not be zero"
     ));
 }
 
@@ -232,7 +233,8 @@ fn encoder_rejects_zero_height() {
     c.height = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "height"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "height" && reason == "must not be zero"
     ));
 }
 
@@ -242,7 +244,8 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     c.fps_numerator = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "fps_numerator"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "fps_numerator" && reason == "must fit in i32 for CMTime timescale"
     ));
 }
 
@@ -252,7 +255,8 @@ fn encoder_rejects_width_above_i32_max() {
     c.width = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "width"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "width" && reason == "must fit in i32 for Video Toolbox dimensions"
     ));
 }
 
@@ -262,7 +266,8 @@ fn encoder_rejects_height_above_i32_max() {
     c.height = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "height"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "height" && reason == "must fit in i32 for Video Toolbox dimensions"
     ));
 }
 
@@ -272,7 +277,8 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     c.average_bitrate = Some(i64::MAX as u64 + 1);
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "average_bitrate"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "average_bitrate" && reason == "must fit in i64 for CFNumber"
     ));
 }
 
@@ -282,7 +288,8 @@ fn encoder_rejects_zero_fps_denominator() {
     c.fps_denominator = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field, .. }) if field == "fps_denominator"
+        Err(Error::InvalidConfig { field, reason })
+            if field == "fps_denominator" && reason == "must not be zero"
     ));
 }
 
@@ -452,15 +459,49 @@ fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
 
 #[test]
 fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
+    // 全項目 None の reconfigure は no-op であり、設定を変えずセッションも壊さないことを確認する
     let config = encoder_config(false);
     let before_bitrate = config.average_bitrate;
     let before_fps_num = config.fps_numerator;
     let before_fps_den = config.fps_denominator;
-    let mut encoder = Encoder::new(config, noop_encode_handler())?;
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results.lock().expect("results mutex poisoned").push(result);
+            }
+        }),
+    )?;
     encoder.reconfigure(ReconfigureParams::default())?;
     assert_eq!(encoder.config().average_bitrate, before_bitrate);
     assert_eq!(encoder.config().fps_numerator, before_fps_num);
     assert_eq!(encoder.config().fps_denominator, before_fps_den);
+    // no-op の reconfigure がセッションを壊していないこと (後続の encode が成功すること) を確認する
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.finish()?;
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match &callbacks[0] {
+        Ok(frame) => {
+            assert_eq!(frame.user_data, 1);
+            assert!(
+                !frame.data.is_empty(),
+                "no-op の reconfigure 後の encode は実データを返すこと"
+            );
+        }
+        Err(e) => panic!("no-op の reconfigure 後の encode は成功すること: {e}"),
+    }
     Ok(())
 }
 

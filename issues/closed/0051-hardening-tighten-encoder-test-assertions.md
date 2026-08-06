@@ -3,7 +3,7 @@
 - Priority: Low
 - Created: 2026-05-14
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Opus 4.7
 - Branch: feature/update-tighten-encoder-test-assertions
 - Polished: 2026-07-31
@@ -177,3 +177,12 @@ fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
     Ok(())
 }
 ```
+
+## 解決方法
+
+`tests/test_encoder.rs` のテストアサーションを強化した。
+
+1. `encoder_rejects_*` 系 7 テスト (`encoder_rejects_zero_width` / `encoder_rejects_zero_height` / `encoder_rejects_fps_numerator_above_i32_max` / `encoder_rejects_width_above_i32_max` / `encoder_rejects_height_above_i32_max` / `encoder_rejects_average_bitrate_above_i64_max` / `encoder_rejects_zero_fps_denominator`) の `Error::InvalidConfig` 検証を `reason` 文字列まで固定する match guard 形式に変更した。`reason` は公開 API として観測可能な契約であり、回帰検出力が向上する
+2. `reconfigure_is_noop_when_all_none` に no-op 後の `encode` 成功検証を追加した。1 フレームを encode し、コールバックで `user_data` と実データ (非空) が返ることを確認することで、no-op の reconfigure がセッションを壊していないことを検証する。既存の config 不変の検証は維持した
+
+`CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した。`cargo test --workspace` は全 46 テストがパスする。
