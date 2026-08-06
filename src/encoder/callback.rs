@@ -44,8 +44,12 @@ impl<H: EncodeHandler> Encoder<H> {
         Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
     }
 
-    fn invoke_callback(handler: &mut H, result: Result<EncodedFrame<H::UserData>, H::Error>) {
-        handler.on_encoded(result);
+    fn invoke_callback(
+        handler: &mut H,
+        result: Result<EncodedFrame<H::UserData>, H::Error>,
+        callback_name: &'static str,
+    ) {
+        crate::types::catch_user_panic(callback_name, || handler.on_encoded(result));
     }
 
     /// VTCompressionSessionCreate に渡す H.264 用の出力コールバック
@@ -113,7 +117,7 @@ impl<H: EncodeHandler> Encoder<H> {
             Ok(data) => data,
             Err(e) => {
                 if let Some(h) = handler {
-                    Self::invoke_callback(h, Err(e.into()));
+                    Self::invoke_callback(h, Err(e.into()), callback_name);
                 }
                 return;
             }
@@ -125,7 +129,7 @@ impl<H: EncodeHandler> Encoder<H> {
         };
 
         if let Err(e) = Error::check(status, callback_name) {
-            Self::invoke_callback(handler, Err(e.into()));
+            Self::invoke_callback(handler, Err(e.into()), callback_name);
             return;
         }
 
@@ -134,7 +138,7 @@ impl<H: EncodeHandler> Encoder<H> {
             let e = Error::LimitExceeded {
                 reason: "encoded sample buffer is null".into(),
             };
-            Self::invoke_callback(handler, Err(e.into()));
+            Self::invoke_callback(handler, Err(e.into()), callback_name);
             return;
         }
 
@@ -144,7 +148,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 let e = Error::LimitExceeded {
                     reason: "CMSampleBufferGetDataBuffer returned null".into(),
                 };
-                Self::invoke_callback(handler, Err(e.into()));
+                Self::invoke_callback(handler, Err(e.into()), callback_name);
                 return;
             }
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
@@ -156,7 +160,7 @@ impl<H: EncodeHandler> Encoder<H> {
                         "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {MAX_ENCODED_BLOCK_COPY_BYTES}"
                     ),
                 };
-                Self::invoke_callback(handler, Err(e.into()));
+                Self::invoke_callback(handler, Err(e.into()), callback_name);
                 return;
             }
             let mut data = vec![0u8; block_len];
@@ -167,7 +171,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                Self::invoke_callback(handler, Err(e.into()));
+                Self::invoke_callback(handler, Err(e.into()), callback_name);
                 return;
             }
 
@@ -180,13 +184,13 @@ impl<H: EncodeHandler> Encoder<H> {
                         reason: "CMSampleBufferGetFormatDescription returned null for keyframe"
                             .into(),
                     };
-                    Self::invoke_callback(handler, Err(e.into()));
+                    Self::invoke_callback(handler, Err(e.into()), callback_name);
                     return;
                 }
                 match extract_params(description) {
                     Ok(params) => params,
                     Err(e) => {
-                        Self::invoke_callback(handler, Err(e.into()));
+                        Self::invoke_callback(handler, Err(e.into()), callback_name);
                         return;
                     }
                 }
@@ -202,7 +206,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 data,
                 user_data,
             };
-            Self::invoke_callback(handler, Ok(frame));
+            Self::invoke_callback(handler, Ok(frame), callback_name);
         }
     }
 

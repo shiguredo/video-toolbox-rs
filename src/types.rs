@@ -2,6 +2,74 @@ use std::ffi::c_void;
 
 use crate::{error::Error, sys};
 
+/// `std::panic::catch_unwind` で捕捉した panic payload からメッセージを取り出す
+///
+/// panic 時のメッセージは `&str` または `String` のいずれかで payload に積まれる。
+/// どちらでもない場合は汎用メッセージを返す。
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// ユーザーハンドラの panic を捕捉してエラーログを出力する
+///
+/// `on_encoded` / `on_decoded` が panic すると、unwind が `extern "C"` 境界を越えて
+/// プロセスを abort させるため、`catch_unwind` で捕捉する (CODEBASE.md の
+/// 「catch_unwind の許可」参照)。捕捉した panic はエラーログで可視化し、セッションは継続する。
+/// `&mut H` は `UnwindSafe` でないため `AssertUnwindSafe` で包む。
+pub(crate) fn catch_user_panic(callback_name: &'static str, f: impl FnOnce()) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Err(payload) = outcome {
+        // `&payload` は `&Box<dyn Any + Send>` となり、`&(dyn Any + Send)` への coerce 時に
+        // deref ではなく Box 構造体自体の unsize が適用されるため、明示的に `&*payload` で deref する。
+        let message = panic_payload_message(&*payload);
+        tracing::error!("{callback_name}: user handler panicked: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `&'static str` の panic payload からメッセージを取り出せること
+    #[test]
+    fn panic_payload_message_extracts_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("panic message");
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "panic message",
+            "&str payload からメッセージを取り出せること"
+        );
+    }
+
+    /// `String` の panic payload からメッセージを取り出せること
+    #[test]
+    fn panic_payload_message_extracts_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("panic message"));
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "panic message",
+            "String payload からメッセージを取り出せること"
+        );
+    }
+
+    /// `&str` でも `String` でもない panic payload は汎用メッセージになること
+    #[test]
+    fn panic_payload_message_falls_back_for_unknown_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "unknown panic payload",
+            "未知の payload は汎用メッセージになること"
+        );
+    }
+}
+
 /// Video Toolbox / CoreMedia の `i32` 寸法引数に渡す前に、`u32` が正の `i32` に収まることを検証する。
 pub(crate) fn validate_video_dimensions_for_toolbox(width: u32, height: u32) -> Result<(), Error> {
     let max = i32::MAX as u32;

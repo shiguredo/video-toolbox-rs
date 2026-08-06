@@ -57,6 +57,13 @@
     `CFRelease` で解放する
   - 成功パスでは `forget` でガードを解除し、`Encoder::drop` の解放処理との二重解放を防ぐ
   - @voluntas
+- [FIX] `extern "C"` コールバック内のユーザーハンドラ panic でプロセスが abort する問題を修正する
+  - `on_encoded` / `on_decoded` の呼び出しを `std::panic::catch_unwind` で保護し、panic を捕捉して
+    エラーログ（コールバック名 + panic メッセージ）を出力した上でセッションを継続する
+  - encoder / decoder で重複していた panic 捕捉を `catch_user_panic` として `src/types.rs` に統合し、
+    `invoke_callback` に `callback_name` 引数を追加して捕捉ログにコールバック名を含める
+  - `CODEBASE.md` に shiguredo-rust 規約の「`catch_unwind` を使わないこと」の例外を根拠付きで追記する
+  - @voluntas
 
 ### misc
 

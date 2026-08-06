@@ -57,6 +57,10 @@ pub struct DecoderConfig<'a> {
 /// デコード結果を通知するためのハンドラー
 ///
 /// デコード処理が完了するたびに [`DecodeHandler::on_decoded`] が呼ばれる。
+/// `on_decoded` 内で panic してもプロセスは abort せず、panic は捕捉されて
+/// エラーログ（コールバック名 + panic メッセージ）が出力され、デコードセッションは継続する。
+/// ただし、ホストアプリが abort するカスタム panic hook をインストールしている場合や
+/// `panic=abort` ビルドでは捕捉されず abort する。
 pub trait DecodeHandler: Send + 'static {
     /// ユーザーデータ型
     type UserData: Send + 'static;
@@ -463,8 +467,12 @@ impl<H: DecodeHandler> Decoder<H> {
         Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
     }
 
-    fn invoke_callback(handler: &mut H, result: Result<DecodedFrame<H::UserData>, H::Error>) {
-        handler.on_decoded(result);
+    fn invoke_callback(
+        handler: &mut H,
+        result: Result<DecodedFrame<H::UserData>, H::Error>,
+        callback_name: &'static str,
+    ) {
+        crate::types::catch_user_panic(callback_name, || handler.on_decoded(result));
     }
 
     unsafe extern "C" fn output_callback(
@@ -488,7 +496,7 @@ impl<H: DecodeHandler> Decoder<H> {
                 Ok(p) => p,
                 Err(e) => {
                     if let Some(h) = handler {
-                        Self::invoke_callback(h, Err(e.into()));
+                        Self::invoke_callback(h, Err(e.into()), callback_name);
                     }
                     return;
                 }
@@ -506,7 +514,7 @@ impl<H: DecodeHandler> Decoder<H> {
         } = *pending;
 
         if let Err(e) = Error::check(status, callback_name) {
-            Self::invoke_callback(handler, Err(e.into()));
+            Self::invoke_callback(handler, Err(e.into()), callback_name);
             return;
         }
 
@@ -515,7 +523,7 @@ impl<H: DecodeHandler> Decoder<H> {
             let e = Error::LimitExceeded {
                 reason: "decoded image buffer is null".into(),
             };
-            Self::invoke_callback(handler, Err(e.into()));
+            Self::invoke_callback(handler, Err(e.into()), callback_name);
             return;
         }
 
@@ -527,7 +535,7 @@ impl<H: DecodeHandler> Decoder<H> {
         let flags_readonly = 1;
         let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
         if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
-            Self::invoke_callback(handler, Err(e.into()));
+            Self::invoke_callback(handler, Err(e.into()), callback_name);
             return;
         }
 
@@ -545,7 +553,7 @@ impl<H: DecodeHandler> Decoder<H> {
                 user_data,
             },
         };
-        Self::invoke_callback(handler, Ok(frame));
+        Self::invoke_callback(handler, Ok(frame), callback_name);
     }
 }
 
