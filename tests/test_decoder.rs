@@ -68,11 +68,16 @@ fn push_decode_event(results: &SharedDecodeResults, result: Result<DecodedFrame<
         Ok(DecodedFrame::Nv12 { user_data, .. }) => DecodeEvent::Nv12 { user_data },
         Err(e) => DecodeEvent::Err(e),
     };
-    results.lock().expect("results mutex poisoned").push(event);
+    results
+        .lock()
+        .expect("結果バッファの mutex が poison になっている")
+        .push(event);
 }
 
 fn take_results(results: &SharedDecodeResults) -> Vec<DecodeEvent> {
-    let mut guard = results.lock().expect("results mutex poisoned");
+    let mut guard = results
+        .lock()
+        .expect("結果バッファの mutex が poison になっている");
     std::mem::take(&mut *guard)
 }
 
@@ -138,7 +143,11 @@ fn h264_decoder() -> Result<(), Error> {
 
     let callbacks = take_results(&results);
     assert_eq!(callbacks.len(), 1);
-    match callbacks.into_iter().next().expect("callback missing") {
+    match callbacks
+        .into_iter()
+        .next()
+        .expect("コールバック結果が届いていない")
+    {
         DecodeEvent::I420 {
             user_data,
             width,
@@ -150,9 +159,9 @@ fn h264_decoder() -> Result<(), Error> {
             assert_eq!(height, HEIGHT as usize);
         }
         DecodeEvent::Nv12 { .. } => {
-            unreachable!("expected I420 but got NV12");
+            unreachable!("I420 を期待したが NV12 が届いた");
         }
-        DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+        DecodeEvent::Err(e) => panic!("想定外のデコードコールバックエラー: {e}"),
     }
 
     Ok(())
@@ -202,7 +211,11 @@ fn h265_decoder() -> Result<(), Error> {
 
     let callbacks = take_results(&results);
     assert_eq!(callbacks.len(), 1);
-    match callbacks.into_iter().next().expect("callback missing") {
+    match callbacks
+        .into_iter()
+        .next()
+        .expect("コールバック結果が届いていない")
+    {
         DecodeEvent::I420 {
             user_data,
             width,
@@ -214,9 +227,9 @@ fn h265_decoder() -> Result<(), Error> {
             assert_eq!(height, HEIGHT as usize);
         }
         DecodeEvent::Nv12 { .. } => {
-            unreachable!("expected I420 but got NV12");
+            unreachable!("I420 を期待したが NV12 が届いた");
         }
-        DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+        DecodeEvent::Err(e) => panic!("想定外のデコードコールバックエラー: {e}"),
     }
 
     Ok(())
@@ -407,7 +420,10 @@ fn vp9_decoder() -> Result<(), Error> {
         encoded_frames.push(frame.data().to_vec());
     }
 
-    assert!(!encoded_frames.is_empty(), "VP9 encoder produced no frames");
+    assert!(
+        !encoded_frames.is_empty(),
+        "VP9 エンコーダーがフレームを生成しなかった"
+    );
 
     let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
     let mut decoder = Decoder::new(
@@ -448,18 +464,21 @@ fn vp9_decoder() -> Result<(), Error> {
                 let i = user_data as usize;
                 assert!(
                     i < encoded_frames.len(),
-                    "user_data out of range: {user_data}"
+                    "フレーム番号 {user_data} が範囲外"
                 );
-                assert!(!seen[i], "duplicate callback user_data: {user_data}");
+                assert!(
+                    !seen[i],
+                    "コールバック user_data が重複している: {user_data}"
+                );
                 seen[i] = true;
 
                 assert_eq!(
                     decoded_width, frame_width as usize,
-                    "frame {i}: width mismatch"
+                    "フレーム {i}: 幅が一致しない"
                 );
                 assert_eq!(
                     decoded_height, frame_height as usize,
-                    "frame {i}: height mismatch"
+                    "フレーム {i}: 高さが一致しない"
                 );
 
                 let psnr = psnr_y(
@@ -472,16 +491,16 @@ fn vp9_decoder() -> Result<(), Error> {
                 );
                 assert!(
                     psnr >= min_psnr_db,
-                    "frame {i}: PSNR {psnr:.1} dB < {min_psnr_db} dB"
+                    "フレーム {i}: PSNR {psnr:.1} dB が下限 {min_psnr_db} dB 未満"
                 );
             }
             DecodeEvent::Nv12 { user_data, .. } => {
-                unreachable!("frame {user_data}: expected I420 but got NV12");
+                unreachable!("フレーム {user_data}: I420 を期待したが NV12 が届いた");
             }
-            DecodeEvent::Err(e) => panic!("unexpected decode callback error: {e}"),
+            DecodeEvent::Err(e) => panic!("想定外のデコードコールバックエラー: {e}"),
         }
     }
-    assert!(seen.iter().all(|v| *v), "some callbacks are missing");
+    assert!(seen.iter().all(|v| *v), "一部のコールバックが届いていない");
 
     Ok(())
 }
@@ -504,7 +523,8 @@ fn handler_panic_is_caught_and_decode_continues() -> Result<(), Error> {
 
     let log = helpers::take_logs(&logs);
     helpers::assert_log_contains(&log, "output_callback: user handler panicked");
-    helpers::assert_log_contains(&log, "intentional panic in test handler");
+    // panic メッセージはテストコード出自のため日本語 (ライブラリのログフォーマットは英語のまま)
+    helpers::assert_log_contains(&log, "テストハンドラが意図的に panic した");
     Ok(())
 }
 
@@ -526,7 +546,7 @@ fn decode_with_panicking_handler() -> Result<(), Error> {
             move |result: Result<DecodedFrame<u64>, Error>| {
                 // 1 回目のコールバックだけ panic して、後続は正常に結果を返す
                 if !panicked.swap(true, Ordering::Relaxed) {
-                    panic!("intentional panic in test handler");
+                    panic!("テストハンドラが意図的に panic した");
                 }
                 push_decode_event(&results, result);
             }

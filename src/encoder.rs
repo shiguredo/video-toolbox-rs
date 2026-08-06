@@ -378,7 +378,7 @@ mod tests {
                 expected_frame_rate: Some(2),
                 ..Default::default()
             })
-            .expect_err("rescale should overflow");
+            .expect_err("再スケールはオーバーフローすること");
         assert!(matches!(
             err,
             Error::LimitExceeded { reason } if reason == "rescaled presentation timestamp overflow",

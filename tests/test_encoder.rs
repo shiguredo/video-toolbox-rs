@@ -97,10 +97,10 @@ fn noop_encode_handler() -> FnEncodeHandler<()> {
 /// 検証エラーを期待して `reconfigure` を呼び、返された `Error` を取り出す
 fn reconfigure_err(params: ReconfigureParams) -> Error {
     let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())
-        .expect("encoder construction must succeed");
+        .expect("エンコーダーの構築が成功すること");
     encoder
         .reconfigure(params)
-        .expect_err("invalid params must be rejected")
+        .expect_err("無効なパラメータが拒否されること")
 }
 
 fn wait_and_take_results<T>(
@@ -109,7 +109,12 @@ fn wait_and_take_results<T>(
 ) -> Vec<EncodeResult<T>> {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if results.lock().expect("results mutex poisoned").len() >= min_count {
+        if results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .len()
+            >= min_count
+        {
             break;
         }
         if Instant::now() >= deadline {
@@ -118,7 +123,9 @@ fn wait_and_take_results<T>(
         thread::sleep(Duration::from_millis(1));
     }
 
-    let mut guard = results.lock().expect("results mutex poisoned");
+    let mut guard = results
+        .lock()
+        .expect("結果バッファの mutex が poison になっている");
     std::mem::take(&mut *guard)
 }
 
@@ -130,7 +137,10 @@ fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -149,12 +159,16 @@ fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
 
     let callbacks = wait_and_take_results(&results, 1);
     assert_eq!(callbacks.len(), 1);
-    match callbacks.into_iter().next().expect("callback missing") {
+    match callbacks
+        .into_iter()
+        .next()
+        .expect("コールバック結果が届いていない")
+    {
         Ok(frame) => {
             assert_eq!(frame.user_data, 7);
             assert!(!frame.data.is_empty());
         }
-        Err(e) => panic!("unexpected encode callback error: {e}"),
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
     }
 
     Ok(())
@@ -179,7 +193,10 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -212,7 +229,7 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
         .into_iter()
         .map(|r| match r {
             Ok(frame) => frame.user_data,
-            Err(e) => panic!("unexpected encode callback error: {e}"),
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
         })
         .collect::<Vec<_>>();
     user_data.sort_unstable();
@@ -317,7 +334,10 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -337,7 +357,12 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
         r,
         Err(Error::InsufficientFrameData { plane, .. }) if plane == "Y"
     ));
-    assert!(results.lock().expect("results mutex poisoned").is_empty());
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -349,7 +374,10 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -369,7 +397,12 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
         r,
         Err(Error::InsufficientFrameData { plane, .. }) if plane == "U"
     ));
-    assert!(results.lock().expect("results mutex poisoned").is_empty());
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -381,7 +414,10 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -399,7 +435,12 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
             actual: PixelFormat::Nv12,
         })
     ));
-    assert!(results.lock().expect("results mutex poisoned").is_empty());
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -475,7 +516,10 @@ fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -566,7 +610,10 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -581,7 +628,12 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
         r,
         Err(Error::InsufficientFrameData { plane, .. }) if plane == "UV"
     ));
-    assert!(results.lock().expect("results mutex poisoned").is_empty());
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -678,7 +730,7 @@ fn new_rejects_invalid_data_rate_limits() {
     }]);
     let err = Encoder::new(config, noop_encode_handler())
         .map(|_| ())
-        .expect_err("invalid data rate limits must be rejected at construction");
+        .expect_err("構築時に無効なデータレートリミットが拒否されること");
     assert!(matches!(
         err,
         Error::InvalidConfig { field, reason }
@@ -692,7 +744,7 @@ fn new_rejects_zero_average_bitrate() {
     config.average_bitrate = Some(0);
     let err = Encoder::new(config, noop_encode_handler())
         .map(|_| ())
-        .expect_err("zero average bitrate must be rejected at construction");
+        .expect_err("構築時に平均ビットレート 0 が拒否されること");
     assert!(matches!(
         err,
         Error::InvalidConfig { field, reason }
@@ -761,7 +813,7 @@ fn encoder_config_returns_initial_value() -> Result<(), Error> {
             assert_eq!(a.profile, b.profile);
             assert_eq!(a.entropy_mode, b.entropy_mode);
         }
-        _ => panic!("codec variant mismatch"),
+        _ => panic!("コーデックのバリアントが一致しない"),
     }
     Ok(())
 }
@@ -821,7 +873,10 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
         FnEncodeHandler::new({
             let results = Arc::clone(&results);
             move |result: Result<EncodedFrame<u64>, Error>| {
-                results.lock().expect("results mutex poisoned").push(result);
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
             }
         }),
     )?;
@@ -846,7 +901,7 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     for callback in callbacks {
         match callback {
             Ok(frame) => sizes.push(frame.data.len() as u64),
-            Err(e) => panic!("unexpected encode callback error: {e}"),
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
         }
     }
     assert_eq!(sizes.len(), FRAMES);
@@ -860,14 +915,14 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     for (i, bytes) in window_bytes.iter().enumerate().skip(1) {
         assert!(
             *bytes <= LIMIT_BYTES_PER_SEC * 150 / 100,
-            "window {i} produced {bytes} bytes, exceeding hard limit {LIMIT_BYTES_PER_SEC} (+50%)"
+            "ウィンドウ {i} が {bytes} バイトを生成し、ハードリミット {LIMIT_BYTES_PER_SEC} (+50%) を超えた"
         );
     }
     // レート制御で出力が崩壊していないこと (2 Mbps 要求 + ノイズ帯なら上限の 1/4 は確実に使う)
     let total: u64 = sizes.iter().sum();
     assert!(
         total >= LIMIT_BYTES_PER_SEC * (FRAMES as u64 / FPS as u64) / 4,
-        "encoder output collapsed: total {total} bytes over {FRAMES} frames"
+        "エンコーダー出力が崩壊した: {FRAMES} フレームで合計 {total} バイト"
     );
     Ok(())
 }
@@ -899,7 +954,8 @@ fn handler_panic_is_caught_and_encode_continues() -> Result<(), Error> {
 
     let log = helpers::take_logs(&logs);
     helpers::assert_log_contains(&log, "output_callback_h264: user handler panicked");
-    helpers::assert_log_contains(&log, "intentional panic in test handler");
+    // panic メッセージはテストコード出自のため日本語 (ライブラリのログフォーマットは英語のまま)
+    helpers::assert_log_contains(&log, "テストハンドラが意図的に panic した");
     Ok(())
 }
 
@@ -914,7 +970,7 @@ fn encode_with_panicking_handler() -> Result<(), Error> {
             move |result: Result<EncodedFrame<u64>, Error>| {
                 // 1 回目のコールバックだけ panic して、後続は正常に結果を返す
                 if !panicked.swap(true, Ordering::Relaxed) {
-                    panic!("intentional panic in test handler");
+                    panic!("テストハンドラが意図的に panic した");
                 }
                 results
                     .lock()
