@@ -1,7 +1,7 @@
 # CI / Makefile / prek.toml のコマンドフラグを統一する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-06
 - Branch: feature/refactor-unify-build-command-flags
 - Polished: 2026-08-01
 
@@ -43,3 +43,27 @@ CI / Makefile / prek.toml の clippy / test / fmt のコマンドフラグが三
 ## 関連 issue
 
 - issue 0057: PBT インフラ導入で pbt クレートを追加し workspace 化する。0057 は closed 済みであり、その完了条件のコマンドは本 issue の実装で統一後の形式に追従させた
+
+## 解決方法
+
+- clippy / test / fmt のコマンドを以下の形式に統一した（`.github/workflows/ci.yml` / `Makefile` / `prek.toml` の 3 ファイルで完全一致）
+  - clippy: `cargo clippy --workspace --all-targets -- -D warnings`
+    （テスト・example・ベンチも lint し、警告をエラーに昇格する）
+  - test: `cargo test --workspace -- --test-threads=1`
+    （ハードウェアリソース競合を回避するため直列実行。CI の形式に合わせた）
+  - fmt: `cargo fmt --all -- --check`
+    （書き換えをせず、未フォーマットの検出のみ。prek.toml の形式に合わせた）
+- `.github/workflows/ci.yml`: clippy に `--all-targets` を追加し、fmt を `--all -- --check` に変更した
+- `Makefile`: test に `-- --test-threads=1`、clippy に `--all-targets`、fmt に `-- --check` を追加した
+- `prek.toml`: clippy に `--workspace` を追加し、test に `--workspace -- --test-threads=1` を追加した。
+  コメントも実コマンドに合わせて更新した
+- 既存 open issue（0071 / 0072 / 0073 / 0076 / 0078 / 0079 / 0080 / 0081 / 0082 / 0083）の
+  完了条件に記載の clippy / test / fmt コマンドを統一後の形式に追従させた。
+  0076 にあった `--all-features` は features が未定義のため外した。
+  closed 済みの 0057 についても、完了条件に「issue 0070 の統一後に追従する」と明記されていた
+  ため追従させた
+- 完了条件の確認結果
+  - 3 ファイルのコマンドフラグが一致していることを確認
+  - 既存 open issue の完了条件が統一後の形式に追従していることを確認
+  - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` /
+    `cargo fmt --all -- --check` がすべて通ることを確認
