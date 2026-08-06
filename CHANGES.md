@@ -72,6 +72,11 @@
 
 ### misc
 
+- [UPDATE] テスト関数に doc コメントを追加する
+  - `tests/test_encoder.rs` / `tests/test_decoder.rs` / `tests/test_error.rs` の全 `#[test]`
+    関数に「何を検証するか・なぜその値を使うか」を日本語の doc コメントで追記する
+  - `h264_decoder` / `h265_decoder` のハードコードされたビットストリームの構成・前提条件も記す
+  - @voluntas
 - [UPDATE] テストのログメッセージを日本語に統一する
   - `tests/test_encoder.rs` / `tests/test_decoder.rs` / `src/encoder.rs` のテストコードの
     カスタムメッセージ（`expect` / `expect_err` / `panic!` / `unreachable!` /

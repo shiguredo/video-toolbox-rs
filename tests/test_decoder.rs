@@ -81,6 +81,7 @@ fn take_results(results: &SharedDecodeResults) -> Vec<DecodeEvent> {
     std::mem::take(&mut *guard)
 }
 
+/// VP9 デコーダーの構築で width が i32::MAX を超えると InvalidConfig で拒否されることを検証する
 #[test]
 fn decoder_vp9_rejects_width_above_i32_max() {
     let r = Decoder::new(
@@ -99,6 +100,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
     ));
 }
 
+/// AV1 デコーダーの構築で height が i32::MAX を超えると InvalidConfig で拒否されることを検証する
 #[test]
 fn decoder_av1_rejects_height_above_i32_max() {
     let r = Decoder::new(
@@ -117,6 +119,9 @@ fn decoder_av1_rejects_height_above_i32_max() {
     ));
 }
 
+/// ハードコードされた H.264 ビットストリーム (SPS / PPS / IDR フレーム) をデコードし、
+/// 1 フレームが出力されることを検証する。ビットストリームは 640x480 の I420 フレーム 1 枚分で、
+/// ファイル内定数の H264_SPS / H264_PPS / H264_NAL_UNIT を使用する
 #[test]
 fn h264_decoder() -> Result<(), Error> {
     let results: SharedDecodeResults = Arc::new(Mutex::new(Vec::new()));
@@ -167,6 +172,9 @@ fn h264_decoder() -> Result<(), Error> {
     Ok(())
 }
 
+/// ハードコードされた H.265 ビットストリーム (VPS / SPS / PPS / IDR フレーム) をデコードし、
+/// 1 フレームが出力されることを検証する。ビットストリームは 640x480 の I420 フレーム 1 枚分で、
+/// 関数内ローカルの vps / sps / pps / nal_unit 配列を使用する (nalu_len_bytes: 4)
 #[test]
 fn h265_decoder() -> Result<(), Error> {
     let vps = [
@@ -235,6 +243,9 @@ fn h265_decoder() -> Result<(), Error> {
     Ok(())
 }
 
+/// AV1 デコーダーが構築できることを検証する。非対応環境では supported_codecs() の
+/// 事前検査でスキップする。ビットストリームなしの最小構築ではコーデック固有の
+/// パラメータ不足で UnsupportedCodec が返り得るため、Ok と UnsupportedCodec の両方を許容する
 #[test]
 fn init_av1_decoder() -> Result<(), Error> {
     if !supported_codecs()
@@ -244,8 +255,6 @@ fn init_av1_decoder() -> Result<(), Error> {
         return Ok(());
     }
 
-    // Decoder::new は最小限の FormatDescription でセッション作成を試行するため、
-    // コーデック固有のパラメータが不足して失敗する場合がある。
     // 実際のビットストリームからデコードする場合は正常に動作する。
     match Decoder::new(
         DecoderConfig {
@@ -343,6 +352,8 @@ fn psnr_y(
     10.0 * (255.0_f64 * 255.0 / mse).log10()
 }
 
+/// shiguredo_libvpx の VP9 エンコーダーで生成したフレームをデコードし、
+/// Y プレーンの PSNR が下限を満たすことを検証する (対応環境でない場合はスキップ)
 #[test]
 fn vp9_decoder() -> Result<(), Error> {
     if !supported_codecs()

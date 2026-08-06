@@ -174,16 +174,26 @@ fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// 黒フレーム 1 枚を H.264 でエンコードし、出力コールバックが 1 回呼ばれて
+/// user_data とエンコード済みデータが届くことを検証する。ビットストリームの内容は
+/// 検証しないため、決定的で圧縮が効く黒フレームを使う
 #[test]
 fn encode_h264_black() -> Result<(), Error> {
     encode_black_frame_roundtrip(false)
 }
 
+/// 黒フレーム 1 枚を H.265 でエンコードし、出力コールバックが 1 回呼ばれて
+/// user_data とエンコード済みデータが届くことを検証する。ビットストリームの内容は
+/// 検証しないため、決定的で圧縮が効く黒フレームを使う
 #[test]
 fn encode_h265_black() -> Result<(), Error> {
     encode_black_frame_roundtrip(true)
 }
 
+/// 2 フレームを連続でエンコードし、各フレームに渡した user_data (10 / 20) が
+/// そのままコールバックに届くことを検証する。allow_frame_reordering: false のため
+/// 投入順でコールバックされるが (Video Toolbox の保証ではない)、防衛的に取得後に
+/// ソートして比較する
 #[test]
 fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
     let config = encoder_config(false);
@@ -238,6 +248,8 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
     Ok(())
 }
 
+/// width に 0 を指定した Encoder::new が InvalidConfig (field: width) で拒否されることを検証する
+/// (Video Toolbox の寸法は正の値が必要なため)
 #[test]
 fn encoder_rejects_zero_width() {
     let mut c = minimal_encoder_config();
@@ -249,6 +261,8 @@ fn encoder_rejects_zero_width() {
     ));
 }
 
+/// height に 0 を指定した Encoder::new が InvalidConfig (field: height) で拒否されることを検証する
+/// (Video Toolbox の寸法は正の値が必要なため)
 #[test]
 fn encoder_rejects_zero_height() {
     let mut c = minimal_encoder_config();
@@ -260,6 +274,8 @@ fn encoder_rejects_zero_height() {
     ));
 }
 
+/// fps_numerator が i32::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (CMTime の timescale は i32 のため)
 #[test]
 fn encoder_rejects_fps_numerator_above_i32_max() {
     let mut c = minimal_encoder_config();
@@ -271,6 +287,8 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     ));
 }
 
+/// width が i32::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (Video Toolbox の寸法引数は i32 のため)
 #[test]
 fn encoder_rejects_width_above_i32_max() {
     let mut c = minimal_encoder_config();
@@ -282,6 +300,8 @@ fn encoder_rejects_width_above_i32_max() {
     ));
 }
 
+/// height が i32::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (Video Toolbox の寸法引数は i32 のため)
 #[test]
 fn encoder_rejects_height_above_i32_max() {
     let mut c = minimal_encoder_config();
@@ -293,6 +313,8 @@ fn encoder_rejects_height_above_i32_max() {
     ));
 }
 
+/// average_bitrate が i64::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (CFNumber は SInt64 のため)
 #[test]
 fn encoder_rejects_average_bitrate_above_i64_max() {
     let mut c = minimal_encoder_config();
@@ -304,6 +326,7 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     ));
 }
 
+/// fps_denominator に 0 を指定すると InvalidConfig で拒否されることを検証する (0 除算を防ぐため)
 #[test]
 fn encoder_rejects_zero_fps_denominator() {
     let mut c = minimal_encoder_config();
@@ -315,6 +338,7 @@ fn encoder_rejects_zero_fps_denominator() {
     ));
 }
 
+/// fps_numerator に 0 を指定すると InvalidConfig で拒否されることを検証する (フレームレート 0 は無効なため)
 #[test]
 fn encoder_rejects_zero_fps_numerator() {
     let mut c = minimal_encoder_config();
@@ -326,6 +350,8 @@ fn encoder_rejects_zero_fps_numerator() {
     ));
 }
 
+/// I420 の Y プレーン長が不足していると InsufficientFrameData で拒否され、
+/// コールバックが発火しないことを検証する
 #[test]
 fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
@@ -366,6 +392,8 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
     Ok(())
 }
 
+/// I420 の U プレーン長が不足していると InsufficientFrameData で拒否され、
+/// コールバックが発火しないことを検証する
 #[test]
 fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
@@ -406,6 +434,8 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
     Ok(())
 }
 
+/// I420 設定のエンコーダーに Nv12 フレームを渡すと PixelFormatMismatch で拒否され、
+/// コールバックが発火しないことを検証する
 #[test]
 fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
@@ -444,6 +474,8 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
     Ok(())
 }
 
+/// reconfigure 成功時に config が更新されることを検証する
+/// (ExpectedFrameRate は単一整数のため分母が 1 に正規化される)
 #[test]
 fn reconfigure_updates_config_on_success() -> Result<(), Error> {
     let config = encoder_config(false);
@@ -455,15 +487,14 @@ fn reconfigure_updates_config_on_success() -> Result<(), Error> {
     })?;
     assert_eq!(encoder.config().average_bitrate, Some(250_000));
     assert_eq!(encoder.config().fps_numerator, 60);
-    // ExpectedFrameRate は単一整数のため分母は 1 に正規化される
     assert_eq!(encoder.config().fps_denominator, 1);
     Ok(())
 }
 
+/// bitrate のみ更新で fps (30_000/1_001) が初期値のまま保たれることを検証する。
+/// 初期 fps を分数にすることで、既定値 (1/1) への巻き戻りや分母の誤正規化を検出できる
 #[test]
 fn reconfigure_updates_only_average_bitrate() -> Result<(), Error> {
-    // bitrate のみ更新で fps (30_000/1_001) が初期値のまま保たれることを確認する。
-    // 初期 fps を分数にすることで、既定値 (1/1) への巻き戻りや分母の誤正規化を検出できる。
     // 検証対象は `self.config` への反映のみで、セッション側のプロパティ設定は対象外。
     let mut config = encoder_config(false);
     config.fps_numerator = 30_000;
@@ -481,11 +512,11 @@ fn reconfigure_updates_only_average_bitrate() -> Result<(), Error> {
     Ok(())
 }
 
+/// fps のみ更新で bitrate が初期値のまま保たれ、分母が 1 に正規化されることを検証する。
+/// 初期値を既定値と区別できる値にすることで、更新時に他項目が初期値へ上書きされる回帰を検出できる
 #[test]
 fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
-    // fps のみ更新で bitrate が初期値のまま保たれ、分母が 1 に正規化されることを確認する。
     // 初期 fps を分数にすることで、正規化漏れ (分母 1_001 のまま) を検出できる。
-    // 初期 bitrate は既定値と区別し、fps 更新時に bitrate が初期値へ上書きされる回帰を検出できるようにする。
     // 検証対象は `self.config` への反映のみで、PTS の再スケールは対象外。
     let mut config = encoder_config(false);
     config.fps_numerator = 30_000;
@@ -503,9 +534,9 @@ fn reconfigure_updates_only_expected_frame_rate() -> Result<(), Error> {
     Ok(())
 }
 
+/// 全項目 None の reconfigure が no-op であり、設定を変えず後続の encode が成功することを検証する
 #[test]
 fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
-    // 全項目 None の reconfigure は no-op であり、設定を変えずセッションも壊さないことを確認する
     let config = encoder_config(false);
     let before_bitrate = config.average_bitrate;
     let before_fps_num = config.fps_numerator;
@@ -527,7 +558,6 @@ fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
     assert_eq!(encoder.config().average_bitrate, before_bitrate);
     assert_eq!(encoder.config().fps_numerator, before_fps_num);
     assert_eq!(encoder.config().fps_denominator, before_fps_den);
-    // no-op の reconfigure がセッションを壊していないこと (後続の encode が成功すること) を確認する
     let (y, u, v) = build_i420_black_frame();
     encoder.encode(
         &FrameData::I420 {
@@ -554,6 +584,7 @@ fn reconfigure_is_noop_when_all_none() -> Result<(), Error> {
     Ok(())
 }
 
+/// average_bitrate に 0 を指定した reconfigure が InvalidConfig で拒否されることを検証する
 #[test]
 fn reconfigure_rejects_zero_bitrate() {
     assert!(matches!(
@@ -566,6 +597,7 @@ fn reconfigure_rejects_zero_bitrate() {
     ));
 }
 
+/// expected_frame_rate に 0 を指定した reconfigure が InvalidConfig で拒否されることを検証する
 #[test]
 fn reconfigure_rejects_zero_expected_frame_rate() {
     assert!(matches!(
@@ -578,6 +610,8 @@ fn reconfigure_rejects_zero_expected_frame_rate() {
     ));
 }
 
+/// expected_frame_rate が i32::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (CFNumber は SInt32 のため)
 #[test]
 fn reconfigure_rejects_expected_frame_rate_above_i32_max() {
     assert!(matches!(
@@ -590,6 +624,8 @@ fn reconfigure_rejects_expected_frame_rate_above_i32_max() {
     ));
 }
 
+/// average_bitrate が i64::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (CFNumber は SInt64 のため)
 #[test]
 fn reconfigure_rejects_bitrate_above_i64_max() {
     assert!(matches!(
@@ -602,6 +638,8 @@ fn reconfigure_rejects_bitrate_above_i64_max() {
     ));
 }
 
+/// Nv12 の UV プレーン長が不足していると InsufficientFrameData で拒否され、
+/// コールバックが発火しないことを検証する
 #[test]
 fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
@@ -637,6 +675,7 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     Ok(())
 }
 
+/// data_rate_limits の設定 (1 リミット) と、空 Vec による解除 (None への正規化) を検証する
 #[test]
 fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
     let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())?;
@@ -650,7 +689,6 @@ fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
     })?;
     assert_eq!(encoder.config().data_rate_limits, Some(limits));
 
-    // 空 Vec で上限を解除できる
     encoder.reconfigure(ReconfigureParams {
         data_rate_limits: Some(Vec::new()),
         ..Default::default()
@@ -659,6 +697,8 @@ fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
     Ok(())
 }
 
+/// data_rate_limits が 3 個以上だと InvalidConfig で拒否されることを検証する
+/// (Video Toolbox の仕様上 0〜2 個のため)
 #[test]
 fn reconfigure_rejects_more_than_two_data_rate_limits() {
     let limit = DataRateLimit {
@@ -675,6 +715,7 @@ fn reconfigure_rejects_more_than_two_data_rate_limits() {
     ));
 }
 
+/// bytes 0 のリミットが InvalidConfig で拒否されることを検証する
 #[test]
 fn reconfigure_rejects_zero_bytes_data_rate_limit() {
     assert!(matches!(
@@ -690,9 +731,10 @@ fn reconfigure_rejects_zero_bytes_data_rate_limit() {
     ));
 }
 
+/// bytes が i64::MAX を超えると InvalidConfig で拒否されることを検証する
+/// (CFNumber は SInt64 のため)
 #[test]
 fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
-    // `bytes` は CFNumber (SInt64) に変換されるため i64::MAX を超える値は拒否される
     assert!(matches!(
         reconfigure_err(ReconfigureParams {
             data_rate_limits: Some(vec![DataRateLimit {
@@ -706,6 +748,7 @@ fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
     ));
 }
 
+/// window 0 のリミットが InvalidConfig で拒否されることを検証する
 #[test]
 fn reconfigure_rejects_zero_window_data_rate_limit() {
     assert!(matches!(
@@ -721,6 +764,8 @@ fn reconfigure_rejects_zero_window_data_rate_limit() {
     ));
 }
 
+/// Encoder::new の構築時にも無効な data_rate_limits (bytes 0) が
+/// InvalidConfig で拒否されることを検証する
 #[test]
 fn new_rejects_invalid_data_rate_limits() {
     let mut config = minimal_encoder_config();
@@ -738,6 +783,7 @@ fn new_rejects_invalid_data_rate_limits() {
     ));
 }
 
+/// Encoder::new の構築時に average_bitrate 0 が InvalidConfig で拒否されることを検証する
 #[test]
 fn new_rejects_zero_average_bitrate() {
     let mut config = minimal_encoder_config();
@@ -752,9 +798,9 @@ fn new_rejects_zero_average_bitrate() {
     ));
 }
 
+/// 構築時に Some(空 Vec) を渡すと、config() では None に正規化されることを検証する
 #[test]
 fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
-    // `Some(空 Vec)` は未設定と同義なので `config()` では `None` に正規化される
     let mut config = minimal_encoder_config();
     config.data_rate_limits = Some(Vec::new());
     let encoder = Encoder::new(config, noop_encode_handler())?;
@@ -762,10 +808,11 @@ fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
     Ok(())
 }
 
+/// Encoder::new 直後の config() が入力した全フィールドを変更なしで返すことを検証する。
+/// 既定値と区別できる値を使うことで、ハードコードされた既定値を返す回帰を検出する
 #[test]
 fn encoder_config_returns_initial_value() -> Result<(), Error> {
     let mut config = encoder_config(false);
-    // 既定値と区別できる値にする (ハードコードされた既定値を返す回帰を検出するため)
     config.fps_numerator = 30;
     config.real_time = true;
     config.prioritize_encoding_speed_over_quality = true;
@@ -927,11 +974,13 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     Ok(())
 }
 
+/// H.264 でデータレートリミットが 1 秒ウィンドウの出力バイト数を制限することを検証する
 #[test]
 fn data_rate_limits_cap_windowed_output_h264() -> Result<(), Error> {
     data_rate_limits_cap_windowed_output(false)
 }
 
+/// H.265 でデータレートリミットが 1 秒ウィンドウの出力バイト数を制限することを検証する
 #[test]
 fn data_rate_limits_cap_windowed_output_h265() -> Result<(), Error> {
     data_rate_limits_cap_windowed_output(true)

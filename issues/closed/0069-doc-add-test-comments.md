@@ -1,7 +1,7 @@
 # テスト関数にコメントを追加する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-06
 - Branch: feature/refactor-test-comments
 - Polished: 2026-08-01
 
@@ -37,3 +37,22 @@ AGENTS.md は「テストはコメントを重視すること」と定めてい�
 
 - issue 0068: `tests/test_encoder.rs` / `tests/test_decoder.rs` を変更対象とし、同一ファイルを変更する。目的は別のため重複ではないが、差分衝突に注意する
 - issue 0051: `tests/test_encoder.rs` を変更対象とし、同一のテスト関数に触れる
+
+## 解決方法
+
+- `tests/test_encoder.rs` の全 35 件・`tests/test_decoder.rs` の全 7 件・`tests/test_error.rs` の
+  全 2 件の `#[test]` 関数に、日本語の doc コメント（`///`）を追記した
+  - 内容は「何を検証するか・なぜその値を使うか」の 2 点を満たすよう記述した
+  - `h264_decoder` / `h265_decoder` はハードコードされたビットストリームの構成
+    （640x480 の I420 フレーム 1 枚分・使用する定数・`nalu_len_bytes: 4` 等）を記した
+  - `encoder_rejects_*` / `reconfigure_rejects_*` 系は境界値の根拠（CMTime の timescale は
+    i32 / CFNumber は SInt32・SInt64 / Video Toolbox の寸法は i32 等）を記した
+  - 既に本文にインラインコメントがあった関数は、doc コメントと重複する行を整理して
+    固有情報だけ本文に残した
+- `tests/test_codec_info.rs` は対象外（本文に詳細なコメントがあり「何を検証するか」が
+  既に記述されているため変更なし）
+- `CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した
+- 完了条件の確認結果
+  - 全 `#[test]` 関数の直上に日本語 doc コメントがあること（grep + 目視で確認）
+  - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` /
+    `cargo fmt --all -- --check` がすべて通ることを確認
