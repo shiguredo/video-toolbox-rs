@@ -37,6 +37,24 @@
   - モジュール構造の内部変更（分割）で公開 API のパスを維持するための例外的な許可であり、
     新たな re-export を追加する場合は、必ず本ドキュメントに理由と共に追記すること
 
+## catch_unwind の許可
+
+- `shiguredo-rust` 規約は「`std::panic::catch_unwind` を使わないこと」を定めているが、
+  本クレートでは `extern "C"` コールバック内でのユーザーハンドラの panic 捕捉に限り
+  **許可済み**とする
+- 許可の根拠
+  - エンコーダー / デコーダーの FFI コールバック (`output_callback_h264` / `output_callback_h265` /
+    `output_callback`) は `extern "C"` 関数として定義されており、ユーザー実装の
+    `on_encoded` / `on_decoded` が panic すると unwind が ABI 境界を越えてプロセスが abort する
+  - ユーザーハンドラの panic は実装バグの表明ではなく利用者コードの実行結果であり、
+    `extern "C"` 境界を越えさせないための捕捉であって握りつぶしではない
+  - 捕捉した panic はエラーログ（コールバック名 + panic メッセージ）で可視化し、
+    セッションは継続する
+  - ホストアプリが abort するカスタム panic hook をインストールしている場合や
+    `panic=abort` ビルドでは `catch_unwind` では捕捉されず abort するため、
+    本保証はこれらの環境では成立しない
+- 新たに `catch_unwind` を使う場合は、必ず本ドキュメントに理由と共に追記すること
+
 ## テストの前提
 
 - 本クレートは Video Toolbox の実 FFI を叩くため、テスト実行には macOS が必須
