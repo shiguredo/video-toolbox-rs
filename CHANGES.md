@@ -60,6 +60,10 @@
 
 ### misc
 
+- [UPDATE] PBT (proptest) 基盤を導入する
+  - `pbt/` ワークスペースメンバーを追加し、`make pbt` / `make pbt-with-cover` を実行可能にする
+  - `Encoder::new` / `Encoder::reconfigure` の拒否域を `pbt/tests/prop_encoder.rs` で検証する
+  - @voluntas
 - [UPDATE] `cf_dictionary` の返り値を `CfPtr` ガード付きに統一する
   - `cf_array` / `cf_number_*` と同じく drop 時に `CFRelease` されるガードを返すようにし、呼び出し側での手動ラップを不要にする
   - @voluntas
