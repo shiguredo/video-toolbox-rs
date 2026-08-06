@@ -197,12 +197,76 @@ unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 #[cfg(test)]
 mod tests {
-    //! `Encoder::reconfigure` の内部状態 (`next_input_pts`) を直接確認するためのテスト。
-    //! `tests/test_encoder.rs` からは到達できない private フィールド検証だけをここに置く。
-    //! 通常系の検証は `tests/test_encoder.rs` 側にある。
+    //! `Encoder::reconfigure` / `Encoder::encode` / `Encoder::encode_pixel_buffer` の内部状態
+    //! (`next_input_pts`) を直接確認するためのテスト。
+    //! `tests/test_encoder.rs` からは到達できない private フィールドへの書き込みが必要な
+    //! テストだけをここに置く。通常系の検証は `tests/test_encoder.rs` 側にある。
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::PixelFormat;
+    use crate::{PixelFormat, sys, types::CfPtrMut};
+
+    /// エンコードコールバックが `expected` 件届くまでポーリングで待つ
+    fn wait_for_encode_callbacks(count: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let actual = count.load(Ordering::SeqCst);
+            if actual >= expected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "エンコードコールバックが {expected} 件届くのを待ってタイムアウトした (現在 {actual} 件)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `next_input_pts` を `i64::MAX` にした状態で、送信が PTS オーバーフローで拒否されることを検証する
+    ///
+    /// 検証内容: 送信 API が `Error::LimitExceeded` を返す、`next_input_pts` が不変、
+    /// 以後の呼び出しも同じエラーを返す、フレームが送信されない (コールバックが増えない)。
+    fn assert_pts_overflow_rejected<H: EncodeHandler>(
+        encoder: &mut Encoder<H>,
+        mut submit: impl FnMut(&mut Encoder<H>) -> Result<(), Error>,
+        callback_count: &AtomicUsize,
+        baseline: usize,
+    ) {
+        // private フィールドへ直接書き込んでオーバーフロー境界を作る
+        // (公開 API 経由では送信を i64::MAX 回呼ぶ必要があるため)
+        encoder.next_input_pts = i64::MAX;
+
+        // オーバーフローする PTS は送信されず、エラーが返る
+        let err = submit(encoder).expect_err("PTS オーバーフローは拒否されること");
+        assert!(matches!(
+            err,
+            Error::LimitExceeded { reason } if reason == "input presentation timestamp overflow",
+        ));
+
+        // next_input_pts は変更されない
+        assert_eq!(encoder.next_input_pts, i64::MAX);
+
+        // エラー後も next_input_pts が動かないため、以後の呼び出しも同じエラーを返す
+        let err =
+            submit(encoder).expect_err("PTS オーバーフローは以後の呼び出しでも拒否されること");
+        assert!(matches!(
+            err,
+            Error::LimitExceeded { reason } if reason == "input presentation timestamp overflow",
+        ));
+
+        // フレームが万一送信された場合のコールバック到達を待つため 1 秒待ってから、
+        // コールバックが増えていない (フレームを送信していない) ことを確認する
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(
+            callback_count.load(Ordering::SeqCst),
+            baseline,
+            "オーバーフロー時はフレームを送信しないこと"
+        );
+    }
 
     fn base_encoder_config() -> EncoderConfig {
         EncoderConfig {
@@ -322,6 +386,91 @@ mod tests {
         // 失敗時には config も next_input_pts も変更されない
         assert_eq!(encoder.config().fps_numerator, 1);
         assert_eq!(encoder.next_input_pts, i64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_rejects_pts_overflow_before_frame_submit() -> Result<(), Error> {
+        // コールバックが発火しないことの検証は「一定時間待ってカウント 0」で行うため、
+        // 陽性対照（正常フレーム 1 枚を送ってコールバックが届くこと）を併設する。
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let handler = FnEncodeHandler::new({
+            let callback_count = Arc::clone(&callback_count);
+            move |_: Result<EncodedFrame<()>, Error>| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut encoder = Encoder::new(base_encoder_config(), handler)?;
+        let (y, u, v) = black_i420_frame(960, 480);
+        let frame = FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        };
+
+        // 陽性対照: 正常フレームは送信され、コールバックが届くことを確認する。
+        // 既存テストと同じく `finish()` で出力をフラッシュしてから待つ。
+        encoder.encode(&frame, &EncodeOptions::default(), ())?;
+        encoder.finish()?;
+        wait_for_encode_callbacks(&callback_count, 1);
+        let baseline = callback_count.load(Ordering::SeqCst);
+
+        assert_pts_overflow_rejected(
+            &mut encoder,
+            |encoder| encoder.encode(&frame, &EncodeOptions::default(), ()),
+            &callback_count,
+            baseline,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn encode_pixel_buffer_rejects_pts_overflow_before_frame_submit() -> Result<(), Error> {
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let handler = FnEncodeHandler::new({
+            let callback_count = Arc::clone(&callback_count);
+            move |_: Result<EncodedFrame<()>, Error>| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut encoder = Encoder::new(base_encoder_config(), handler)?;
+
+        // 有効な CVPixelBuffer を生成する (I420 の 4:2:0 プラナー)
+        let mut image_buffer = std::ptr::null_mut();
+        let status = unsafe {
+            sys::CVPixelBufferCreate(
+                std::ptr::null_mut(),
+                960,
+                480,
+                sys::kCVPixelFormatType_420YpCbCr8Planar,
+                std::ptr::null(),
+                &mut image_buffer,
+            )
+        };
+        Error::check(status, "CVPixelBufferCreate")?;
+        let image_buffer = CfPtrMut(image_buffer);
+
+        // 陽性対照: 正常フレームは送信され、コールバックが届くことを確認する。
+        // 既存テストと同じく `finish()` で出力をフラッシュしてから待つ。
+        unsafe {
+            encoder.encode_pixel_buffer(image_buffer.0.cast(), &EncodeOptions::default(), ())?;
+        }
+        encoder.finish()?;
+        wait_for_encode_callbacks(&callback_count, 1);
+        let baseline = callback_count.load(Ordering::SeqCst);
+
+        assert_pts_overflow_rejected(
+            &mut encoder,
+            |encoder| unsafe {
+                encoder.encode_pixel_buffer(image_buffer.0.cast(), &EncodeOptions::default(), ())
+            },
+            &callback_count,
+            baseline,
+        );
+
         Ok(())
     }
 }

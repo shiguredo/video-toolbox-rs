@@ -64,6 +64,11 @@
     `invoke_callback` に `callback_name` 引数を追加して捕捉ログにコールバック名を含める
   - `CODEBASE.md` に shiguredo-rust 規約の「`catch_unwind` を使わないこと」の例外を根拠付きで追記する
   - @voluntas
+- [FIX] PTS オーバーフロー検査がフレーム送信後に行われる問題を修正する
+  - `encode` / `encode_pixel_buffer` の `checked_add` を `VTCompressionSessionEncodeFrame` 呼び出し前に移動し、
+    オーバーフロー時はフレームを送信せずに `Error::LimitExceeded` を返す
+  - オーバーフロー時は `next_input_pts` を変更しないため、以後の呼び出しも同じエラーを返す
+  - @voluntas
 
 ### misc
 
