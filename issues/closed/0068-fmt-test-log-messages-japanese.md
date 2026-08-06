@@ -1,7 +1,7 @@
 # テストのログメッセージを日本語に統一する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-08-06
 - Branch: feature/refactor-test-log-messages-japanese
 - Polished: 2026-08-01
 
@@ -39,3 +39,25 @@ AGENTS.md は「テストのログメッセージは全て日本語にするこ�
 
 - issue 0051: `tests/test_encoder.rs` を変更対象とし、同一のテスト関数に触れる
 - issue 0069: `tests/test_encoder.rs` / `tests/test_decoder.rs` にコメントを追加し、同一ファイルを変更対象とする。目的は別のため重複ではないが、差分衝突に注意する
+
+## 解決方法
+
+- `tests/test_encoder.rs` / `tests/test_decoder.rs` / `src/encoder.rs` のテストコードの
+  カスタムメッセージ（`expect` / `expect_err` / `panic!` / `unreachable!` /
+  カスタムメッセージ付き `assert!` / `assert_eq!`）を日本語に統一した
+  - プレースホルダ（`{e}` / `{i}` / `{user_data}` / `{bytes}` / `{total}` 等）は維持
+  - メッセージなしの `assert!` / `assert_eq!` にはメッセージを追加していない
+- `tests/test_codec_info.rs` は変更前から日本語だったため変更なし
+- 対象外の確認
+  - `tests/test_error.rs` は `Error` の Display 出力検証（英語）のため変更なし
+  - ライブラリのログ検証文字列（`output_callback_h264: user handler panicked` 等）は
+    ログが英語のため英語のまま
+- テストハンドラ内の `panic!("テストハンドラが意図的に panic した")` は日本語に統一した。
+  このメッセージは `catch_user_panic` のエラーログ（`"{callback_name}: user handler panicked: {message}"`）
+  に埋め込まれるが、メッセージはテストコード出自の値であり、ライブラリのログフォーマット
+  （"user handler panicked" 等）は英語のままとする
+- `CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した
+- 完了条件の確認結果
+  - 対象ファイルのカスタムメッセージが日本語に統一されていること（grep + 目視で確認）
+  - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace -- -D warnings` /
+    `cargo fmt --all -- --check` がすべて通ることを確認

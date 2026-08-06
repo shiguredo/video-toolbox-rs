@@ -72,6 +72,12 @@
 
 ### misc
 
+- [UPDATE] テストのログメッセージを日本語に統一する
+  - `tests/test_encoder.rs` / `tests/test_decoder.rs` / `src/encoder.rs` のテストコードの
+    カスタムメッセージ（`expect` / `expect_err` / `panic!` / `unreachable!` /
+    カスタムメッセージ付き `assert!` / `assert_eq!`）を日本語に統一する
+  - ライブラリのログ検証文字列と `Error` の Display 出力検証は英語のまま
+  - @voluntas
 - [UPDATE] PBT (proptest) 基盤を導入する
   - `pbt/` ワークスペースメンバーを追加し、`make pbt` / `make pbt-with-cover` を実行可能にする
   - `Encoder::new` / `Encoder::reconfigure` の拒否域を `pbt/tests/prop_encoder.rs` で検証する
