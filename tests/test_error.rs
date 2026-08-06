@@ -5,13 +5,13 @@ use shiguredo_video_toolbox::{Error, PixelFormat};
 #[test]
 fn error_display_limit_exceeded_and_cf_object_creation_failed() {
     let e = Error::LimitExceeded {
-        reason: "unit test reason",
+        reason: "unit test reason".into(),
     };
     assert!(e.to_string().contains("limit exceeded"));
     assert!(e.to_string().contains("unit test reason"));
 
     let e2 = Error::CfObjectCreationFailed {
-        function: "CFNumberCreate",
+        function: "CFNumberCreate".into(),
     };
     let s = e2.to_string();
     assert!(s.contains("CFNumberCreate"));

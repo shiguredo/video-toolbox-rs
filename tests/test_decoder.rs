@@ -60,7 +60,7 @@ fn decoder_vp9_rejects_width_above_i32_max() {
     );
     assert!(matches!(
         r,
-        Err(Error::InvalidConfig { field: "width", .. })
+        Err(Error::InvalidConfig { field, .. }) if field == "width"
     ));
 }
 
@@ -78,10 +78,7 @@ fn decoder_av1_rejects_height_above_i32_max() {
     );
     assert!(matches!(
         r,
-        Err(Error::InvalidConfig {
-            field: "height",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "height"
     ));
 }
 

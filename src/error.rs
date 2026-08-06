@@ -8,7 +8,7 @@ pub enum Error {
         /// ステータスコード
         status: i32,
         /// 関数名
-        function: &'static str,
+        function: String,
     },
     /// ピクセルフォーマットの不一致
     PixelFormatMismatch {
@@ -20,7 +20,7 @@ pub enum Error {
     /// フレームデータのサイズ不足
     InsufficientFrameData {
         /// プレーン名
-        plane: &'static str,
+        plane: String,
         /// 期待する最小サイズ
         expected: usize,
         /// 実際のサイズ
@@ -29,24 +29,24 @@ pub enum Error {
     /// コーデックが未対応
     UnsupportedCodec {
         /// コーデック名
-        codec: &'static str,
+        codec: String,
     },
     /// 不正な設定値
     InvalidConfig {
         /// フィールド名
-        field: &'static str,
+        field: String,
         /// 理由
-        reason: &'static str,
+        reason: String,
     },
-    /// 内部カウンタや算術の上限超過（PTS の加算オーバーフロー等）
+    /// 防御的な上限超過や異常値（null ポインタ、PTS の加算オーバーフロー等）
     LimitExceeded {
-        /// 英語の理由（ログ・表示用）
-        reason: &'static str,
+        /// 英語の理由（表示用）
+        reason: String,
     },
     /// Core Foundation のオブジェクト生成が NULL を返した（メモリ不足等）
     CfObjectCreationFailed {
         /// 関数名
-        function: &'static str,
+        function: String,
     },
     /// 認識できないピクセルフォーマット (I420/Nv12 のいずれでもない FourCC が渡された)
     UnknownPixelFormat {
@@ -58,11 +58,14 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn check(status: i32, function: &'static str) -> Result<(), Self> {
+    pub(crate) fn check(status: i32, function: impl Into<String>) -> Result<(), Self> {
         if status == 0 {
             return Ok(());
         }
-        Err(Self::VideoToolbox { status, function })
+        Err(Self::VideoToolbox {
+            status,
+            function: function.into(),
+        })
     }
 }
 

@@ -183,14 +183,14 @@ type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>);
 fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
     if bitrate == 0 {
         return Err(Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must not be zero",
+            field: "average_bitrate".into(),
+            reason: "must not be zero".into(),
         });
     }
     if bitrate > i64::MAX as u64 {
         return Err(Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must fit in i64 for CFNumber",
+            field: "average_bitrate".into(),
+            reason: "must fit in i64 for CFNumber".into(),
         });
     }
     Ok(())
@@ -203,27 +203,27 @@ fn validate_average_bitrate(bitrate: u64) -> Result<(), Error> {
 fn validate_data_rate_limits(limits: &[DataRateLimit]) -> Result<(), Error> {
     if limits.len() > 2 {
         return Err(Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "must contain at most two limits",
+            field: "data_rate_limits".into(),
+            reason: "must contain at most two limits".into(),
         });
     }
     for limit in limits {
         if limit.bytes == 0 {
             return Err(Error::InvalidConfig {
-                field: "data_rate_limits",
-                reason: "bytes must not be zero",
+                field: "data_rate_limits".into(),
+                reason: "bytes must not be zero".into(),
             });
         }
         if limit.bytes > i64::MAX as u64 {
             return Err(Error::InvalidConfig {
-                field: "data_rate_limits",
-                reason: "bytes must fit in i64 for CFNumber",
+                field: "data_rate_limits".into(),
+                reason: "bytes must fit in i64 for CFNumber".into(),
             });
         }
         if limit.window.is_zero() {
             return Err(Error::InvalidConfig {
-                field: "data_rate_limits",
-                reason: "window must not be zero",
+                field: "data_rate_limits".into(),
+                reason: "window must not be zero".into(),
             });
         }
     }
@@ -243,14 +243,14 @@ fn validate_positive_i32_field(
 ) -> Result<(), Error> {
     if value == 0 {
         return Err(Error::InvalidConfig {
-            field,
-            reason: "must not be zero",
+            field: field.into(),
+            reason: "must not be zero".into(),
         });
     }
     if value > i32::MAX as u32 {
         return Err(Error::InvalidConfig {
-            field,
-            reason: reason_overflow,
+            field: field.into(),
+            reason: reason_overflow.into(),
         });
     }
     Ok(())
@@ -451,7 +451,7 @@ impl<H: EncodeHandler> Encoder<H> {
             let rescaled = (old_pts * new_timescale).div_ceil(old_timescale);
             if rescaled > i64::MAX as u128 {
                 return Err(Error::LimitExceeded {
-                    reason: "rescaled presentation timestamp overflow",
+                    reason: "rescaled presentation timestamp overflow".into(),
                 });
             }
             Some(rescaled as i64)
@@ -755,8 +755,8 @@ impl<H: EncodeHandler> Encoder<H> {
         // PTS 計算の加数としてのみ使われるため、i32 上限は不要 (ゼロ拒否のみ)
         if config.fps_denominator == 0 {
             return Err(Error::InvalidConfig {
-                field: "fps_denominator",
-                reason: "must not be zero",
+                field: "fps_denominator".into(),
+                reason: "must not be zero".into(),
             });
         }
         validate_positive_i32_field(
@@ -775,16 +775,16 @@ impl<H: EncodeHandler> Encoder<H> {
             && interval.get() > i32::MAX as u32
         {
             return Err(Error::InvalidConfig {
-                field: "max_key_frame_interval",
-                reason: "must fit in i32 for CFNumber",
+                field: "max_key_frame_interval".into(),
+                reason: "must fit in i32 for CFNumber".into(),
             });
         }
         if let Some(delay_count) = config.max_frame_delay_count
             && delay_count.get() > i32::MAX as u32
         {
             return Err(Error::InvalidConfig {
-                field: "max_frame_delay_count",
-                reason: "must fit in i32 for CFNumber",
+                field: "max_frame_delay_count".into(),
+                reason: "must fit in i32 for CFNumber".into(),
             });
         }
         Ok(())
@@ -823,7 +823,7 @@ impl<H: EncodeHandler> Encoder<H> {
             let dst = sys::CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) as *mut u8;
             if dst.is_null() {
                 return Err(Error::LimitExceeded {
-                    reason: "CVPixelBuffer base address for plane is null",
+                    reason: "CVPixelBuffer base address for plane is null".into(),
                 });
             }
             let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
@@ -832,21 +832,21 @@ impl<H: EncodeHandler> Encoder<H> {
             // 行あたり `dst_stride` バイトしかないのに `src_width` バイトを書くとバッファ外になる
             if dst_stride < src_width {
                 return Err(Error::LimitExceeded {
-                    reason: "plane destination stride is less than copy width",
+                    reason: "plane destination stride is less than copy width".into(),
                 });
             }
             // Core Video の契約では、プレーンは少なくとも `height * bytesPerRow` バイトを指す。
             // コピー範囲が `CVPixelBuffer` が報告するプレーン寸法を超えないことを検証する。
             if src_width > cv_plane_width || src_height > cv_plane_height {
                 return Err(Error::LimitExceeded {
-                    reason: "plane copy dimensions exceed CVPixelBuffer plane bounds",
+                    reason: "plane copy dimensions exceed CVPixelBuffer plane bounds".into(),
                 });
             }
             let plane_storage =
                 dst_stride
                     .checked_mul(cv_plane_height)
                     .ok_or(Error::LimitExceeded {
-                        reason: "plane storage byte length overflow",
+                        reason: "plane storage byte length overflow".into(),
                     })?;
             let write_span = if src_height == 0 {
                 0
@@ -854,7 +854,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 src_width
                     .checked_mul(src_height)
                     .ok_or(Error::LimitExceeded {
-                        reason: "plane copy byte length overflow",
+                        reason: "plane copy byte length overflow".into(),
                     })?
             } else {
                 src_height
@@ -862,19 +862,19 @@ impl<H: EncodeHandler> Encoder<H> {
                     .and_then(|r| r.checked_mul(dst_stride))
                     .and_then(|o| o.checked_add(src_width))
                     .ok_or(Error::LimitExceeded {
-                        reason: "plane row copy span overflow",
+                        reason: "plane row copy span overflow".into(),
                     })?
             };
             if write_span > plane_storage {
                 return Err(Error::LimitExceeded {
-                    reason: "plane copy would exceed CVPixelBuffer plane storage",
+                    reason: "plane copy would exceed CVPixelBuffer plane storage".into(),
                 });
             }
 
             let copy_size = src_width
                 .checked_mul(src_height)
                 .ok_or(Error::LimitExceeded {
-                    reason: "plane copy byte length overflow",
+                    reason: "plane copy byte length overflow".into(),
                 })?;
             if dst_stride == src_width {
                 // ストライドと入力幅が一致する場合は一括コピー
@@ -883,10 +883,10 @@ impl<H: EncodeHandler> Encoder<H> {
                 // ストライドが異なる場合は行ごとにコピー
                 for row in 0..src_height {
                     let src_off = row.checked_mul(src_width).ok_or(Error::LimitExceeded {
-                        reason: "plane row source offset overflow",
+                        reason: "plane row source offset overflow".into(),
                     })?;
                     let dst_off = row.checked_mul(dst_stride).ok_or(Error::LimitExceeded {
-                        reason: "plane row destination offset overflow",
+                        reason: "plane row destination offset overflow".into(),
                     })?;
                     std::ptr::copy_nonoverlapping(
                         src.as_ptr().add(src_off),
@@ -913,21 +913,21 @@ impl<H: EncodeHandler> Encoder<H> {
                 let uv_expected = Self::frame_byte_len_checked(uv_w, uv_h)?;
                 if y.len() < y_expected {
                     return Err(Error::InsufficientFrameData {
-                        plane: "Y",
+                        plane: "Y".into(),
                         expected: y_expected,
                         actual: y.len(),
                     });
                 }
                 if u.len() < uv_expected {
                     return Err(Error::InsufficientFrameData {
-                        plane: "U",
+                        plane: "U".into(),
                         expected: uv_expected,
                         actual: u.len(),
                     });
                 }
                 if v.len() < uv_expected {
                     return Err(Error::InsufficientFrameData {
-                        plane: "V",
+                        plane: "V".into(),
                         expected: uv_expected,
                         actual: v.len(),
                     });
@@ -938,14 +938,14 @@ impl<H: EncodeHandler> Encoder<H> {
                 let uv_expected = Self::frame_byte_len_checked(width, height.div_ceil(2))?;
                 if y.len() < y_expected {
                     return Err(Error::InsufficientFrameData {
-                        plane: "Y",
+                        plane: "Y".into(),
                         expected: y_expected,
                         actual: y.len(),
                     });
                 }
                 if uv.len() < uv_expected {
                     return Err(Error::InsufficientFrameData {
-                        plane: "UV",
+                        plane: "UV".into(),
                         expected: uv_expected,
                         actual: uv.len(),
                     });
@@ -958,7 +958,7 @@ impl<H: EncodeHandler> Encoder<H> {
     /// `width * height` 等のフレームサイズ計算で `usize` 乗算がオーバーフローしないことを保証する
     fn frame_byte_len_checked(a: usize, b: usize) -> Result<usize, Error> {
         a.checked_mul(b).ok_or(Error::LimitExceeded {
-            reason: "frame dimension size overflow",
+            reason: "frame dimension size overflow".into(),
         })
     }
 
@@ -1080,7 +1080,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 .next_input_pts
                 .checked_add(self.config.fps_denominator as i64)
                 .ok_or(Error::LimitExceeded {
-                    reason: "input presentation timestamp overflow",
+                    reason: "input presentation timestamp overflow".into(),
                 })?;
 
             Ok(())
@@ -1164,7 +1164,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 .next_input_pts
                 .checked_add(self.config.fps_denominator as i64)
                 .ok_or(Error::LimitExceeded {
-                    reason: "input presentation timestamp overflow",
+                    reason: "input presentation timestamp overflow".into(),
                 })?;
 
             Ok(())
@@ -1182,15 +1182,21 @@ impl<H: EncodeHandler> Encoder<H> {
         Ok(())
     }
 
+    // SAFETY:
+    // - `source_frame_ref_con` は `Box<H::UserData>` を `Box::into_raw` したポインタである。
+    //   成功時は一度だけ消費し、`VTCompressionSessionEncodeFrame` 失敗時は呼び出し側の
+    //   `Box::from_raw` が回収する。どちらか一方のみが回収する契約である。
+    // - エンコーダー側は `EncodedFrame` に値のまま載せるため、`Box` からムーブアウトする。
     unsafe fn take_user_data(
         source_frame_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<H::UserData> {
+    ) -> Result<H::UserData, Error> {
         if source_frame_ref_con.is_null() {
-            tracing::error!("{callback_name}: source_frame_ref_con is null");
-            return None;
+            return Err(Error::LimitExceeded {
+                reason: format!("{callback_name}: source_frame_ref_con is null"),
+            });
         }
-        Some(unsafe { *Box::from_raw(source_frame_ref_con.cast::<H::UserData>()) })
+        Ok(unsafe { *Box::from_raw(source_frame_ref_con.cast::<H::UserData>()) })
     }
 
     unsafe fn callback_from_ref_con<'a>(
@@ -1257,16 +1263,26 @@ impl<H: EncodeHandler> Encoder<H> {
         sample_buffer: sys::CMSampleBufferRef,
         status: i32,
         callback_name: &'static str,
-        extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Option<ParameterSets>,
+        extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Result<ParameterSets, Error>,
     ) {
-        let Some(user_data) =
-            (unsafe { Self::take_user_data(source_frame_ref_con, callback_name) })
-        else {
-            return;
+        let handler =
+            unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) };
+
+        // `source_frame_ref_con` の Box は status の成否にかかわらず必ず回収する。
+        // 先に `Error::check(status, ...)` を呼ぶと status エラー時に Box が回収されず
+        // リークするため、take を先に実行する。
+        let user_data = match unsafe { Self::take_user_data(source_frame_ref_con, callback_name) } {
+            Ok(data) => data,
+            Err(e) => {
+                if let Some(h) = handler {
+                    Self::invoke_callback(h, Err(e.into()));
+                }
+                return;
+            }
         };
-        let Some(handler) =
-            (unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) })
-        else {
+
+        let Some(handler) = handler else {
+            // callback_from_ref_con が null。source_frame_ref_con は take_user_data 内で消費済み。
             return;
         };
 
@@ -1278,7 +1294,7 @@ impl<H: EncodeHandler> Encoder<H> {
         // フレームドロップ等で sample_buffer が NULL になる場合がある
         if sample_buffer.is_null() {
             let e = Error::LimitExceeded {
-                reason: "encoded sample buffer is null",
+                reason: "encoded sample buffer is null".into(),
             };
             Self::invoke_callback(handler, Err(e.into()));
             return;
@@ -1288,7 +1304,7 @@ impl<H: EncodeHandler> Encoder<H> {
             let data_buffer = sys::CMSampleBufferGetDataBuffer(sample_buffer);
             if data_buffer.is_null() {
                 let e = Error::LimitExceeded {
-                    reason: "CMSampleBufferGetDataBuffer returned null",
+                    reason: "CMSampleBufferGetDataBuffer returned null".into(),
                 };
                 Self::invoke_callback(handler, Err(e.into()));
                 return;
@@ -1298,12 +1314,10 @@ impl<H: EncodeHandler> Encoder<H> {
             let block_len = sys::CMBlockBufferGetDataLength(data_buffer);
             if block_len > MAX_ENCODED_BLOCK_COPY_BYTES {
                 let e = Error::LimitExceeded {
-                    reason: "encoded block length exceeds defensive maximum",
+                    reason: format!(
+                        "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {MAX_ENCODED_BLOCK_COPY_BYTES}"
+                    ),
                 };
-                tracing::error!(
-                    "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {max}",
-                    max = MAX_ENCODED_BLOCK_COPY_BYTES
-                );
                 Self::invoke_callback(handler, Err(e.into()));
                 return;
             }
@@ -1325,17 +1339,15 @@ impl<H: EncodeHandler> Encoder<H> {
             let (vps_list, sps_list, pps_list) = if keyframe {
                 if description.is_null() {
                     let e = Error::LimitExceeded {
-                        reason: "CMSampleBufferGetFormatDescription returned null for keyframe",
+                        reason: "CMSampleBufferGetFormatDescription returned null for keyframe"
+                            .into(),
                     };
                     Self::invoke_callback(handler, Err(e.into()));
                     return;
                 }
                 match extract_params(description) {
-                    Some(params) => params,
-                    None => {
-                        let e = Error::LimitExceeded {
-                            reason: "failed to extract codec parameter sets",
-                        };
+                    Ok(params) => params,
+                    Err(e) => {
                         Self::invoke_callback(handler, Err(e.into()));
                         return;
                     }
@@ -1361,11 +1373,12 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 戻り値は (vps_list, sps_list, pps_list) のタプル (H.264 では vps_list は空)
     unsafe fn extract_h264_params(
         description: sys::CMVideoFormatDescriptionRef,
-    ) -> Option<ParameterSets> {
+    ) -> Result<ParameterSets, Error> {
         unsafe {
             if description.is_null() {
-                tracing::error!("CMVideoFormatDescription is null in extract_h264_params");
-                return None;
+                return Err(Error::LimitExceeded {
+                    reason: "CMVideoFormatDescription is null in extract_h264_params".into(),
+                });
             }
             let mut nalu_header_length = 0;
             let status = sys::CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -1376,15 +1389,11 @@ impl<H: EncodeHandler> Encoder<H> {
                 std::ptr::null_mut(),
                 &mut nalu_header_length,
             );
-            if let Err(e) =
-                Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")
-            {
-                tracing::error!("{e}");
-                return None;
-            }
+            Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")?;
             if nalu_header_length != 4 {
-                tracing::error!("unexpected NAL unit header length: {nalu_header_length}");
-                return None;
+                return Err(Error::LimitExceeded {
+                    reason: format!("unexpected NAL unit header length: {nalu_header_length}"),
+                });
             }
 
             let mut sps_ptr = std::ptr::null();
@@ -1405,18 +1414,13 @@ impl<H: EncodeHandler> Encoder<H> {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 );
-                if let Err(e) =
-                    Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")
-                {
-                    tracing::error!("{e}");
-                    return None;
-                }
+                Error::check(status, "CMVideoFormatDescriptionGetH264ParameterSetAtIndex")?;
             }
 
             let sps_vec = vec_u8_from_raw_parts_safe(sps_ptr, sps_size, "H264 SPS")?;
             let pps_vec = vec_u8_from_raw_parts_safe(pps_ptr, pps_size, "H264 PPS")?;
 
-            Some((Vec::new(), vec![sps_vec], vec![pps_vec]))
+            Ok((Vec::new(), vec![sps_vec], vec![pps_vec]))
         }
     }
 
@@ -1425,11 +1429,12 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 戻り値は (vps_list, sps_list, pps_list) のタプル
     unsafe fn extract_h265_params(
         description: sys::CMVideoFormatDescriptionRef,
-    ) -> Option<ParameterSets> {
+    ) -> Result<ParameterSets, Error> {
         unsafe {
             if description.is_null() {
-                tracing::error!("CMVideoFormatDescription is null in extract_h265_params");
-                return None;
+                return Err(Error::LimitExceeded {
+                    reason: "CMVideoFormatDescription is null in extract_h265_params".into(),
+                });
             }
             let mut nalu_header_length = 0;
             let status = sys::CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
@@ -1440,15 +1445,11 @@ impl<H: EncodeHandler> Encoder<H> {
                 std::ptr::null_mut(),
                 &mut nalu_header_length,
             );
-            if let Err(e) =
-                Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")
-            {
-                tracing::error!("{e}");
-                return None;
-            }
+            Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")?;
             if nalu_header_length != 4 {
-                tracing::error!("unexpected NAL unit header length: {nalu_header_length}");
-                return None;
+                return Err(Error::LimitExceeded {
+                    reason: format!("unexpected NAL unit header length: {nalu_header_length}"),
+                });
             }
 
             let mut vps_ptr = std::ptr::null();
@@ -1474,19 +1475,14 @@ impl<H: EncodeHandler> Encoder<H> {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 );
-                if let Err(e) =
-                    Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")
-                {
-                    tracing::error!("{e}");
-                    return None;
-                }
+                Error::check(status, "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex")?;
             }
 
             let vps_vec = vec_u8_from_raw_parts_safe(vps_ptr, vps_size, "HEVC VPS")?;
             let sps_vec = vec_u8_from_raw_parts_safe(sps_ptr, sps_size, "HEVC SPS")?;
             let pps_vec = vec_u8_from_raw_parts_safe(pps_ptr, pps_size, "HEVC PPS")?;
 
-            Some((vec![vps_vec], vec![sps_vec], vec![pps_vec]))
+            Ok((vec![vps_vec], vec![sps_vec], vec![pps_vec]))
         }
     }
 }
@@ -1561,7 +1557,7 @@ const MAX_PARAMETER_SET_COPY_BYTES: usize = u16::MAX as usize;
 /// エンコード出力 1 フレーム分を `Vec` にコピーするときの防御的上限（バイト）。
 ///
 /// `MAX_PARAMETER_SET_COPY_BYTES`（パラメータセット用）とは別。`CMBlockBufferGetDataLength` が異常に大きい場合の OOM を防ぐ。
-/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はログして当該フレームを破棄する。
+/// 値は保守的に大きめ（4K・高ビットレート等を想定）。超過時はエラーを通知して当該フレームを破棄する。
 const MAX_ENCODED_BLOCK_COPY_BYTES: usize = 256 * 1024 * 1024;
 
 /// `slice::from_raw_parts` の前提（長さ 0 でも非 NULL ポインタ、長さ正では NULL 禁止）を満たすためのヘルパー
@@ -1569,22 +1565,23 @@ fn vec_u8_from_raw_parts_safe(
     ptr: *const u8,
     len: usize,
     context: &'static str,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, Error> {
     if len > MAX_PARAMETER_SET_COPY_BYTES {
-        tracing::error!(
-            "{context}: parameter set length {len} exceeds defensive maximum {max}",
-            max = MAX_PARAMETER_SET_COPY_BYTES
-        );
-        return None;
+        return Err(Error::LimitExceeded {
+            reason: format!(
+                "{context}: parameter set length {len} exceeds defensive maximum {MAX_PARAMETER_SET_COPY_BYTES}"
+            ),
+        });
     }
     if len == 0 {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     if ptr.is_null() {
-        tracing::error!("{context}: null pointer with non-zero length");
-        return None;
+        return Err(Error::LimitExceeded {
+            reason: format!("{context}: null pointer with non-zero length"),
+        });
     }
-    Some(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })
 }
 
 fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
@@ -1736,9 +1733,7 @@ mod tests {
             .expect_err("rescale should overflow");
         assert!(matches!(
             err,
-            Error::LimitExceeded {
-                reason: "rescaled presentation timestamp overflow",
-            }
+            Error::LimitExceeded { reason } if reason == "rescaled presentation timestamp overflow",
         ));
         // 失敗時には config も next_input_pts も変更されない
         assert_eq!(encoder.config().fps_numerator, 1);

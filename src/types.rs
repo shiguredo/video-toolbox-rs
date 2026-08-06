@@ -7,26 +7,26 @@ pub(crate) fn validate_video_dimensions_for_toolbox(width: u32, height: u32) -> 
     let max = i32::MAX as u32;
     if width == 0 {
         return Err(Error::InvalidConfig {
-            field: "width",
-            reason: "must not be zero",
+            field: "width".into(),
+            reason: "must not be zero".into(),
         });
     }
     if height == 0 {
         return Err(Error::InvalidConfig {
-            field: "height",
-            reason: "must not be zero",
+            field: "height".into(),
+            reason: "must not be zero".into(),
         });
     }
     if width > max {
         return Err(Error::InvalidConfig {
-            field: "width",
-            reason: "must fit in i32 for Video Toolbox dimensions",
+            field: "width".into(),
+            reason: "must fit in i32 for Video Toolbox dimensions".into(),
         });
     }
     if height > max {
         return Err(Error::InvalidConfig {
-            field: "height",
-            reason: "must fit in i32 for Video Toolbox dimensions",
+            field: "height".into(),
+            reason: "must fit in i32 for Video Toolbox dimensions".into(),
         });
     }
     Ok(())
@@ -92,7 +92,7 @@ pub(crate) fn cf_dictionary(
     };
     if ptr.is_null() {
         return Err(Error::CfObjectCreationFailed {
-            function: "CFDictionaryCreate",
+            function: "CFDictionaryCreate".into(),
         });
     }
     Ok(ptr)
@@ -113,7 +113,7 @@ pub(crate) fn cf_array(values: &[*const c_void]) -> Result<CfPtr<c_void>, Error>
     };
     if ptr.is_null() {
         return Err(Error::CfObjectCreationFailed {
-            function: "CFArrayCreate",
+            function: "CFArrayCreate".into(),
         });
     }
     Ok(CfPtr(ptr.cast()))
@@ -129,7 +129,7 @@ pub(crate) fn cf_number_i32(n: i32) -> Result<CfPtr<c_void>, Error> {
     };
     if ptr.is_null() {
         return Err(Error::CfObjectCreationFailed {
-            function: "CFNumberCreate",
+            function: "CFNumberCreate".into(),
         });
     }
     Ok(CfPtr(ptr.cast()))
@@ -145,7 +145,7 @@ pub(crate) fn cf_number_i64(n: i64) -> Result<CfPtr<c_void>, Error> {
     };
     if ptr.is_null() {
         return Err(Error::CfObjectCreationFailed {
-            function: "CFNumberCreate",
+            function: "CFNumberCreate".into(),
         });
     }
     Ok(CfPtr(ptr.cast()))
@@ -161,7 +161,7 @@ pub(crate) fn cf_number_f64(n: f64) -> Result<CfPtr<c_void>, Error> {
     };
     if ptr.is_null() {
         return Err(Error::CfObjectCreationFailed {
-            function: "CFNumberCreate",
+            function: "CFNumberCreate".into(),
         });
     }
     Ok(CfPtr(ptr.cast()))

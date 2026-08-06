@@ -222,7 +222,7 @@ fn encoder_rejects_zero_width() {
     c.width = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field: "width", .. })
+        Err(Error::InvalidConfig { field, .. }) if field == "width"
     ));
 }
 
@@ -232,10 +232,7 @@ fn encoder_rejects_zero_height() {
     c.height = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "height",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "height"
     ));
 }
 
@@ -245,10 +242,7 @@ fn encoder_rejects_fps_numerator_above_i32_max() {
     c.fps_numerator = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "fps_numerator",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "fps_numerator"
     ));
 }
 
@@ -258,7 +252,7 @@ fn encoder_rejects_width_above_i32_max() {
     c.width = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig { field: "width", .. })
+        Err(Error::InvalidConfig { field, .. }) if field == "width"
     ));
 }
 
@@ -268,10 +262,7 @@ fn encoder_rejects_height_above_i32_max() {
     c.height = i32::MAX as u32 + 1;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "height",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "height"
     ));
 }
 
@@ -281,10 +272,7 @@ fn encoder_rejects_average_bitrate_above_i64_max() {
     c.average_bitrate = Some(i64::MAX as u64 + 1);
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "average_bitrate",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "average_bitrate"
     ));
 }
 
@@ -294,10 +282,7 @@ fn encoder_rejects_zero_fps_denominator() {
     c.fps_denominator = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "fps_denominator",
-            ..
-        })
+        Err(Error::InvalidConfig { field, .. }) if field == "fps_denominator"
     ));
 }
 
@@ -307,10 +292,8 @@ fn encoder_rejects_zero_fps_numerator() {
     c.fps_numerator = 0;
     assert!(matches!(
         Encoder::new(c, noop_encode_handler()),
-        Err(Error::InvalidConfig {
-            field: "fps_numerator",
-            reason: "must not be zero"
-        })
+        Err(Error::InvalidConfig { field, reason })
+            if field == "fps_numerator" && reason == "must not be zero"
     ));
 }
 
@@ -340,7 +323,7 @@ fn encode_rejects_insufficient_i420_y_plane() -> Result<(), Error> {
     );
     assert!(matches!(
         r,
-        Err(Error::InsufficientFrameData { plane: "Y", .. })
+        Err(Error::InsufficientFrameData { plane, .. }) if plane == "Y"
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
@@ -372,7 +355,7 @@ fn encode_rejects_insufficient_i420_u_plane() -> Result<(), Error> {
     );
     assert!(matches!(
         r,
-        Err(Error::InsufficientFrameData { plane: "U", .. })
+        Err(Error::InsufficientFrameData { plane, .. }) if plane == "U"
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
@@ -445,10 +428,8 @@ fn reconfigure_rejects_zero_bitrate() {
             average_bitrate: Some(0),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "average_bitrate" && reason == "must not be zero"
     ));
 }
 
@@ -459,10 +440,8 @@ fn reconfigure_rejects_zero_expected_frame_rate() {
             expected_frame_rate: Some(0),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "expected_frame_rate" && reason == "must not be zero"
     ));
 }
 
@@ -473,10 +452,8 @@ fn reconfigure_rejects_expected_frame_rate_above_i32_max() {
             expected_frame_rate: Some(i32::MAX as u32 + 1),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "expected_frame_rate",
-            reason: "must fit in i32 for CFNumber",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "expected_frame_rate" && reason == "must fit in i32 for CFNumber"
     ));
 }
 
@@ -487,10 +464,8 @@ fn reconfigure_rejects_bitrate_above_i64_max() {
             average_bitrate: Some(i64::MAX as u64 + 1),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must fit in i64 for CFNumber",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "average_bitrate" && reason == "must fit in i64 for CFNumber"
     ));
 }
 
@@ -515,7 +490,7 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     );
     assert!(matches!(
         r,
-        Err(Error::InsufficientFrameData { plane: "UV", .. })
+        Err(Error::InsufficientFrameData { plane, .. }) if plane == "UV"
     ));
     assert!(results.lock().expect("results mutex poisoned").is_empty());
     Ok(())
@@ -554,10 +529,8 @@ fn reconfigure_rejects_more_than_two_data_rate_limits() {
             data_rate_limits: Some(vec![limit; 3]),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "must contain at most two limits",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "must contain at most two limits"
     ));
 }
 
@@ -571,10 +544,8 @@ fn reconfigure_rejects_zero_bytes_data_rate_limit() {
             }]),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "bytes must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "bytes must not be zero"
     ));
 }
 
@@ -589,10 +560,8 @@ fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
             }]),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "bytes must fit in i64 for CFNumber",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "bytes must fit in i64 for CFNumber"
     ));
 }
 
@@ -606,10 +575,8 @@ fn reconfigure_rejects_zero_window_data_rate_limit() {
             }]),
             ..Default::default()
         }),
-        Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "window must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "window must not be zero"
     ));
 }
 
@@ -625,10 +592,8 @@ fn new_rejects_invalid_data_rate_limits() {
         .expect_err("invalid data rate limits must be rejected at construction");
     assert!(matches!(
         err,
-        Error::InvalidConfig {
-            field: "data_rate_limits",
-            reason: "bytes must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "bytes must not be zero"
     ));
 }
 
@@ -641,10 +606,8 @@ fn new_rejects_zero_average_bitrate() {
         .expect_err("zero average bitrate must be rejected at construction");
     assert!(matches!(
         err,
-        Error::InvalidConfig {
-            field: "average_bitrate",
-            reason: "must not be zero",
-        }
+        Error::InvalidConfig { field, reason }
+            if field == "average_bitrate" && reason == "must not be zero"
     ));
 }
 

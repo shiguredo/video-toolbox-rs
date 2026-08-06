@@ -150,11 +150,15 @@ impl<H: DecodeHandler> Decoder<H> {
     fn wrap_unsupported_codec_error(codec: &DecoderCodec<'_>, error: Error) -> Error {
         match codec {
             DecoderCodec::Vp9 { .. } => match error {
-                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "VP9" },
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec {
+                    codec: "VP9".into(),
+                },
                 _ => error,
             },
             DecoderCodec::Av1 { .. } => match error {
-                Error::VideoToolbox { .. } => Error::UnsupportedCodec { codec: "AV1" },
+                Error::VideoToolbox { .. } => Error::UnsupportedCodec {
+                    codec: "AV1".into(),
+                },
                 _ => error,
             },
             _ => error,
@@ -239,15 +243,15 @@ impl<H: DecodeHandler> Decoder<H> {
                     // Apple のドキュメントで有効値は 1, 2, 4 のみ
                     if !matches!(nalu_len_bytes, 1 | 2 | 4) {
                         return Err(Error::InvalidConfig {
-                            field: "nalu_len_bytes",
-                            reason: "must be 1, 2, or 4",
+                            field: "nalu_len_bytes".into(),
+                            reason: "must be 1, 2, or 4".into(),
                         });
                     }
                     // 空スライスの as_ptr() は dangling pointer になるため拒否する
                     if sps.is_empty() || pps.is_empty() {
                         return Err(Error::InvalidConfig {
-                            field: "parameter_sets",
-                            reason: "sps and pps must not be empty",
+                            field: "parameter_sets".into(),
+                            reason: "sps and pps must not be empty".into(),
                         });
                     }
                     let status = sys::CMVideoFormatDescriptionCreateFromH264ParameterSets(
@@ -272,15 +276,15 @@ impl<H: DecodeHandler> Decoder<H> {
                     // Apple のドキュメントで有効値は 1, 2, 4 のみ
                     if !matches!(nalu_len_bytes, 1 | 2 | 4) {
                         return Err(Error::InvalidConfig {
-                            field: "nalu_len_bytes",
-                            reason: "must be 1, 2, or 4",
+                            field: "nalu_len_bytes".into(),
+                            reason: "must be 1, 2, or 4".into(),
                         });
                     }
                     // 空スライスの as_ptr() は dangling pointer になるため拒否する
                     if vps.is_empty() || sps.is_empty() || pps.is_empty() {
                         return Err(Error::InvalidConfig {
-                            field: "parameter_sets",
-                            reason: "vps, sps, and pps must not be empty",
+                            field: "parameter_sets".into(),
+                            reason: "vps, sps, and pps must not be empty".into(),
                         });
                     }
                     let status = sys::CMVideoFormatDescriptionCreateFromHEVCParameterSets(
@@ -429,15 +433,21 @@ impl<H: DecodeHandler> Decoder<H> {
         }
     }
 
+    // SAFETY:
+    // - `source_frame_ref_con` は `Box<PendingDecode<H::UserData>>` を `Box::into_raw` した
+    //   ポインタである。成功時は一度だけ消費し、`VTDecompressionSessionDecodeFrame` 失敗時は
+    //   呼び出し側の `Box::from_raw` が回収する。どちらか一方のみが回収する契約である。
+    // - デコーダー側は `PendingDecode` を分解して使うため、Box のまま返す。
     unsafe fn take_pending_decode(
         source_frame_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<Box<PendingDecode<H::UserData>>> {
+    ) -> Result<Box<PendingDecode<H::UserData>>, Error> {
         if source_frame_ref_con.is_null() {
-            tracing::error!("{callback_name}: source_frame_ref_con is null");
-            return None;
+            return Err(Error::LimitExceeded {
+                reason: format!("{callback_name}: source_frame_ref_con is null"),
+            });
         }
-        Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>()) })
+        Ok(unsafe { Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>()) })
     }
 
     unsafe fn callback_from_ref_con<'a>(
@@ -469,14 +479,25 @@ impl<H: DecodeHandler> Decoder<H> {
         _presentation_duration: sys::CMTime,
     ) {
         let callback_name = "output_callback";
-        let Some(pending) =
-            (unsafe { Self::take_pending_decode(source_frame_ref_con, callback_name) })
-        else {
-            return;
-        };
-        let Some(handler) =
-            (unsafe { Self::callback_from_ref_con(decompression_output_ref_con, callback_name) })
-        else {
+        let handler =
+            unsafe { Self::callback_from_ref_con(decompression_output_ref_con, callback_name) };
+
+        // `source_frame_ref_con` の Box は status の成否にかかわらず必ず回収する。
+        // 先に `Error::check(status, ...)` を呼ぶと status エラー時に Box が回収されず
+        // リークするため、take を先に実行する。
+        let pending =
+            match unsafe { Self::take_pending_decode(source_frame_ref_con, callback_name) } {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(h) = handler {
+                        Self::invoke_callback(h, Err(e.into()));
+                    }
+                    return;
+                }
+            };
+
+        let Some(handler) = handler else {
+            // callback_from_ref_con が null。source_frame_ref_con は take_pending_decode 内で消費済み。
             return;
         };
 
@@ -494,7 +515,7 @@ impl<H: DecodeHandler> Decoder<H> {
         // フレームドロップ等で image_buffer が NULL になる場合がある
         if image_buffer.is_null() {
             let e = Error::LimitExceeded {
-                reason: "decoded image buffer is null",
+                reason: "decoded image buffer is null".into(),
             };
             Self::invoke_callback(handler, Err(e.into()));
             return;
