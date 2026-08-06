@@ -3,7 +3,7 @@
 - Priority: Medium
 - Created: 2026-07-16
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-08-06
 - Model: Fable 5
 - Branch: feature/add-pbt-infrastructure
 - Polished: 2026-07-31
@@ -58,3 +58,19 @@ shiguredo-rust スキルは「PBT(Property-Based Testing) や Fuzzing でテス�
 - 既存の単体テストのうち、追加する PBT で完全に代替できるものは削除されている（既存の `encoder_rejects_*` / `reconfigure_rejects_*` テストは field / reason 文字列まで検証しており、PBT の性質検証では代替されない。`src/encoder.rs` の内部テスト 3 本も FFI 経路・制御フロー・失敗時の状態不変を検証しており、PBT では代替されない）
 - `CHANGES.md` の `## develop` に `[UPDATE]` としてエントリを追記する（`### misc` サブセクション）
 - `cargo test --workspace` / `cargo clippy --workspace -- -D warnings` / `cargo fmt --all -- --check` が通る（clippy / fmt のフラグは issue 0070 の統一後に追従する）
+
+## 解決方法
+
+PBT (proptest) 基盤を導入した。
+
+- ルート `Cargo.toml` に `[workspace] members = ["pbt"]` を追加し、`pbt/` を publish 対象外 (`publish = false`) の内部テスト専用クレートとして追加した
+- `pbt/Cargo.toml` に `proptest = "1.11"` を dev-dependency として追加し、本体クレートへ path 依存した (`rust-version = "1.93"` も明記)
+- `pbt/tests/prop_encoder.rs` を作成し、`Encoder::new` / `Encoder::reconfigure` の拒否域を PBT で検証した
+  - 「不正フィールドを 1 個だけ固定し、残りは有効範囲から生成する」戦略 (`prop_oneof` で各拒否パスを列挙)
+  - `validate_config` の全 15 パスと `validate_reconfigure_params` の全 8 パスを 1:1 で網羅
+  - 拒否時は必ず `Error::InvalidConfig` を返すこと、reconfigure 拒否時は `config()` が不変であることを検証
+  - reconfigure の検証は実 FFI セッション 1 つを `RefCell` で包んで使い回す
+- `Makefile` の `.PHONY` の誤記 (`pbt-cover` → `pbt-with-cover`、`fuzz` → `fuzzing`) を修正し、`make pbt` / `make pbt-with-cover` が実行できることを確認した
+- `CHANGES.md` の `### misc` に `[UPDATE]` エントリを追記した
+
+`cargo test --workspace` は全 48 テスト (pbt 2 件を含む) がパスする。

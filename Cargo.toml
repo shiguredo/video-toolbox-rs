@@ -11,6 +11,9 @@ license = "Apache-2.0"
 build = "build.rs"
 include = ["/LICENSE", "/README.md", "/build.rs", "/src/**"]
 
+[workspace]
+members = ["pbt"]
+
 [dependencies]
 # コールバック内などで呼び出し元へエラーを返せない箇所のエラーログ用
 tracing = "0.1"

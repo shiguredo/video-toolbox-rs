@@ -1,0 +1,14 @@
+[package]
+name = "pbt"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+# PBT のテスト対象クレート
+shiguredo_video_toolbox = { path = ".." }
+
+[dev-dependencies]
+# PBT 用のプロパティベーステストライブラリ (Property-Based Testing)
+proptest = "1.11"
