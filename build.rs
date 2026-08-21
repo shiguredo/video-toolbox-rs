@@ -99,6 +99,10 @@ fn main() {
         // ターゲット判定がうまくいかないことがあるので、明示的に指定する
         // ちゃんとやるなら TargetConditionals.h をインクルードするようにした方がいいかもしれない
         .clang_arg("-DTARGET_OS_OSX=1")
+        // Clang が memcpy / strlen 等を builtin 署名に差し替えると、bindgen が size_t を
+        // c_ulong として出力し、Rust 1.98 以降の suspicious_runtime_symbol_definitions に引っかかる。
+        // -fno-builtin で差し替えを止め、size_t → usize の正しい対応を保つ。
+        .clang_arg("-fno-builtin")
         // Video Toolbox 側のコメントが誤ってテスト対象と認識されてしまいエラーとなることがあるので、
         // コメントは生成しないようにしている。
         .generate_comments(false)
