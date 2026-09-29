@@ -128,6 +128,12 @@
   - 「動的に更新できる項目 / できない項目」の本体説明を `Encoder::reconfigure` に集約し、
     `ReconfigureParams` / `Encoder::config` からは参照で辿れるようにする
   - @voluntas
+- [UPDATE] `I420Frame` / `Nv12Frame` に重複していたピクセルバッファ操作を `PixelBuffer` に集約する
+  - `plane_slice` / `y_plane` / `y_stride` / `width` / `height` / `Drop` を共通の内部構造体に移し、
+    両フレーム型は固有のプレーンアクセサだけを持つ
+  - retain と `CVPixelBufferLockBaseAddress` は `PixelBuffer::new` に集約する
+  - 公開 API の変更はない（`#[derive(Debug)]` の出力形式のみ変化する）
+  - @melpon
 
 ## 2026.1.1
 
