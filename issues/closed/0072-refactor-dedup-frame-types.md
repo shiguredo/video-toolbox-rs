@@ -1,7 +1,7 @@
 # `I420Frame` / `Nv12Frame` の重複を解消する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-09-29
 - Branch: feature/refactor-dedup-frame-types
 - Polished: 2026-08-01
 
@@ -40,3 +40,15 @@
 
 - issue 0071: `Nv12Frame` の公開メソッドのテスト追加を対象とする。公開 API は変わらず開発順序の制約はないが、同一ファイル（`src/decoder.rs` / `tests/test_decoder.rs`）を変更するためマージ時は差分衝突に注意する
 - issue 0073: `encode` / `encode_pixel_buffer` の重複解消で、本 issue と同じ「重複解消」の refactor カテゴリ
+
+## 解決方法
+
+共通の内部構造体 `PixelBuffer` を新設し、`I420Frame` / `Nv12Frame` で重複していた実装を集約した（設計方針の `LockedPixelBuffer` から名前を変えている）。
+
+- `plane_slice` / `plane_stride` / `y_plane` / `width` / `height` / `Drop` を `PixelBuffer` に移した
+- `I420Frame` / `Nv12Frame` は `PixelBuffer` をラップし、固有のプレーンアクセサ（I420: `u_plane` / `v_plane` / `u_stride` / `v_stride`、Nv12: `uv_plane` / `uv_stride`）だけを持つ。共通アクセサは `PixelBuffer` への委譲として再公開し、公開 API は変更していない
+- `Drop` を `PixelBuffer` に移したため、`I420Frame` / `Nv12Frame` の `Drop` 実装は削除した
+- retain と `CVPixelBufferLockBaseAddress` を `PixelBuffer::new` に集約した。ロックに失敗した場合は `Drop` が retain した参照を解放する
+- `plane_slice` の空スライス分岐から長さ 0 の early return を削り、乗算オーバーフローと NULL の防御だけに絞った。NULL が返る条件は非プラナーのバッファであり、本クレートは出力を I420 / NV12 に固定しロック後にのみプレーンを参照するため、この防御が発動しないことを rustdoc に明記した
+- `CHANGES.md` の `## develop` に `### misc` の `[UPDATE]` としてエントリを追記した
+- 検証: `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` がすべて成功。委譲後のプレーンインデックス（`u` / `v` / `uv`）が既存実装と一致することを手動で照合した

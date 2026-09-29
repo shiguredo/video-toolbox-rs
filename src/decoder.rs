@@ -527,29 +527,20 @@ impl<H: DecodeHandler> Decoder<H> {
             return;
         }
 
-        // コールバック引数の image_buffer を利用者コールバックの外でも保持できるように retain する。
-        let retained_image_buffer = unsafe { sys::CFRetain(image_buffer.cast()) };
-        let retained_image_buffer = retained_image_buffer.cast_mut().cast();
-        let image_buffer = CfPtrMut(retained_image_buffer);
-
-        let flags_readonly = 1;
-        let status = unsafe { sys::CVPixelBufferLockBaseAddress(image_buffer.0, flags_readonly) };
-        if let Err(e) = Error::check(status, "CVPixelBufferLockBaseAddress") {
-            Self::invoke_callback(handler, Err(e.into()), callback_name);
-            return;
-        }
-
+        let buffer = match unsafe { PixelBuffer::new(image_buffer) } {
+            Ok(buffer) => buffer,
+            Err(e) => {
+                Self::invoke_callback(handler, Err(e.into()), callback_name);
+                return;
+            }
+        };
         let frame = match pixel_format {
             PixelFormat::I420 => DecodedFrame::I420 {
-                frame: I420Frame {
-                    inner: image_buffer,
-                },
+                frame: I420Frame { buffer },
                 user_data,
             },
             PixelFormat::Nv12 => DecodedFrame::Nv12 {
-                frame: Nv12Frame {
-                    inner: image_buffer,
-                },
+                frame: Nv12Frame { buffer },
                 user_data,
             },
         };
@@ -594,155 +585,186 @@ pub enum DecodedFrame<T> {
     },
 }
 
-/// I420 形式のデコード済みフレーム (3 プレーン: Y, U, V)
+/// ロック済みのピクセルバッファ
 ///
-/// ## プレーン参照
-///
-/// プラットフォームが基底アドレスに NULL を返した場合、または行数とストライドの乗算が
-/// `usize` で表現できない場合、各 `*_plane` は **空のスライス**を返す。
-/// 解像度が正である通常のデコードでは空にはならない想定である。
-///
-/// **空スライスは「デコードが成功したがピクセルが無い」ではなく、異常時のセンチネル**として扱う。
-/// 呼び出し側は `y_plane().is_empty()` 等で分岐し、通常のピクセル処理に進まないこと。
+/// ピクセルバッファの参照を所有し `CVPixelBufferLockBaseAddress` でロックを保持した状態を表す。
+/// 参照の解放とロックの解除は `Drop` が行う。
 #[derive(Debug)]
-pub struct I420Frame {
+struct PixelBuffer {
     inner: CfPtrMut<sys::__CVBuffer>,
 }
 
-impl I420Frame {
+impl PixelBuffer {
+    /// ピクセルバッファの参照を retain して読み取り専用でロックする
+    ///
+    /// 返り値はピクセルバッファの参照を所有し、ロックを保持した状態になる。
+    ///
+    /// # Errors
+    ///
+    /// `CVPixelBufferLockBaseAddress` が失敗した場合は [`Error::VideoToolbox`] を返す。
+    ///
+    /// # Safety
+    ///
+    /// `image_buffer` は有効な `CVImageBufferRef` を指していること。
+    unsafe fn new(image_buffer: sys::CVImageBufferRef) -> Result<Self, Error> {
+        let retained = unsafe { sys::CFRetain(image_buffer.cast()) };
+        let inner = CfPtrMut(retained.cast_mut().cast());
+
+        let flags_readonly = 1;
+        let status = unsafe { sys::CVPixelBufferLockBaseAddress(inner.0, flags_readonly) };
+        // ロックに失敗した場合も、`inner` の `Drop` が retain した参照を解放する
+        Error::check(status, "CVPixelBufferLockBaseAddress")?;
+
+        Ok(Self { inner })
+    }
+
     /// ロック済みプレーンを `&[u8]` として返す
     ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`I420Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
+    /// 乗算オーバーフローまたは内部エラーが発生した場合は空スライスを返す。
     fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
-        let len = match row_count.checked_mul(bytes_per_row) {
-            Some(n) if n > 0 => n,
-            _ => return &[],
+        // `from_raw_parts` に `usize` で表現できない長さを渡すと未定義動作になるため、
+        // 乗算がオーバーフローした場合は空スライスを返す
+        let Some(len) = row_count.checked_mul(bytes_per_row) else {
+            return &[];
         };
         let ptr = unsafe {
             sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
         };
+        // 非プラナーのピクセルバッファの場合、この関数は NULL を返す (Apple のドキュメント)。
+        // NULL を `from_raw_parts` に渡すと未定義動作になるため、空スライスを返す
         if ptr.is_null() {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
+    /// 指定プレーンのストライド（1 行あたりのバイト数）を返す
+    fn plane_stride(&self, plane_index: usize) -> usize {
+        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, plane_index) }
+    }
+
     /// フレームの Y 成分のデータを返す
-    pub fn y_plane(&self) -> &[u8] {
-        self.plane_slice(0, self.height(), self.y_stride())
-    }
-
-    /// フレームの U 成分のデータを返す
-    pub fn u_plane(&self) -> &[u8] {
-        self.plane_slice(1, self.height().div_ceil(2), self.u_stride())
-    }
-
-    /// フレームの V 成分のデータを返す
-    pub fn v_plane(&self) -> &[u8] {
-        self.plane_slice(2, self.height().div_ceil(2), self.v_stride())
-    }
-
-    /// フレームの Y 成分のストライドを返す
-    pub fn y_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 0) }
-    }
-
-    /// フレームの U 成分のストライドを返す
-    pub fn u_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 1) }
-    }
-
-    /// フレームの V 成分のストライドを返す
-    pub fn v_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 2) }
+    fn y_plane(&self) -> &[u8] {
+        self.plane_slice(0, self.height(), self.plane_stride(0))
     }
 
     /// フレームの幅を返す
-    pub fn width(&self) -> usize {
+    fn width(&self) -> usize {
         unsafe { sys::CVPixelBufferGetWidth(self.inner.0) }
     }
 
     /// フレームの高さを返す
-    pub fn height(&self) -> usize {
+    fn height(&self) -> usize {
         unsafe { sys::CVPixelBufferGetHeight(self.inner.0) }
     }
 }
 
-impl Drop for I420Frame {
+impl Drop for PixelBuffer {
     fn drop(&mut self) {
         unsafe {
             let flags_readonly = 1;
             sys::CVPixelBufferUnlockBaseAddress(self.inner.0, flags_readonly);
         }
+    }
+}
+
+/// I420 形式のデコード済みフレーム (3 プレーン: Y, U, V)
+///
+/// ## プレーン参照について
+///
+/// 各 `*_plane` は乗算オーバーフローしたり内部関数でのエラーが発生した時は
+/// 空のスライスを返す防御を入れている。
+/// そのため空スライスは「デコードが成功したがピクセルが無い」を意味しない。
+#[derive(Debug)]
+pub struct I420Frame {
+    /// ロック済みピクセルバッファ
+    buffer: PixelBuffer,
+}
+
+impl I420Frame {
+    /// フレームの Y 成分のデータを返す
+    pub fn y_plane(&self) -> &[u8] {
+        self.buffer.y_plane()
+    }
+
+    /// フレームの U 成分のデータを返す
+    pub fn u_plane(&self) -> &[u8] {
+        self.buffer
+            .plane_slice(1, self.height().div_ceil(2), self.u_stride())
+    }
+
+    /// フレームの V 成分のデータを返す
+    pub fn v_plane(&self) -> &[u8] {
+        self.buffer
+            .plane_slice(2, self.height().div_ceil(2), self.v_stride())
+    }
+
+    /// フレームの Y 成分のストライドを返す
+    pub fn y_stride(&self) -> usize {
+        self.buffer.plane_stride(0)
+    }
+
+    /// フレームの U 成分のストライドを返す
+    pub fn u_stride(&self) -> usize {
+        self.buffer.plane_stride(1)
+    }
+
+    /// フレームの V 成分のストライドを返す
+    pub fn v_stride(&self) -> usize {
+        self.buffer.plane_stride(2)
+    }
+
+    /// フレームの幅を返す
+    pub fn width(&self) -> usize {
+        self.buffer.width()
+    }
+
+    /// フレームの高さを返す
+    pub fn height(&self) -> usize {
+        self.buffer.height()
     }
 }
 
 /// NV12 形式のデコード済みフレーム (2 プレーン: Y, UV interleaved)
 ///
-/// ## プレーン参照
+/// ## プレーン参照について
 ///
-/// [`I420Frame`] と同様、異常時は各 `*_plane` が空スライスになることがある。
-///
-/// **空スライスは異常時のセンチネル**であり、空でないことを前提にピクセル処理して進めないこと。
+/// プレーンの参照に関する契約は [`I420Frame`] と同じ。
 #[derive(Debug)]
 pub struct Nv12Frame {
-    inner: CfPtrMut<sys::__CVBuffer>,
+    /// ロック済みピクセルバッファ
+    buffer: PixelBuffer,
 }
 
 impl Nv12Frame {
-    /// ロック済みプレーンを `&[u8]` として返す
-    ///
-    /// NULL または乗算オーバーフロー時は空スライス（[`Nv12Frame`] の説明を参照）。**型は `Result` ではなく**、空で異常を表す。
-    fn plane_slice(&self, plane_index: usize, row_count: usize, bytes_per_row: usize) -> &[u8] {
-        let len = match row_count.checked_mul(bytes_per_row) {
-            Some(n) if n > 0 => n,
-            _ => return &[],
-        };
-        let ptr = unsafe {
-            sys::CVPixelBufferGetBaseAddressOfPlane(self.inner.0, plane_index) as *const u8
-        };
-        if ptr.is_null() {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(ptr, len) }
-    }
-
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
-        self.plane_slice(0, self.height(), self.y_stride())
+        self.buffer.y_plane()
     }
 
     /// フレームの UV インターリーブデータを返す
     pub fn uv_plane(&self) -> &[u8] {
-        self.plane_slice(1, self.height().div_ceil(2), self.uv_stride())
+        self.buffer
+            .plane_slice(1, self.height().div_ceil(2), self.uv_stride())
     }
 
     /// フレームの Y 成分のストライドを返す
     pub fn y_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 0) }
+        self.buffer.plane_stride(0)
     }
 
     /// フレームの UV インターリーブのストライドを返す
     pub fn uv_stride(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetBytesPerRowOfPlane(self.inner.0, 1) }
+        self.buffer.plane_stride(1)
     }
 
     /// フレームの幅を返す
     pub fn width(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetWidth(self.inner.0) }
+        self.buffer.width()
     }
 
     /// フレームの高さを返す
     pub fn height(&self) -> usize {
-        unsafe { sys::CVPixelBufferGetHeight(self.inner.0) }
-    }
-}
-
-impl Drop for Nv12Frame {
-    fn drop(&mut self) {
-        unsafe {
-            let flags_readonly = 1;
-            sys::CVPixelBufferUnlockBaseAddress(self.inner.0, flags_readonly);
-        }
+        self.buffer.height()
     }
 }
