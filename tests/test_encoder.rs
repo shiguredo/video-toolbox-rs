@@ -350,6 +350,25 @@ fn encoder_rejects_zero_fps_numerator() {
     ));
 }
 
+/// fps_numerator と average_bitrate を同時に不正にした Encoder::new が
+/// fps_numerator のエラーを先に返すことを検証する
+///
+/// 構築 (Encoder::new) と再設定 (Encoder::reconfigure) で検証順序が揃っていることを
+/// 固定するテスト。既存のフィールド単位の拒否テストは各エラー種別しか見ていないため、
+/// 共通の検証関数の中で順序が逆転しても検出できない。
+#[test]
+fn encoder_rejects_prioritizing_fps_error_over_bitrate_error() {
+    let mut c = minimal_encoder_config();
+    // 両フィールドを不正値にして、どちらのエラーが優先されるかを判定する
+    c.fps_numerator = 0;
+    c.average_bitrate = Some(0);
+    assert!(matches!(
+        Encoder::new(c, noop_encode_handler()),
+        Err(Error::InvalidConfig { field, reason })
+            if field == "fps_numerator" && reason == "must not be zero"
+    ));
+}
+
 /// I420 の Y プレーン長が不足していると InsufficientFrameData で拒否され、
 /// コールバックが発火しないことを検証する
 #[test]
@@ -634,6 +653,25 @@ fn reconfigure_rejects_bitrate_above_i64_max() {
         }),
         Error::InvalidConfig { field, reason }
             if field == "average_bitrate" && reason == "must fit in i64 for CFNumber"
+    ));
+}
+
+/// expected_frame_rate と average_bitrate を同時に不正にした reconfigure が
+/// expected_frame_rate のエラーを先に返すことを検証する
+///
+/// 構築 (Encoder::new) と再設定 (Encoder::reconfigure) で検証順序が揃っていることを
+/// 固定するテスト。既存のフィールド単位の拒否テストは各エラー種別しか見ていないため、
+/// 共通の検証関数の中で順序が逆転しても検出できない。
+#[test]
+fn reconfigure_rejects_prioritizing_fps_error_over_bitrate_error() {
+    assert!(matches!(
+        reconfigure_err(ReconfigureParams {
+            // 両フィールドを不正値にして、どちらのエラーが優先されるかを判定する
+            average_bitrate: Some(0),
+            expected_frame_rate: Some(0),
+        }),
+        Error::InvalidConfig { field, reason }
+            if field == "expected_frame_rate" && reason == "must not be zero"
     ));
 }
 
