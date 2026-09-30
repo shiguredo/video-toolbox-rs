@@ -146,10 +146,26 @@ impl<H: EncodeHandler> Encoder<H> {
             // 生成したセッションをガードし、以降のプロパティ設定が失敗して早期リターンしても
             // `session_guard` の `Drop` で `CFRelease` する。エラーパスは実機で誘発困難なため
             // 単体テストの対象外とし、このガードによる構造的な解放とコードレビューで担保する。
+            //
             // `Encoder::drop` は `VTCompressionSessionInvalidate` + `CFRelease` を行うため
             // エラーパスの解放方法とは非対称だが、ここで解放するセッションは一度も
             // エンコードしていない未使用のセッションであり、invalidate なしの `CFRelease`
-            // のみで解放してよい。
+            // のみで解放してよい。これは推論ではなく Apple の一次資料に明記された仕様である。
+            // - Apple Developer Documentation "VTCompressionSessionInvalidate(_:)" の Note:
+            //   "A compression session is automatically invalidated when its retain count
+            //   reaches zero, but because sessions may be retained by multiple parties,
+            //   it's hard to predict when this will happen."
+            //   https://developer.apple.com/documentation/videotoolbox/vtcompressionsessioninvalidate(_:)
+            // - macOS SDK の VideoToolbox.framework/Headers/VTCompressionSession.h にある
+            //   同関数の @discussion にも同旨の記述がある
+            //
+            // 生成したセッションはこの関数の外に公開しておらず、参照を保持しているのは
+            // この関数だけである (retain count は 1)。`VTCompressionSessionCreate` の
+            // `compressionSessionOut` (`CM_RETURNS_RETAINED_PARAMETER` 指定) で得た参照を
+            // `CFRelease` すると retain count が 0 に到達し、上記の仕様により自動的に
+            // invalidate される。
+            // この保証は将来の OS / SDK の更新で変わりうるため、SDK を更新した際は
+            // ヘッダーの @discussion を再確認すること。
             let session_guard = CfPtrMut(session);
 
             // 共通のプロパティ設定

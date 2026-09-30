@@ -74,6 +74,11 @@
 
 ### misc
 
+- [UPDATE] 未使用の圧縮セッションを invalidate なしの `CFRelease` で解放してよい根拠をコメントに追記する
+  - Apple Developer Documentation の `VTCompressionSessionInvalidate(_:)` と macOS SDK の
+    `VTCompressionSession.h` に「retain count が 0 になった時点でセッションは自動的に
+    invalidate される」と明記されていることを、エラーパスの解放処理の根拠として引用する
+  - @melpon
 - [UPDATE] CI / Makefile / prek.toml のコマンドフラグを統一する
   - clippy を `cargo clippy --workspace --all-targets -- -D warnings` に統一し、テストコードの
     警告を全経路で検出できるようにする
