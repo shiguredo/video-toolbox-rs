@@ -116,10 +116,10 @@ pub struct EncoderConfig {
 
     /// kVTCompressionPropertyKey_DataRateLimits
     ///
-    /// `None` は未設定。`Some(空 Vec)` も未設定と同じ扱いで、[`crate::encoder::Encoder::new`] 時に `None` へ
-    /// 正規化される ([`crate::encoder::Encoder::config`] が返す表現を一意にするため)。
-    /// 詳細は [`DataRateLimit`] を参照。
-    pub data_rate_limits: Option<Vec<DataRateLimit>>,
+    /// 空 `Vec` は上限なし (未設定) を意味する。指定できるリミットは Video Toolbox の仕様上
+    /// 0〜2 個で、詳細は [`DataRateLimit`] を参照。
+    /// ([`crate::encoder::Encoder::reconfigure`] の rustdoc を参照)。
+    pub data_rate_limits: Vec<DataRateLimit>,
 }
 
 /// データレートのハードリミット 1 個分
@@ -163,10 +163,4 @@ pub struct ReconfigureParams {
     ///
     /// 詳細な正規化 / 再スケール挙動は [`crate::encoder::Encoder::reconfigure`] の rustdoc を参照。
     pub expected_frame_rate: Option<u32>,
-
-    /// kVTCompressionPropertyKey_DataRateLimits
-    ///
-    /// `None` は現在値を維持する。`Some(空 Vec)` は設定済みの上限を解除する。
-    /// 詳細は [`DataRateLimit`] を参照。
-    pub data_rate_limits: Option<Vec<DataRateLimit>>,
 }

@@ -283,9 +283,9 @@ impl<H: EncodeHandler> Encoder<H> {
                 ));
             }
 
-            // データレートのハードリミット (指定時のみ設定。空 Vec は `Encoder::new` で `None` に正規化済み)
-            if let Some(limits) = &config.data_rate_limits {
-                push_data_rate_limits_property(properties, cf_objects, limits)?;
+            // データレートのハードリミット
+            if !config.data_rate_limits.is_empty() {
+                push_data_rate_limits_property(properties, cf_objects, &config.data_rate_limits)?;
             }
         }
         Ok(())

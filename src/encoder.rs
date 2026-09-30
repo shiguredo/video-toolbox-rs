@@ -18,9 +18,7 @@ pub use handler::{EncodeHandler, FnEncodeHandler};
 use std::ffi::c_void;
 
 use crate::{
-    encoder::session::{
-        push_bitrate_property, push_data_rate_limits_property, push_expected_frame_rate_property,
-    },
+    encoder::session::{push_bitrate_property, push_expected_frame_rate_property},
     error::Error,
     sys,
     types::{CfPtr, cf_dictionary},
@@ -45,16 +43,8 @@ pub struct Encoder<H: EncodeHandler> {
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(mut config: EncoderConfig, handler: H) -> Result<Self, Error> {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        // `Some(空 Vec)` は未設定と同義なので `None` へ正規化し、`config()` が返す表現を一意にする
-        if config
-            .data_rate_limits
-            .as_deref()
-            .is_some_and(<[_]>::is_empty)
-        {
-            config.data_rate_limits = None;
-        }
         let handler = Box::new(handler);
         let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
@@ -72,9 +62,9 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
     ///
     /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは [`ReconfigureParams`] に
-    /// 対応するフィールドのみである。`average_bitrate` / `data_rate_limits` は同名の
-    /// フィールドが、`fps_numerator` / `fps_denominator` は `expected_frame_rate` の指定に
-    /// よって書き換わる。その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
+    /// 対応するフィールドのみである。`average_bitrate` は同名のフィールドが、
+    /// `fps_numerator` / `fps_denominator` は `expected_frame_rate` の指定によって
+    /// 書き換わる。その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -131,9 +121,6 @@ impl<H: EncodeHandler> Encoder<H> {
             if let Some(fps) = params.expected_frame_rate {
                 push_expected_frame_rate_property(&mut properties, &mut cf_objects, fps)?;
             }
-            if let Some(ref limits) = params.data_rate_limits {
-                push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
-            }
 
             // 更新対象が無ければ no-op (パラメータのフィールド列挙で判定するとフィールド追加時に漏れる)
             if properties.is_empty() {
@@ -153,14 +140,6 @@ impl<H: EncodeHandler> Encoder<H> {
             // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
             self.config.fps_numerator = fps;
             self.config.fps_denominator = 1;
-        }
-        if let Some(limits) = params.data_rate_limits {
-            // 解除 (空 Vec) は「未設定」へ正規化し、`config()` の表現を一意にする
-            self.config.data_rate_limits = if limits.is_empty() {
-                None
-            } else {
-                Some(limits)
-            };
         }
         if let Some(new_pts) = rescaled_next_input_pts {
             self.next_input_pts = new_pts;
@@ -301,7 +280,7 @@ mod tests {
             max_key_frame_interval: None,
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
-            data_rate_limits: None,
+            data_rate_limits: Vec::new(),
         }
     }
 
@@ -364,12 +343,12 @@ mod tests {
         config.real_time = true;
         config.prioritize_encoding_speed_over_quality = true;
         config.data_rate_limits = if set_at_construction {
-            Some(vec![DataRateLimit {
+            vec![DataRateLimit {
                 bytes: LIMIT_BYTES_PER_SEC,
                 window: Duration::from_secs(1),
-            }])
+            }]
         } else {
-            None
+            Vec::new()
         };
 
         let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));

@@ -43,7 +43,7 @@ fn minimal_encoder_config() -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: None,
+        data_rate_limits: Vec::new(),
     }
 }
 
@@ -81,7 +81,7 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: None,
+        data_rate_limits: Vec::new(),
     }
 }
 
@@ -483,7 +483,6 @@ fn reconfigure_updates_config_on_success() -> Result<(), Error> {
     encoder.reconfigure(ReconfigureParams {
         average_bitrate: Some(250_000),
         expected_frame_rate: Some(60),
-        ..Default::default()
     })?;
     assert_eq!(encoder.config().average_bitrate, Some(250_000));
     assert_eq!(encoder.config().fps_numerator, 60);
@@ -675,111 +674,80 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     Ok(())
 }
 
-/// data_rate_limits の設定 (1 リミット) と、空 Vec による解除 (None への正規化) を検証する
+/// Encoder::new の構築時に bytes 0 のデータレートリミットが
+/// InvalidConfig で拒否されることを検証する
 #[test]
-fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
-    let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())?;
-    let limits = vec![DataRateLimit {
-        bytes: 93_750,
+fn new_rejects_zero_bytes_data_rate_limit() {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: 0,
         window: Duration::from_secs(1),
     }];
-    encoder.reconfigure(ReconfigureParams {
-        data_rate_limits: Some(limits.clone()),
-        ..Default::default()
-    })?;
-    assert_eq!(encoder.config().data_rate_limits, Some(limits));
-
-    encoder.reconfigure(ReconfigureParams {
-        data_rate_limits: Some(Vec::new()),
-        ..Default::default()
-    })?;
-    assert!(encoder.config().data_rate_limits.is_none());
-    Ok(())
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に bytes 0 のデータレートリミットが拒否されること");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "bytes must not be zero"
+    ));
 }
 
-/// data_rate_limits が 3 個以上だと InvalidConfig で拒否されることを検証する
-/// (Video Toolbox の仕様上 0〜2 個のため)
+/// Encoder::new の構築時に 3 個以上のデータレートリミットが InvalidConfig で
+/// 拒否されることを検証する (Video Toolbox の仕様上 0〜2 個のため)
 #[test]
-fn reconfigure_rejects_more_than_two_data_rate_limits() {
+fn new_rejects_more_than_two_data_rate_limits() {
     let limit = DataRateLimit {
         bytes: 93_750,
         window: Duration::from_secs(1),
     };
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![limit; 3];
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に 3 個のデータレートリミットが拒否されること");
     assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![limit; 3]),
-            ..Default::default()
-        }),
+        err,
         Error::InvalidConfig { field, reason }
             if field == "data_rate_limits" && reason == "must contain at most two limits"
     ));
 }
 
-/// bytes 0 のリミットが InvalidConfig で拒否されることを検証する
+/// Encoder::new の構築時に bytes が i64::MAX を超えるデータレートリミットが
+/// InvalidConfig で拒否されることを検証する (CFNumber は SInt64 のため)
 #[test]
-fn reconfigure_rejects_zero_bytes_data_rate_limit() {
+fn new_rejects_data_rate_limit_bytes_above_i64_max() {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: i64::MAX as u64 + 1,
+        window: Duration::from_secs(1),
+    }];
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に i64 を超えるデータレートリミットが拒否されること");
     assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 0,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
-        Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "bytes must not be zero"
-    ));
-}
-
-/// bytes が i64::MAX を超えると InvalidConfig で拒否されることを検証する
-/// (CFNumber は SInt64 のため)
-#[test]
-fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
-    assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: i64::MAX as u64 + 1,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
+        err,
         Error::InvalidConfig { field, reason }
             if field == "data_rate_limits" && reason == "bytes must fit in i64 for CFNumber"
     ));
 }
 
-/// window 0 のリミットが InvalidConfig で拒否されることを検証する
-#[test]
-fn reconfigure_rejects_zero_window_data_rate_limit() {
-    assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 93_750,
-                window: Duration::ZERO,
-            }]),
-            ..Default::default()
-        }),
-        Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "window must not be zero"
-    ));
-}
-
-/// Encoder::new の構築時にも無効な data_rate_limits (bytes 0) が
+/// Encoder::new の構築時に window 0 のデータレートリミットが
 /// InvalidConfig で拒否されることを検証する
 #[test]
-fn new_rejects_invalid_data_rate_limits() {
+fn new_rejects_zero_window_data_rate_limit() {
     let mut config = minimal_encoder_config();
-    config.data_rate_limits = Some(vec![DataRateLimit {
-        bytes: 0,
-        window: Duration::from_secs(1),
-    }]);
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: 93_750,
+        window: Duration::ZERO,
+    }];
     let err = Encoder::new(config, noop_encode_handler())
         .map(|_| ())
-        .expect_err("構築時に無効なデータレートリミットが拒否されること");
+        .expect_err("構築時に window 0 のデータレートリミットが拒否されること");
     assert!(matches!(
         err,
         Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "bytes must not be zero"
+            if field == "data_rate_limits" && reason == "window must not be zero"
     ));
 }
 
@@ -798,13 +766,13 @@ fn new_rejects_zero_average_bitrate() {
     ));
 }
 
-/// 構築時に Some(空 Vec) を渡すと、config() では None に正規化されることを検証する
+/// 構築時に空 Vec を渡すと上限なしとして扱われ、config() でも空のまま返ることを検証する
 #[test]
-fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
+fn new_accepts_empty_data_rate_limits() -> Result<(), Error> {
     let mut config = minimal_encoder_config();
-    config.data_rate_limits = Some(Vec::new());
+    config.data_rate_limits = Vec::new();
     let encoder = Encoder::new(config, noop_encode_handler())?;
-    assert!(encoder.config().data_rate_limits.is_none());
+    assert!(encoder.config().data_rate_limits.is_empty());
     Ok(())
 }
 
@@ -821,10 +789,10 @@ fn encoder_config_returns_initial_value() -> Result<(), Error> {
     config.max_key_frame_interval = std::num::NonZeroU32::new(60);
     config.max_key_frame_interval_duration = Some(Duration::from_secs(2));
     config.max_frame_delay_count = std::num::NonZeroU32::new(2);
-    config.data_rate_limits = Some(vec![DataRateLimit {
+    config.data_rate_limits = vec![DataRateLimit {
         bytes: 93_750,
         window: Duration::from_secs(1),
-    }]);
+    }];
     let encoder = Encoder::new(config.clone(), noop_encode_handler())?;
     let got = encoder.config();
     assert_eq!(got.width, config.width);
@@ -909,10 +877,10 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     config.fps_denominator = 1;
     config.real_time = true;
     config.prioritize_encoding_speed_over_quality = true;
-    config.data_rate_limits = Some(vec![DataRateLimit {
+    config.data_rate_limits = vec![DataRateLimit {
         bytes: LIMIT_BYTES_PER_SEC,
         window: Duration::from_secs(1),
-    }]);
+    }];
 
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
     let mut encoder = Encoder::new(
