@@ -3,7 +3,7 @@
 - Priority: Medium
 - Created: 2026-07-16
 - Updated: 2026-07-21
-- Completed:
+- Completed: 2026-09-30
 - Model: Fable 5
 - Branch: feature/fix-reconfigure-rate-properties
 - Polished: 2026-07-31
@@ -77,3 +77,39 @@
 - 「契約を実態に合わせる」を採った場合: `ReconfigureParams` の rustdoc / CHANGES.md / README の契約を実態に合わせて修正している（エンコード開始前のみ有効であることを明記）
 - `CHANGES.md` にエントリを追記する
 - `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通る
+
+## 解決方法
+
+「契約を実態に合わせる」を採用し、対象を `data_rate_limits` に限定した。
+
+### 原因の特定（実測）
+
+- Video Toolbox はエンコード開始（最初のフレーム投入）後の `kVTCompressionPropertyKey_DataRateLimits` の変更を無視する。`VTSessionSetProperty` は `noErr` を返すが出力レートは変化しない
+- `VTCompressionSessionCompleteFrames`（`Encoder::finish`）で保留フレームをフラッシュしてから設定しても反映されない
+- 一方 `average_bitrate` と `expected_frame_rate` のエンコード中の変更は反映される。つまり黙殺されるのは `data_rate_limits` だけである
+- いずれも `VTCompressionProperties.h` にタイミングの記述は無く、macOS 26.5 / Apple M1 での実測（将来の macOS で変わり得る）
+- 実測値（960x480 / 30 fps / H.264、30 フレーム = 1 秒ウィンドウの出力バイト数）:
+  - 構築時に 750 kbps の上限を設定: `[130033, 65728, 66698, 66009]`（上限の 0.70 倍に抑制）
+  - エンコード開始後に同じ上限を設定: `[400105, 260416, 260873, 260787]`（上限なしと同一）
+  - `average_bitrate` を 200 kbps → 8 Mbps → 200 kbps: `[24992, 1020557, 967067, 41578]`
+  - `expected_frame_rate` を 30 fps → 60 fps（8 Mbps 固定）: `[1023834, 704966, 514908, 506936]`
+
+### 変更内容
+
+- `ReconfigureParams` から `data_rate_limits` を削除し、動的に更新できる項目を `average_bitrate` / `expected_frame_rate` の 2 項目にした（`validate_reconfigure_params` の該当検証も削除）
+- `data_rate_limits` は `EncoderConfig`（セッション作成時）専用とし、変更・解除は `Encoder` の作り直しで行う契約に変更した
+- `data_rate_limits` の型を `Option<Vec<DataRateLimit>>` から `Vec<DataRateLimit>` に変更した（空 `Vec` が上限なしを意味するため `Option` は情報を増やさない。`Encoder::new` の `None` への正規化も削除し、検証とセッション構築の分岐が 1 段簡素になった）
+- `Encoder::reconfigure` / `Encoder::config` / `ReconfigureParams` / `EncoderConfig::data_rate_limits` / `DataRateLimit` の rustdoc と README を実測に合わせて修正した（`VTCompressionProperties.h` に明記が無いこと、将来の macOS で変わり得ることも記載）
+- `CHANGES.md` の `## develop` の `[ADD]` / `[CHANGE]` エントリを実態に合わせて修正し、`### misc` にテスト追加のエントリを追記した
+- `data_rate_limits` の検証テストは `Encoder::new` 経路に集約した（`new_rejects_zero_bytes_data_rate_limit` / `new_rejects_more_than_two_data_rate_limits` / `new_rejects_data_rate_limit_bytes_above_i64_max` / `new_rejects_zero_window_data_rate_limit`）
+- `pbt/tests/prop_encoder.rs` の不正な `ReconfigureParams` から `data_rate_limits` のケースを削除した（`data_rate_limits` の拒否は構築時設定のケースで引き続き検証している）
+
+### 追加したテスト
+
+- `tests/test_encoder.rs` の `reconfigure_average_bitrate_changes_mid_stream_output_rate` / `reconfigure_expected_frame_rate_changes_mid_stream_output_rate`: 動的更新が出力レートに反映されることを検出する。反映されなくなると失敗する
+- `src/encoder.rs` の `data_rate_limits_mid_stream_change_has_no_effect`: エンコード開始後の上限変更が反映されないことを FFI を直接呼んで検出する。構築時に設定した上限が効くことを陽性対照として同時に確認しており、反映されるようになると失敗する
+
+### 検証
+
+- `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` がすべて成功することを確認した
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` も成功することを確認した

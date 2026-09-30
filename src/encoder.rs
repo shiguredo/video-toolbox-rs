@@ -18,9 +18,7 @@ pub use handler::{EncodeHandler, FnEncodeHandler};
 use std::ffi::c_void;
 
 use crate::{
-    encoder::session::{
-        push_bitrate_property, push_data_rate_limits_property, push_expected_frame_rate_property,
-    },
+    encoder::session::{push_bitrate_property, push_expected_frame_rate_property},
     error::Error,
     sys,
     types::{CfPtr, cf_dictionary},
@@ -45,16 +43,8 @@ pub struct Encoder<H: EncodeHandler> {
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
-    pub fn new(mut config: EncoderConfig, handler: H) -> Result<Self, Error> {
+    pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        // `Some(空 Vec)` は未設定と同義なので `None` へ正規化し、`config()` が返す表現を一意にする
-        if config
-            .data_rate_limits
-            .as_deref()
-            .is_some_and(<[_]>::is_empty)
-        {
-            config.data_rate_limits = None;
-        }
         let handler = Box::new(handler);
         let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
 
@@ -72,9 +62,9 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 反映された値である。Video Toolbox がバックエンドで丸めた実効値とは異なる場合がある。
     ///
     /// [`Encoder::reconfigure`] 経由で動的に更新され得るのは [`ReconfigureParams`] に
-    /// 対応するフィールドのみである。`average_bitrate` / `data_rate_limits` は同名の
-    /// フィールドが、`fps_numerator` / `fps_denominator` は `expected_frame_rate` の指定に
-    /// よって書き換わる。その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
+    /// 対応するフィールドのみである。`average_bitrate` は同名のフィールドが、
+    /// `fps_numerator` / `fps_denominator` は `expected_frame_rate` の指定によって
+    /// 書き換わる。その他のフィールドは [`Encoder::new`] で渡した初期値のまま保持される。
     pub fn config(&self) -> &EncoderConfig {
         &self.config
     }
@@ -131,9 +121,6 @@ impl<H: EncodeHandler> Encoder<H> {
             if let Some(fps) = params.expected_frame_rate {
                 push_expected_frame_rate_property(&mut properties, &mut cf_objects, fps)?;
             }
-            if let Some(ref limits) = params.data_rate_limits {
-                push_data_rate_limits_property(&mut properties, &mut cf_objects, limits)?;
-            }
 
             // 更新対象が無ければ no-op (パラメータのフィールド列挙で判定するとフィールド追加時に漏れる)
             if properties.is_empty() {
@@ -153,14 +140,6 @@ impl<H: EncodeHandler> Encoder<H> {
             // ExpectedFrameRate は単一整数のため分母を 1 に正規化する。
             self.config.fps_numerator = fps;
             self.config.fps_denominator = 1;
-        }
-        if let Some(limits) = params.data_rate_limits {
-            // 解除 (空 Vec) は「未設定」へ正規化し、`config()` の表現を一意にする
-            self.config.data_rate_limits = if limits.is_empty() {
-                None
-            } else {
-                Some(limits)
-            };
         }
         if let Some(new_pts) = rescaled_next_input_pts {
             self.next_input_pts = new_pts;
@@ -198,17 +177,30 @@ unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 #[cfg(test)]
 mod tests {
     //! `Encoder::reconfigure` / `Encoder::encode` / `Encoder::encode_pixel_buffer` の内部状態
-    //! (`next_input_pts`) を直接確認するためのテスト。
-    //! `tests/test_encoder.rs` からは到達できない private フィールドへの書き込みが必要な
-    //! テストだけをここに置く。通常系の検証は `tests/test_encoder.rs` 側にある。
+    //! (`next_input_pts`) と、Video Toolbox のプロパティ反映挙動を直接確認するためのテスト。
+    //! `tests/test_encoder.rs` からは到達できない private フィールドや FFI の直接呼び出しが
+    //! 必要なテストだけをここに置く。通常系の検証は `tests/test_encoder.rs` 側にある。
 
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::{PixelFormat, sys, types::CfPtrMut};
+    use crate::{
+        PixelFormat, sys,
+        types::{CfPtrMut, cf_array, cf_number_f64, cf_number_i64},
+    };
+
+    /// データレート上限の検証に使う上限値 (750 kbps = 1 秒あたり 93,750 バイト)
+    const LIMIT_BYTES_PER_SEC: u64 = 93_750;
+
+    /// 出力バイト数を集計するウィンドウのフレーム数 (30 fps のとき 1 秒ぶん)
+    const TEST_WINDOW_FRAMES: usize = 30;
+
+    /// エンコードコールバックで受け取った結果を蓄積する共有バッファ
+    type SharedEncodeResults<T> = Arc<Mutex<Vec<Result<EncodedFrame<T>, Error>>>>;
 
     /// エンコードコールバックが `expected` 件届くまでポーリングで待つ
     fn wait_for_encode_callbacks(count: &AtomicUsize, expected: usize) {
@@ -288,7 +280,7 @@ mod tests {
             max_key_frame_interval: None,
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
-            data_rate_limits: None,
+            data_rate_limits: Vec::new(),
         }
     }
 
@@ -304,6 +296,141 @@ mod tests {
 
     fn noop_handler() -> FnEncodeHandler<()> {
         FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
+    }
+
+    /// データレート上限の効果を観測するための合成フレーム (グラデーション + 下部 1/4 ノイズ) を生成する
+    ///
+    /// ノイズ帯がビット消費を押し上げるため、上限を設定すると出力バイト数が明確に抑えられる。
+    /// 全面ノイズでは最低品質でも上限を下回れず、上限の効果を観測できない。
+    fn noisy_i420_frame(
+        w: usize,
+        h: usize,
+        frame_index: usize,
+        seed: &mut u64,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut y_plane = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                y_plane[row * w + col] = ((col * 255 / w + frame_index * 3) % 256) as u8;
+            }
+        }
+        for b in y_plane[w * h * 3 / 4..].iter_mut() {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (*seed >> 33) as u8;
+        }
+        let uv_size = w.div_ceil(2) * h.div_ceil(2);
+        (y_plane, vec![128u8; uv_size], vec![128u8; uv_size])
+    }
+
+    /// `data_rate_limits` の効果を観測するシナリオを実行し、
+    /// [`TEST_WINDOW_FRAMES`] フレームごとの出力バイト数を返す
+    ///
+    /// `set_at_construction` が true の場合は構築時に上限を設定する。false の場合は
+    /// 30 フレームエンコードした後に `VTSessionSetProperty` で直接設定する。エンコード中の
+    /// 上限変更は本クレートの公開 API では提供していない (Video Toolbox が受け付けない) ため、
+    /// Video Toolbox の挙動そのものを確認する目的で FFI を直接呼ぶ。
+    fn data_rate_limit_windowed_output(set_at_construction: bool) -> Result<Vec<u64>, Error> {
+        const W: usize = 960;
+        const H: usize = 480;
+        const FRAMES: usize = 120;
+
+        let mut config = base_encoder_config();
+        config.average_bitrate = Some(2_000_000);
+        config.fps_numerator = TEST_WINDOW_FRAMES as u32;
+        config.fps_denominator = 1;
+        config.real_time = true;
+        config.prioritize_encoding_speed_over_quality = true;
+        config.data_rate_limits = if set_at_construction {
+            vec![DataRateLimit {
+                bytes: LIMIT_BYTES_PER_SEC,
+                window: Duration::from_secs(1),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+        let mut encoder = Encoder::new(
+            config,
+            FnEncodeHandler::new({
+                let results = Arc::clone(&results);
+                move |result: Result<EncodedFrame<u64>, Error>| {
+                    results
+                        .lock()
+                        .expect("結果バッファの mutex が poison になっている")
+                        .push(result);
+                }
+            }),
+        )?;
+
+        let mut seed = 0x5eed_5eed_5eed_5eedu64;
+        for i in 0..FRAMES {
+            if i == TEST_WINDOW_FRAMES && !set_at_construction {
+                // エンコード開始後 (30 フレーム投入後) に DataRateLimits を直接設定する。
+                // kVTCompressionPropertyKey_DataRateLimits は「bytes, seconds」を交互に並べた
+                // 偶数個の CFNumber の CFArray を取る (VTCompressionProperties.h)。
+                let bytes = cf_number_i64(LIMIT_BYTES_PER_SEC as i64)?;
+                let seconds = cf_number_f64(1.0)?;
+                let array = cf_array(&[bytes.0, seconds.0])?;
+                let status = unsafe {
+                    sys::VTSessionSetProperty(
+                        encoder.session.cast(),
+                        sys::kVTCompressionPropertyKey_DataRateLimits,
+                        array.0.cast(),
+                    )
+                };
+                Error::check(status, "VTSessionSetProperty")?;
+            }
+            let (y, u, v) = noisy_i420_frame(W, H, i, &mut seed);
+            encoder.encode(
+                &FrameData::I420 {
+                    y: &y,
+                    u: &u,
+                    v: &v,
+                },
+                &EncodeOptions::default(),
+                i as u64,
+            )?;
+        }
+        encoder.finish()?;
+
+        // 全フレームぶんのエンコード結果が届くまで待つ
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let count = results
+                .lock()
+                .expect("結果バッファの mutex が poison になっている")
+                .len();
+            if count >= FRAMES {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "エンコード結果が {FRAMES} 件届くのを待ってタイムアウトした (現在 {count} 件)"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut sizes = Vec::new();
+        {
+            let mut guard = results
+                .lock()
+                .expect("結果バッファの mutex が poison になっている");
+            for result in guard.drain(..) {
+                match result {
+                    Ok(frame) => sizes.push(frame.data.len() as u64),
+                    Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+                }
+            }
+        }
+        let windows: Vec<u64> = sizes
+            .chunks(TEST_WINDOW_FRAMES)
+            .map(|chunk| chunk.iter().sum())
+            .collect();
+        eprintln!("データレート上限のシナリオ (構築時設定={set_at_construction}): {windows:?}");
+        Ok(windows)
     }
 
     #[test]
@@ -471,6 +598,36 @@ mod tests {
             baseline,
         );
 
+        Ok(())
+    }
+
+    /// エンコード開始後に `kVTCompressionPropertyKey_DataRateLimits` を変更しても
+    /// 出力レートが変わらないことを検証する
+    ///
+    /// Video Toolbox はエンコード開始後の `DataRateLimits` の変更を無視するため、本クレートは
+    /// `data_rate_limits` を構築時 (`EncoderConfig`) 専用にしている。本テストはその前提が
+    /// 崩れたことを検出するためのもので、失敗した場合はエンコード中の変更が反映されるように
+    /// なったことを意味する (その場合は `data_rate_limits` の扱いを見直すこと)。
+    /// 陽性対照として、構築時に設定した上限が効くことも同じ条件で確認する。
+    #[test]
+    fn data_rate_limits_mid_stream_change_has_no_effect() -> Result<(), Error> {
+        // 陽性対照: 構築時に設定した上限はウィンドウ合計を上限近傍まで抑える
+        let capped = data_rate_limit_windowed_output(true)?;
+        for (i, bytes) in capped.iter().enumerate().skip(1) {
+            assert!(
+                *bytes <= LIMIT_BYTES_PER_SEC * 150 / 100,
+                "構築時に設定した上限が効いていない (ウィンドウ {i}): {bytes} バイト"
+            );
+        }
+
+        // 検証対象: エンコード開始後に設定した上限は反映されない (上限なしと同じ出力になる)
+        let mid_stream = data_rate_limit_windowed_output(false)?;
+        for (i, bytes) in mid_stream.iter().enumerate().skip(1) {
+            assert!(
+                *bytes > LIMIT_BYTES_PER_SEC * 150 / 100,
+                "エンコード開始後に設定した上限が効くようになった (ウィンドウ {i}): {bytes} バイト"
+            );
+        }
         Ok(())
     }
 }

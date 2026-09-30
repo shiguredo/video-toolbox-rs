@@ -107,9 +107,7 @@ impl<H: EncodeHandler> Encoder<H> {
         if let Some(bitrate) = config.average_bitrate {
             validate_average_bitrate(bitrate)?;
         }
-        if let Some(limits) = &config.data_rate_limits {
-            validate_data_rate_limits(limits)?;
-        }
+        validate_data_rate_limits(&config.data_rate_limits)?;
         // NonZeroU32 から i32 へのキャストで負値に切り詰まるのを防ぐ
         if let Some(interval) = config.max_key_frame_interval
             && interval.get() > i32::MAX as u32
@@ -141,9 +139,6 @@ impl<H: EncodeHandler> Encoder<H> {
                 "must fit in i32 for CFNumber",
                 fps,
             )?;
-        }
-        if let Some(ref limits) = params.data_rate_limits {
-            validate_data_rate_limits(limits)?;
         }
         Ok(())
     }

@@ -18,10 +18,12 @@
   - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える
   - @voluntas
 - [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型と
-  `ReconfigureParams::data_rate_limits` を追加する
+  `EncoderConfig::data_rate_limits` を追加する
   - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
     ウィンドウあたりの総バイト数のハード上限を併設できるようにする
   - 指定できるリミットは Video Toolbox の仕様上 0〜2 個
+  - Video Toolbox はエンコード開始後のこのプロパティの変更を無視するため、
+    上限はセッション作成時にのみ設定できる (`Encoder` を作り直せば変更・解除できる)
   - @voluntas
 - [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
   - @voluntas
@@ -30,14 +32,14 @@
 - [CHANGE] `Encoder::reconfigure` を `ReconfigureParams` ベースの動的更新専用 API に変更する
   - 旧 API は `EncoderConfig` を所有権で受け取りセッションを再作成していたが、
     `VTSessionSetProperties` 1 回で完結する動的更新型に置き換える
-  - 動的に変更可能な項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の
-    3 項目で、解像度・コーデック・ピクセルフォーマットの変更は `Encoder` を作り直す運用に統一する
+  - 動的に変更可能な項目は `average_bitrate` / `expected_frame_rate` の
+    2 項目で、解像度・コーデック・ピクセルフォーマットの変更は `Encoder` を作り直す運用に統一する
   - `expected_frame_rate` 更新時は内部 PTS を切り上げで再スケールし、
     オーバーフロー時には `Error::LimitExceeded` を返す
   - @voluntas
 - [CHANGE] `EncoderConfig` に `data_rate_limits` フィールドを追加する
   - `#[non_exhaustive]` を付けていない公開構造体へのフィールド追加のため、
-    構造体リテラルで構築しているコードは `data_rate_limits: None` の追記が必要になる
+    構造体リテラルで構築しているコードは `data_rate_limits: Vec::new()` の追記が必要になる
   - @voluntas
 - [CHANGE] `Encoder::new` が `average_bitrate` に 0 を指定された場合に `Error::InvalidConfig` を返すようにする
   - 従来は 0 がそのまま Video Toolbox に渡っていたが、`Encoder::reconfigure` と検証を共通化して
@@ -111,7 +113,6 @@
   - @voluntas
 - [UPDATE] `Encoder::config` getter の単体テストを追加する
   - `Encoder::new` 直後の `config()` が入力した全フィールドを変更なしで返すことを検証する
-    (`Some(空 Vec)` の `data_rate_limits` が `None` に正規化されるケースを除く)
   - @voluntas
 - [UPDATE] `average_bitrate` / `expected_frame_rate` の CFNumber 構築と push をヘルパー関数に共通化する
   - `push_bitrate_property` / `push_expected_frame_rate_property` を追加し、
@@ -140,6 +141,12 @@
     status エラー時の `user_data` の Box 回収・`next_input_pts` の更新を 1 箇所にまとめる
   - 両メソッドはピクセルバッファの取得と入力検証だけを担当する
   - 公開 API の変更はない
+  - @melpon
+- [UPDATE] エンコード中の `reconfigure` による更新が出力レートに反映されることを検証するテストを追加する
+  - `average_bitrate` の変更 (200 kbps ↔ 8 Mbps) と `expected_frame_rate` の変更 (30 fps → 60 fps) が
+    出力バイト数に現れることを確認する
+  - エンコード開始後の `data_rate_limits` 変更が反映されないことを FFI を直接呼んで検出する
+    (構築時に設定した上限が効くことを陽性対照として同時に確認する)
   - @melpon
 
 ## 2026.1.1

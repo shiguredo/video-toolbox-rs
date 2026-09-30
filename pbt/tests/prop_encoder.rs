@@ -70,7 +70,7 @@ fn valid_config_strategy() -> impl Strategy<Value = EncoderConfig> {
                 max_key_frame_interval,
                 max_key_frame_interval_duration: None,
                 max_frame_delay_count,
-                data_rate_limits: None,
+                data_rate_limits: Vec::new(),
             },
         )
 }
@@ -126,34 +126,34 @@ fn invalid_config_strategy() -> impl Strategy<Value = EncoderConfig> {
         }),
         // data_rate_limits の個数超過と内部検証の各拒否
         valid_config_strategy().prop_map(|mut c| {
-            c.data_rate_limits = Some(vec![
+            c.data_rate_limits = vec![
                 DataRateLimit {
                     bytes: 1,
                     window: Duration::from_secs(1),
                 };
                 3
-            ]);
+            ];
             c
         }),
         valid_config_strategy().prop_map(|mut c| {
-            c.data_rate_limits = Some(vec![DataRateLimit {
+            c.data_rate_limits = vec![DataRateLimit {
                 bytes: 0,
                 window: Duration::from_secs(1),
-            }]);
+            }];
             c
         }),
         valid_config_strategy().prop_map(|mut c| {
-            c.data_rate_limits = Some(vec![DataRateLimit {
+            c.data_rate_limits = vec![DataRateLimit {
                 bytes: i64::MAX as u64 + 1,
                 window: Duration::from_secs(1),
-            }]);
+            }];
             c
         }),
         valid_config_strategy().prop_map(|mut c| {
-            c.data_rate_limits = Some(vec![DataRateLimit {
+            c.data_rate_limits = vec![DataRateLimit {
                 bytes: 1,
                 window: Duration::ZERO,
-            }]);
+            }];
             c
         }),
         // max_key_frame_interval / max_frame_delay_count の i32::MAX 超え
@@ -207,16 +207,16 @@ fn valid_encoder() -> Encoder<FnEncodeHandler<()>> {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: None,
+        data_rate_limits: Vec::new(),
     };
     Encoder::new(config, noop_encode_handler()).expect("valid config must be accepted")
 }
 
 /// `Encoder::reconfigure` が拒否する不正な ReconfigureParams を生成する
 ///
-/// `validate_reconfigure_params` の全拒否パス (8 個) を 1 ケースずつ列挙する。proptest の
+/// `validate_reconfigure_params` の全拒否パス (4 個) を 1 ケースずつ列挙する。proptest の
 /// ランダムサンプリングにより全ケースの実行は保証されないが、欠落確率は無視できる程度
-/// ((7/8)^256 相当) である。
+/// ((3/4)^256 相当) である。
 fn invalid_params_strategy() -> impl Strategy<Value = ReconfigureParams> {
     prop_oneof![
         // average_bitrate のゼロと i64::MAX 超え
@@ -235,38 +235,6 @@ fn invalid_params_strategy() -> impl Strategy<Value = ReconfigureParams> {
         }),
         Just(ReconfigureParams {
             expected_frame_rate: Some(i32::MAX as u32 + 1),
-            ..Default::default()
-        }),
-        // data_rate_limits の個数超過と内部検証の各拒否
-        Just(ReconfigureParams {
-            data_rate_limits: Some(vec![
-                DataRateLimit {
-                    bytes: 1,
-                    window: Duration::from_secs(1),
-                };
-                3
-            ]),
-            ..Default::default()
-        }),
-        Just(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 0,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
-        Just(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: i64::MAX as u64 + 1,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
-        Just(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 1,
-                window: Duration::ZERO,
-            }]),
             ..Default::default()
         }),
     ]

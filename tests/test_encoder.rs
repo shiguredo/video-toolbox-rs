@@ -43,7 +43,7 @@ fn minimal_encoder_config() -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: None,
+        data_rate_limits: Vec::new(),
     }
 }
 
@@ -81,7 +81,7 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
-        data_rate_limits: None,
+        data_rate_limits: Vec::new(),
     }
 }
 
@@ -483,7 +483,6 @@ fn reconfigure_updates_config_on_success() -> Result<(), Error> {
     encoder.reconfigure(ReconfigureParams {
         average_bitrate: Some(250_000),
         expected_frame_rate: Some(60),
-        ..Default::default()
     })?;
     assert_eq!(encoder.config().average_bitrate, Some(250_000));
     assert_eq!(encoder.config().fps_numerator, 60);
@@ -675,111 +674,80 @@ fn encode_rejects_insufficient_nv12_uv_plane() -> Result<(), Error> {
     Ok(())
 }
 
-/// data_rate_limits の設定 (1 リミット) と、空 Vec による解除 (None への正規化) を検証する
+/// Encoder::new の構築時に bytes 0 のデータレートリミットが
+/// InvalidConfig で拒否されることを検証する
 #[test]
-fn reconfigure_updates_data_rate_limits() -> Result<(), Error> {
-    let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())?;
-    let limits = vec![DataRateLimit {
-        bytes: 93_750,
+fn new_rejects_zero_bytes_data_rate_limit() {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: 0,
         window: Duration::from_secs(1),
     }];
-    encoder.reconfigure(ReconfigureParams {
-        data_rate_limits: Some(limits.clone()),
-        ..Default::default()
-    })?;
-    assert_eq!(encoder.config().data_rate_limits, Some(limits));
-
-    encoder.reconfigure(ReconfigureParams {
-        data_rate_limits: Some(Vec::new()),
-        ..Default::default()
-    })?;
-    assert!(encoder.config().data_rate_limits.is_none());
-    Ok(())
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に bytes 0 のデータレートリミットが拒否されること");
+    assert!(matches!(
+        err,
+        Error::InvalidConfig { field, reason }
+            if field == "data_rate_limits" && reason == "bytes must not be zero"
+    ));
 }
 
-/// data_rate_limits が 3 個以上だと InvalidConfig で拒否されることを検証する
-/// (Video Toolbox の仕様上 0〜2 個のため)
+/// Encoder::new の構築時に 3 個以上のデータレートリミットが InvalidConfig で
+/// 拒否されることを検証する (Video Toolbox の仕様上 0〜2 個のため)
 #[test]
-fn reconfigure_rejects_more_than_two_data_rate_limits() {
+fn new_rejects_more_than_two_data_rate_limits() {
     let limit = DataRateLimit {
         bytes: 93_750,
         window: Duration::from_secs(1),
     };
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![limit; 3];
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に 3 個のデータレートリミットが拒否されること");
     assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![limit; 3]),
-            ..Default::default()
-        }),
+        err,
         Error::InvalidConfig { field, reason }
             if field == "data_rate_limits" && reason == "must contain at most two limits"
     ));
 }
 
-/// bytes 0 のリミットが InvalidConfig で拒否されることを検証する
+/// Encoder::new の構築時に bytes が i64::MAX を超えるデータレートリミットが
+/// InvalidConfig で拒否されることを検証する (CFNumber は SInt64 のため)
 #[test]
-fn reconfigure_rejects_zero_bytes_data_rate_limit() {
+fn new_rejects_data_rate_limit_bytes_above_i64_max() {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: i64::MAX as u64 + 1,
+        window: Duration::from_secs(1),
+    }];
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("構築時に i64 を超えるデータレートリミットが拒否されること");
     assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 0,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
-        Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "bytes must not be zero"
-    ));
-}
-
-/// bytes が i64::MAX を超えると InvalidConfig で拒否されることを検証する
-/// (CFNumber は SInt64 のため)
-#[test]
-fn reconfigure_rejects_data_rate_limit_bytes_above_i64_max() {
-    assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: i64::MAX as u64 + 1,
-                window: Duration::from_secs(1),
-            }]),
-            ..Default::default()
-        }),
+        err,
         Error::InvalidConfig { field, reason }
             if field == "data_rate_limits" && reason == "bytes must fit in i64 for CFNumber"
     ));
 }
 
-/// window 0 のリミットが InvalidConfig で拒否されることを検証する
-#[test]
-fn reconfigure_rejects_zero_window_data_rate_limit() {
-    assert!(matches!(
-        reconfigure_err(ReconfigureParams {
-            data_rate_limits: Some(vec![DataRateLimit {
-                bytes: 93_750,
-                window: Duration::ZERO,
-            }]),
-            ..Default::default()
-        }),
-        Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "window must not be zero"
-    ));
-}
-
-/// Encoder::new の構築時にも無効な data_rate_limits (bytes 0) が
+/// Encoder::new の構築時に window 0 のデータレートリミットが
 /// InvalidConfig で拒否されることを検証する
 #[test]
-fn new_rejects_invalid_data_rate_limits() {
+fn new_rejects_zero_window_data_rate_limit() {
     let mut config = minimal_encoder_config();
-    config.data_rate_limits = Some(vec![DataRateLimit {
-        bytes: 0,
-        window: Duration::from_secs(1),
-    }]);
+    config.data_rate_limits = vec![DataRateLimit {
+        bytes: 93_750,
+        window: Duration::ZERO,
+    }];
     let err = Encoder::new(config, noop_encode_handler())
         .map(|_| ())
-        .expect_err("構築時に無効なデータレートリミットが拒否されること");
+        .expect_err("構築時に window 0 のデータレートリミットが拒否されること");
     assert!(matches!(
         err,
         Error::InvalidConfig { field, reason }
-            if field == "data_rate_limits" && reason == "bytes must not be zero"
+            if field == "data_rate_limits" && reason == "window must not be zero"
     ));
 }
 
@@ -798,13 +766,13 @@ fn new_rejects_zero_average_bitrate() {
     ));
 }
 
-/// 構築時に Some(空 Vec) を渡すと、config() では None に正規化されることを検証する
+/// 構築時に空 Vec を渡すと上限なしとして扱われ、config() でも空のまま返ることを検証する
 #[test]
-fn new_normalizes_empty_data_rate_limits_to_none() -> Result<(), Error> {
+fn new_accepts_empty_data_rate_limits() -> Result<(), Error> {
     let mut config = minimal_encoder_config();
-    config.data_rate_limits = Some(Vec::new());
+    config.data_rate_limits = Vec::new();
     let encoder = Encoder::new(config, noop_encode_handler())?;
-    assert!(encoder.config().data_rate_limits.is_none());
+    assert!(encoder.config().data_rate_limits.is_empty());
     Ok(())
 }
 
@@ -821,10 +789,10 @@ fn encoder_config_returns_initial_value() -> Result<(), Error> {
     config.max_key_frame_interval = std::num::NonZeroU32::new(60);
     config.max_key_frame_interval_duration = Some(Duration::from_secs(2));
     config.max_frame_delay_count = std::num::NonZeroU32::new(2);
-    config.data_rate_limits = Some(vec![DataRateLimit {
+    config.data_rate_limits = vec![DataRateLimit {
         bytes: 93_750,
         window: Duration::from_secs(1),
-    }]);
+    }];
     let encoder = Encoder::new(config.clone(), noop_encode_handler())?;
     let got = encoder.config();
     assert_eq!(got.width, config.width);
@@ -909,10 +877,10 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     config.fps_denominator = 1;
     config.real_time = true;
     config.prioritize_encoding_speed_over_quality = true;
-    config.data_rate_limits = Some(vec![DataRateLimit {
+    config.data_rate_limits = vec![DataRateLimit {
         bytes: LIMIT_BYTES_PER_SEC,
         window: Duration::from_secs(1),
-    }]);
+    }];
 
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
     let mut encoder = Encoder::new(
@@ -984,6 +952,206 @@ fn data_rate_limits_cap_windowed_output_h264() -> Result<(), Error> {
 #[test]
 fn data_rate_limits_cap_windowed_output_h265() -> Result<(), Error> {
     data_rate_limits_cap_windowed_output(true)
+}
+
+/// 動的更新の検証に使う低ビットレート (200 kbps)
+const LOW_BITRATE: u64 = 200_000;
+
+/// 動的更新の検証に使う高ビットレート (8 Mbps)
+const HIGH_BITRATE: u64 = 8_000_000;
+
+/// 出力バイト数を集計するウィンドウのフレーム数 (30 fps のとき 1 秒ぶん)
+const WINDOW_FRAMES: usize = 30;
+
+/// ビットレート目標に追従して出力サイズが変わる合成フレームを生成する
+///
+/// 全面グラデーション + 下部 1/4 の低振幅ノイズで構成する。低振幅ノイズは量子化で
+/// 落とせるため、目標ビットレートを下げると詳細を捨てて出力が小さくなり、上げると
+/// 詳細を残して出力が大きくなる (実測で 200 kbps と 8 Mbps の間に約 40 倍の差が出る)。
+/// `synthetic_i420_frame` の高振幅ノイズは最低品質でも目標に収まらず、ビットレート変更の
+/// 反映を出力サイズから検出できないため、動的更新の検証にはこちらを使う。
+fn bitrate_sensitive_i420_frame(frame_index: usize, seed: &mut u64) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w = WIDTH as usize;
+    let h = HEIGHT as usize;
+    let mut y_plane = vec![0u8; SIZE];
+    for row in 0..h {
+        for col in 0..w {
+            y_plane[row * w + col] = ((col * 255 / w + frame_index * 3) % 256) as u8;
+        }
+    }
+    for b in y_plane[SIZE * 3 / 4..].iter_mut() {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let noise = ((*seed >> 40) as i16 & 0x0f) - 8;
+        *b = (*b as i16 + noise).clamp(0, 255) as u8;
+    }
+    (y_plane, vec![128u8; SIZE / 4], vec![128u8; SIZE / 4])
+}
+
+/// ビットレートに追従する合成フレームを `frames` 枚エンコードし、
+/// [`WINDOW_FRAMES`] フレームごとの出力バイト数合計を返す
+///
+/// `reconfigure_at` に並べたフレーム番号の直前で `reconfigure` を呼ぶ。フレーム番号は
+/// 投入順のインデックスであり、`allow_frame_reordering: false` のため出力順と一致する
+/// (Video Toolbox の保証ではなく実測前提)。
+fn windowed_output_bytes(
+    config: EncoderConfig,
+    reconfigure_at: &[(usize, ReconfigureParams)],
+    frames: usize,
+) -> Result<Vec<u64>, Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let mut seed = 0x5eed_5eed_5eed_5eedu64;
+    for i in 0..frames {
+        for (at, params) in reconfigure_at {
+            if *at == i {
+                encoder.reconfigure(params.clone())?;
+            }
+        }
+        let (y, u, v) = bitrate_sensitive_i420_frame(i, &mut seed);
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            &EncodeOptions::default(),
+            i as u64,
+        )?;
+    }
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, frames);
+    let mut sizes = Vec::new();
+    for callback in callbacks {
+        match callback {
+            Ok(frame) => sizes.push(frame.data.len() as u64),
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+        }
+    }
+    assert_eq!(sizes.len(), frames, "全フレームのエンコード結果が返ること");
+
+    let windows: Vec<u64> = sizes
+        .chunks(WINDOW_FRAMES)
+        .map(|chunk| chunk.iter().sum())
+        .collect();
+    eprintln!("ウィンドウごとの出力バイト数: {windows:?}");
+    Ok(windows)
+}
+
+/// `reconfigure` の `average_bitrate` 変更がエンコード中の出力レートに反映されることを検証する
+///
+/// 200 kbps で 30 フレーム → 8 Mbps へ変更して 60 フレーム → 200 kbps へ戻して 30 フレーム
+/// エンコードし、30 フレームごとの出力バイト数がビットレートの変更に追従することを確認する。
+/// Video Toolbox がエンコード中の `AverageBitRate` 変更を受け付けなくなると、この assert が
+/// 落ちる (動的更新の実効性を出力から検出するための回帰テスト)。
+#[test]
+fn reconfigure_average_bitrate_changes_mid_stream_output_rate() -> Result<(), Error> {
+    // 200 kbps = 1 秒あたり 25,000 バイト。実測は 25〜28 kB のため 4 倍の余裕を取る
+    const LOW_MAX: u64 = 100_000;
+    // 8 Mbps = 1 秒あたり 1,000,000 バイト。実測は約 1 MB のため半分以下の閾値を取る
+    const HIGH_MIN: u64 = 400_000;
+
+    let mut config = encoder_config(false);
+    config.average_bitrate = Some(LOW_BITRATE);
+    config.fps_numerator = WINDOW_FRAMES as u32;
+    config.fps_denominator = 1;
+
+    // 最初のウィンドウはキーフレームを含むが、ビットレート目標は最初から低いため判定に使える
+    let windows = windowed_output_bytes(
+        config,
+        &[
+            (
+                WINDOW_FRAMES,
+                ReconfigureParams {
+                    average_bitrate: Some(HIGH_BITRATE),
+                    ..Default::default()
+                },
+            ),
+            (
+                WINDOW_FRAMES * 3,
+                ReconfigureParams {
+                    average_bitrate: Some(LOW_BITRATE),
+                    ..Default::default()
+                },
+            ),
+        ],
+        WINDOW_FRAMES * 4,
+    )?;
+    assert_eq!(windows.len(), 4);
+
+    let low_before = windows[0];
+    assert!(
+        low_before < LOW_MAX,
+        "8 Mbps へ変更する前の出力が 200 kbps 相当より大きい: {low_before} バイト"
+    );
+    for (i, high) in windows[1..3].iter().enumerate() {
+        assert!(
+            *high > HIGH_MIN,
+            "8 Mbps へ変更した後の出力が反映されていない (ウィンドウ {}): {high} バイト",
+            i + 1
+        );
+    }
+    let low_after = windows[3];
+    assert!(
+        low_after < LOW_MAX,
+        "200 kbps へ戻した後の出力が反映されていない: {low_after} バイト"
+    );
+    Ok(())
+}
+
+/// `reconfigure` の `expected_frame_rate` 変更がエンコード中の出力レートに反映されることを検証する
+///
+/// 8 Mbps / 30 fps で 30 フレームエンコードしてから 60 fps へ変更し、さらに 90 フレーム
+/// エンコードする。`ExpectedFrameRate` が反映されると 1 フレームあたりの目標ビット量が
+/// 半分になるため、30 フレーム (30 fps では 1 秒、60 fps では 0.5 秒) ごとの合計バイト数は
+/// 約半分になる。Video Toolbox がエンコード中の `ExpectedFrameRate` 変更を受け付けなくなると
+/// この assert が落ちる (動的更新の実効性を出力から検出するための回帰テスト)。
+#[test]
+fn reconfigure_expected_frame_rate_changes_mid_stream_output_rate() -> Result<(), Error> {
+    let mut config = encoder_config(false);
+    config.average_bitrate = Some(HIGH_BITRATE);
+    config.fps_numerator = WINDOW_FRAMES as u32;
+    config.fps_denominator = 1;
+
+    let windows = windowed_output_bytes(
+        config,
+        &[(
+            WINDOW_FRAMES,
+            ReconfigureParams {
+                expected_frame_rate: Some(2 * WINDOW_FRAMES as u32),
+                ..Default::default()
+            },
+        )],
+        WINDOW_FRAMES * 4,
+    )?;
+    assert_eq!(windows.len(), 4);
+
+    let at_30fps = windows[0];
+    assert!(
+        at_30fps > 700_000,
+        "8 Mbps / 30 fps の出力が目標より小さい: {at_30fps} バイト"
+    );
+    // 遷移中のウィンドウ (windows[1]) はレート制御の追従に時間がかかるため判定に使わない
+    let at_60fps = windows[3];
+    assert!(
+        at_60fps * 4 < at_30fps * 3,
+        "60 fps へ変更した後の出力が半分になっていない: {at_60fps} バイト (30 fps 時 {at_30fps} バイト)"
+    );
+    Ok(())
 }
 
 /// ユーザーハンドラが 1 回目に panic してもプロセスが abort せず、

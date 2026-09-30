@@ -90,7 +90,7 @@ let config = EncoderConfig {
     max_key_frame_interval: None,
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
-    data_rate_limits: None,
+    data_rate_limits: Vec::new(),
 };
 
 let mut encoder = Encoder::new(config, FnEncodeHandler::new(
@@ -199,7 +199,7 @@ decoder.finish()?;
 | `max_key_frame_interval` | `Option<NonZeroU32>` | 最大キーフレーム間隔 (フレーム数) |
 | `max_key_frame_interval_duration` | `Option<Duration>` | 最大キーフレーム間隔 (秒数) |
 | `max_frame_delay_count` | `Option<NonZeroU32>` | フレーム遅延制限 |
-| `data_rate_limits` | `Option<Vec<DataRateLimit>>` | 短期ウィンドウごとのデータレート上限 |
+| `data_rate_limits` | `Vec<DataRateLimit>` | 短期ウィンドウごとのデータレート上限 |
 
 ### `DataRateLimit`
 
@@ -212,7 +212,7 @@ decoder.finish()?;
 | `window` | `Duration` | ウィンドウの長さ |
 
 指定できるリミットは最大 2 個です。`bytes` と `window` には 0 を指定できず、`bytes` は `i64::MAX` 以下である必要があります。
-`EncoderConfig::data_rate_limits` の `None` と空の `Vec` は未設定として扱われます。
+`EncoderConfig::data_rate_limits` は空の `Vec` が上限なし (未設定) を意味します。
 
 ### `DecoderConfig`
 
@@ -319,11 +319,9 @@ WebRTC やアダプティブビットレートストリーミングなど、ス�
 `reconfigure()` で `ReconfigureParams` を渡し、動的に変更可能な項目だけを更新します。
 `VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映するため、セッション再作成は行われません。
 
-動的に更新できる項目は `average_bitrate` / `expected_frame_rate` / `data_rate_limits` の 3 つです。
+動的に更新できる項目は `average_bitrate` / `expected_frame_rate` の 2 つです。
 解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
 `Encoder` を作り直して対応します。
-
-`data_rate_limits` に空の `Vec` を指定すると、設定済みのデータレート上限を解除します。
 
 `expected_frame_rate` を更新すると `fps_numerator` / `fps_denominator` は `expected_frame_rate / 1` に
 正規化されます (分数 fps は保持されません)。分数 fps を保持したい場合は `Encoder` を作り直してください。
