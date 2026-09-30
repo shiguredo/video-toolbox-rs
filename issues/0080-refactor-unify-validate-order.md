@@ -2,7 +2,7 @@
 
 - Priority: Low
 - Created: 2026-08-01
-- Completed:
+- Completed: 2026-10-01
 - Model: Opus 4.7
 - Branch: feature/refactor-unify-validate-order
 - Polished: {YYYY-MM-DD}
@@ -36,5 +36,14 @@ fps と bitrate の検証順序が経路ごとに異なる。
 
 ## 解決方法
 
-- `validate_reconfigure_params` 内の `average_bitrate` 検証と `expected_frame_rate` 検証の順序を入れ替える
-- 既存テストはフィールド単位の検証のため無変更で通るはずだが、検証順序を固定するテストを追加する
+`src/encoder/validation.rs` でフレームレートと bitrate の検証を共通関数 `validate_frame_rate_and_bitrate` に集約し、`Encoder::validate_config` と `Encoder::validate_reconfigure_params` の両方がこの関数を呼ぶようにした。順序の一致をコメントで説明するのではなく、順序が 1 か所でしか決まらない構造にすることで、片方の経路だけを変更して順序が逆転する状態を作れなくした。
+
+- 共通関数はフレームレートを先に、`average_bitrate` を次に検証する。`None` の項目は検証しない
+- フレームレート側の検証は `frame_rate_validator` として呼び出し側から受け取る。エラーの `field` と上限超過の reason は公開エラーの一部であり、構築は `fps_numerator` と `"must fit in i32 for CMTime timescale"`、再設定は `expected_frame_rate` と `"must fit in i32 for CFNumber"` を報告する既存の挙動を維持する必要があるため
+- ゼロ拒否の reason (`"must not be zero"`) と i32 上限の判定は既存の `validate_positive_i32_field` を両経路で共通して使う
+- 検証順序を固定するテストを `tests/test_encoder.rs` に 2 つ追加した。`encoder_rejects_prioritizing_fps_error_over_bitrate_error` は `fps_numerator` と `average_bitrate` を同時に不正にした `Encoder::new` が `fps_numerator` のエラーを返すこと、`reconfigure_rejects_prioritizing_fps_error_over_bitrate_error` は `expected_frame_rate` と `average_bitrate` を同時に不正にした `reconfigure` が `expected_frame_rate` のエラーを返すことを検証する
+- 追加したテストが順序逆転を実際に検出することを、共通関数内の 2 つの検証ブロックを入れ替えると 2 テストとも失敗することで確認した。既存のフィールド単位の拒否テストはエラー種別しか見ていないため、この入れ替えを検出できない
+- `CHANGES.md` の `## develop` の `### misc` に `[UPDATE]` エントリを追記した
+- `cargo test --workspace -- --test-threads=1` (59 テスト) / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo fmt --all -- --check` が通ることを確認した
+
+なお「現状」と「完了条件」にある `validate_reconfigure_params` の `data_rate_limits` 検証は、`data_rate_limits` が構築時専用になって `ReconfigureParams` から削除されたため対象外とした。共通化したのはフレームレートと bitrate の検証順序のみである。
