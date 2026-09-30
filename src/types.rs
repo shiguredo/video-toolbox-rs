@@ -68,6 +68,50 @@ mod tests {
             "未知の payload は汎用メッセージになること"
         );
     }
+
+    /// `CfPtrMut::into_raw` が `CFRelease` を行わずに保持していたポインタを返すこと
+    ///
+    /// `into_raw` は `Drop` を無効化して所有権を呼び出し元に移すため、呼び出し後の retain count が
+    /// 1 のままであることを検証する。`CFRelease` が走っていればこの検証は失敗する。
+    /// CFNumber / CFString / 空の CFArray には解放不要な定数オブジェクトとして生成されるものが
+    /// あり retain count を検証できないため、要素を 1 つ持つ CFArray を使う。
+    #[test]
+    fn cf_ptr_mut_into_raw_transfers_ownership() {
+        // CFArray が retain する要素 (CFArray 側が保持するため、この guard は drop してよい)
+        let element = cf_number_i32(42).expect("CFNumberCreate に失敗した");
+
+        // 要素を 1 つ持つ CFArray を生成する (生成直後の retain count は 1)
+        let mut values = [element.0];
+        let raw = unsafe {
+            sys::CFArrayCreate(
+                std::ptr::null_mut(),
+                values.as_mut_ptr(),
+                1,
+                &sys::kCFTypeArrayCallBacks,
+            )
+        }
+        // `CFArrayRef` は `*const __CFArray` だが、`CfPtrMut` は可変ポインタを保持する
+        .cast_mut();
+        assert!(!raw.is_null(), "CFArrayCreate が NULL を返した");
+        let guard = CfPtrMut(raw);
+
+        // `into_raw` は保持していたポインタをそのまま返す
+        let transferred = guard.into_raw();
+        assert_eq!(
+            transferred, raw,
+            "into_raw は保持していたポインタをそのまま返すこと"
+        );
+
+        // `Drop` による `CFRelease` が行われていなければ retain count は 1 のまま
+        let retain_count = unsafe { sys::CFGetRetainCount(transferred.cast()) };
+        assert_eq!(
+            retain_count, 1,
+            "into_raw は CFRelease してはならない (retain count が 1 のままであること)"
+        );
+
+        // 所有権は呼び出し元に移っているため、テスト側で明示的に解放する
+        unsafe { sys::CFRelease(transferred.cast()) };
+    }
 }
 
 /// Video Toolbox / CoreMedia の `i32` 寸法引数に渡す前に、`u32` が正の `i32` に収まることを検証する。
@@ -127,6 +171,20 @@ impl Drop for CvPixelBufferUnlockGuard {
 // ドロップ時に確実に sys::CFRelease() を呼び出すようにするためのラッパー
 #[derive(Debug)]
 pub(crate) struct CfPtrMut<T>(pub(crate) *mut T);
+
+impl<T> CfPtrMut<T> {
+    /// 保持している CF オブジェクトの所有権を呼び出し元に移し、生ポインタを返す
+    ///
+    /// `Drop` による `CFRelease` を行わないため、返り値のポインタの解放は呼び出し元の責務になる。
+    /// `std::mem::forget` を直接呼ぶ代わりに本メソッドを使うことで、所有権の移転がコード上で
+    /// 明示され、`forget` の書き忘れによる `CFRelease` の重複を防げる。
+    pub(crate) fn into_raw(self) -> *mut T {
+        let ptr = self.0;
+        // ここで `Drop` を走らせると `CFRelease` され、移転先での解放と重なって二重解放になる。
+        std::mem::forget(self);
+        ptr
+    }
+}
 
 impl<T> Drop for CfPtrMut<T> {
     fn drop(&mut self) {

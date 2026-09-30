@@ -177,13 +177,13 @@ impl<H: EncodeHandler> Encoder<H> {
             let status = sys::VTSessionSetProperties(session.cast(), properties_dict.0.cast());
             Error::check(status, "VTSessionSetProperties")?;
 
-            // 成功パスではガードを forget して、`Encoder::drop` に解放を委ねる。
-            // forget を書き忘れると `session_guard` の `Drop` が `CFRelease` し、
-            // `Encoder::drop` の `VTCompressionSessionInvalidate` + `CFRelease` と合わせて
-            // 二重解放や use-after-free になるため、成功パスでは必ず forget する。
-            // forget の後で `Err` を返すコードを追加するとリークするため、この後に
-            // エラーパスを追加しないこと。
-            std::mem::forget(session_guard);
+            // 成功パスでは `into_raw` でガードの所有権を放棄して、`Encoder::drop` に解放を委ねる。
+            // ガードを生かしたまま返すと `Drop` が `CFRelease` し、`Encoder::drop` の
+            // `VTCompressionSessionInvalidate` + `CFRelease` と合わせて二重解放や
+            // use-after-free になるため、成功パスでは必ず `into_raw` する。
+            // 所有権を手放した後で `Err` を返すコードを追加するとリークするため、
+            // この後にエラーパスを追加しないこと。
+            let session = session_guard.into_raw();
             Ok(session)
         }
     }

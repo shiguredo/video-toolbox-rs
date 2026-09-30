@@ -57,7 +57,7 @@
 - [FIX] 圧縮セッションのプロパティ設定が失敗したときにセッションがリークする問題を修正する
   - `VTCompressionSessionCreate` 成功後のセッションを `CfPtrMut` でガードし、エラーパスでは `Drop` が
     `CFRelease` で解放する
-  - 成功パスでは `forget` でガードを解除し、`Encoder::drop` の解放処理との二重解放を防ぐ
+  - 成功パスでは `into_raw` でガードの所有権を放棄し、`Encoder::drop` の解放処理との二重解放を防ぐ
   - @voluntas
 - [FIX] `extern "C"` コールバック内のユーザーハンドラ panic でプロセスが abort する問題を修正する
   - `on_encoded` / `on_decoded` の呼び出しを `std::panic::catch_unwind` で保護し、panic を捕捉して
@@ -147,6 +147,10 @@
     出力バイト数に現れることを確認する
   - エンコード開始後の `data_rate_limits` 変更が反映されないことを FFI を直接呼んで検出する
     (構築時に設定した上限が効くことを陽性対照として同時に確認する)
+  - @melpon
+- [UPDATE] `CfPtrMut` に所有権を取り出す `into_raw` を追加する
+  - 圧縮セッション生成の成功パスで `std::mem::forget` を直接呼んでいた箇所を `into_raw` に置き換え、
+    所有権の移転をコード上で明示する
   - @melpon
 
 ## 2026.1.1
