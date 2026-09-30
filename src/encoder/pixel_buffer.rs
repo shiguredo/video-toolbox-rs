@@ -164,6 +164,64 @@ impl<H: EncodeHandler> Encoder<H> {
         })
     }
 
+    /// エンコード対象の CVPixelBuffer を Video Toolbox に送信する
+    ///
+    /// 送信に成功した場合のみ `next_input_pts` を加算後の値へ進める。
+    ///
+    /// # Safety
+    ///
+    /// `image_buffer` が保持する CVPixelBuffer は有効でなければならない。
+    /// また [`crate::encoder::config::EncoderConfig`] の解像度・プレーン構成と整合する
+    /// ピクセルバッファであることは **呼び出し側の責務**とする。
+    unsafe fn submit_pixel_buffer(
+        &mut self,
+        image_buffer: CfPtrMut<sys::__CVBuffer>,
+        options: &EncodeOptions,
+        user_data: H::UserData,
+    ) -> Result<(), Error> {
+        // PTS のオーバーフロー検査
+        let new_next_input_pts = self
+            .next_input_pts
+            .checked_add(self.config.fps_denominator as i64)
+            .ok_or(Error::LimitExceeded {
+                reason: "input presentation timestamp overflow".into(),
+            })?;
+
+        unsafe {
+            let frame_properties = if options.force_key_frame {
+                Some(cf_dictionary(&[(
+                    sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
+                    sys::kCFBooleanTrue as *const c_void,
+                )])?)
+            } else {
+                None
+            };
+            let frame_properties_ptr = frame_properties
+                .as_ref()
+                .map_or(std::ptr::null(), |g| g.0.cast());
+            let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
+
+            let status = sys::VTCompressionSessionEncodeFrame(
+                self.session,
+                image_buffer.0,
+                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
+                sys::kCMTimeInvalid,
+                frame_properties_ptr,
+                source_frame_ref_con,
+                std::ptr::null_mut(),
+            );
+            if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
+                // status エラー時は sourceFrameRefCon がコールバックされないため、ここで drop する
+                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
+                return Err(e);
+            }
+
+            self.next_input_pts = new_next_input_pts;
+
+            Ok(())
+        }
+    }
+
     /// 画像データをエンコードする
     ///
     /// エンコード結果は構築時に指定したコールバックで通知される
@@ -194,18 +252,6 @@ impl<H: EncodeHandler> Encoder<H> {
 
         // 入力データの長さを検証
         Self::validate_frame_data(frame, width, height)?;
-
-        // PTS のオーバーフロー検査はリソース確保・送信より前に行う。オーバーフロー時はフレームを
-        // 送信せずに `next_input_pts` を変更しないままエラーを返す (送信後に検査すると、フレームが
-        // in-flight のまま失敗扱いになり、次回呼び出しで同一 PTS が再送される)。
-        // 入力検証 (pixel_format / データ長) を先に行い、その後に検査することで
-        // 無駄なバッファ確保・コピーを避けつつエラー優先順位を維持する。
-        let new_next_input_pts = self
-            .next_input_pts
-            .checked_add(self.config.fps_denominator as i64)
-            .ok_or(Error::LimitExceeded {
-                reason: "input presentation timestamp overflow".into(),
-            })?;
 
         unsafe {
             // CVPixelBufferCreate で CoreVideo にメモリを確保させ、入力データをコピーする。
@@ -260,37 +306,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 }
             }
 
-            let frame_properties = if options.force_key_frame {
-                Some(cf_dictionary(&[(
-                    sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
-                    sys::kCFBooleanTrue as *const c_void,
-                )])?)
-            } else {
-                None
-            };
-            let frame_properties_ptr = frame_properties
-                .as_ref()
-                .map_or(std::ptr::null(), |g| g.0.cast());
-            let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
-
-            let status = sys::VTCompressionSessionEncodeFrame(
-                self.session,
-                image_buffer.0,
-                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
-                sys::kCMTimeInvalid,
-                frame_properties_ptr,
-                source_frame_ref_con,
-                std::ptr::null_mut(),
-            );
-            if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
-                // status エラー時は sourceFrameRefCon がコールバックされないため、ここで drop する
-                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
-                return Err(e);
-            }
-
-            self.next_input_pts = new_next_input_pts;
-
-            Ok(())
+            self.submit_pixel_buffer(image_buffer, options, user_data)
         }
     }
 
@@ -334,52 +350,11 @@ impl<H: EncodeHandler> Encoder<H> {
                 });
             }
 
-            // PTS のオーバーフロー検査はリソース確保・送信より前に行う。オーバーフロー時はフレームを
-            // 送信せずに `next_input_pts` を変更しないままエラーを返す (送信後に検査すると、フレームが
-            // in-flight のまま失敗扱いになり、次回呼び出しで同一 PTS が再送される)。
-            // 入力検証 (ピクセルフォーマット) を先に行い、その後に検査することで
-            // 無駄な CFRetain を避けつつエラー優先順位を維持する。
-            let new_next_input_pts = self
-                .next_input_pts
-                .checked_add(self.config.fps_denominator as i64)
-                .ok_or(Error::LimitExceeded {
-                    reason: "input presentation timestamp overflow".into(),
-                })?;
-
             // CFRetain して CfPtrMut でラップ（スコープ終了時に CFRelease される）
             sys::CFRetain(pixel_buffer_ptr.cast());
             let image_buffer = CfPtrMut(pixel_buffer_ptr.cast::<sys::__CVBuffer>());
 
-            let frame_properties = if options.force_key_frame {
-                Some(cf_dictionary(&[(
-                    sys::kVTEncodeFrameOptionKey_ForceKeyFrame,
-                    sys::kCFBooleanTrue as *const c_void,
-                )])?)
-            } else {
-                None
-            };
-            let frame_properties_ptr = frame_properties
-                .as_ref()
-                .map_or(std::ptr::null(), |g| g.0.cast());
-            let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
-
-            let status = sys::VTCompressionSessionEncodeFrame(
-                self.session,
-                image_buffer.0,
-                sys::CMTimeMake(self.next_input_pts, self.config.fps_numerator as i32),
-                sys::kCMTimeInvalid,
-                frame_properties_ptr,
-                source_frame_ref_con,
-                std::ptr::null_mut(),
-            );
-            if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
-                let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
-                return Err(e);
-            }
-
-            self.next_input_pts = new_next_input_pts;
-
-            Ok(())
+            self.submit_pixel_buffer(image_buffer, options, user_data)
         }
     }
 }

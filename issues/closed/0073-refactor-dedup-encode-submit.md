@@ -1,7 +1,7 @@
 # `encode` / `encode_pixel_buffer` の重複を解消する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-09-29
 - Branch: feature/refactor-dedup-encode-submit
 - Polished: 2026-08-01
 
@@ -41,3 +41,29 @@
 - issue 0053: `encode` 系の `pixel_buffer.rs` への移動が同一領域に触れる。本 issue の共通メソッドも移動対象になる
 - issue 0055: `frame_properties` の構築と同じ行域を対象とする。どちらを先に実施しても成立する
 - issue 0071: `encode_pixel_buffer` のテスト追加が同一領域に触れる
+
+## 解決方法
+
+`src/encoder/pixel_buffer.rs` の `Encoder::encode` / `Encoder::encode_pixel_buffer` に重複していた
+フレーム送信処理を private メソッド `Encoder::submit_pixel_buffer` に集約した。
+
+- 共通メソッドは `CfPtrMut<sys::__CVBuffer>` を値で受け取り、`frame_properties` の構築・
+  `VTCompressionSessionEncodeFrame` の呼び出し・status エラー時の `user_data` の Box 回収・
+  `next_input_pts` の更新を担当する。受け取った `image_buffer` は送信の成否にかかわらず
+  `CfPtrMut` の `Drop` で `CFRelease` される
+- `encode` は `FrameData` のバリアントと `EncoderConfig.pixel_format` の照合・フレーム長検証・
+  `CVPixelBufferCreate` とプレーンコピーだけを担当し、`encode_pixel_buffer` は
+  `CVPixelBufferGetPixelFormatType` による照合と `CFRetain` だけを担当する
+- PTS のオーバーフロー検査は共通メソッド内で `Box::into_raw`（`user_data` の Box 化）と送信より
+  前に行う。オーバーフロー時はフレームを送信せず `next_input_pts` を変更しない（検査時点の
+  `user_data` は Box 化していないため、通常の drop で解放される）
+- status エラー時の Box 回収理由のコメントは共通メソッドへ移し、`encode_pixel_buffer` 側にも
+  同じコメントが付くようにした
+- PTS 検査の位置は「入力検証の後・ピクセルバッファ確保の後」になる。オーバーフロー時に
+  確保済みの CVPixelBuffer は `CfPtrMut` の `Drop` で解放され、返るエラーと `next_input_pts` の
+  挙動は変更前と同じ
+- 検証: `sys::VTCompressionSessionEncodeFrame(` の呼び出しが `src/` 内で 1 箇所
+  （`src/encoder/pixel_buffer.rs` の `submit_pixel_buffer`）に集約されていることを grep で確認した。
+  `cargo test --workspace -- --test-threads=1` / `cargo clippy --workspace --all-targets -- -D warnings` /
+  `cargo fmt --all -- --check` がすべて成功することを確認した
+- `CHANGES.md` の `## develop` に `### misc` の `[UPDATE]` としてエントリを追記した
