@@ -134,6 +134,13 @@
   - retain と `CVPixelBufferLockBaseAddress` は `PixelBuffer::new` に集約する
   - 公開 API の変更はない（`#[derive(Debug)]` の出力形式のみ変化する）
   - @melpon
+- [UPDATE] `Encoder::encode` と `Encoder::encode_pixel_buffer` に重複していたフレーム送信処理を
+  `submit_pixel_buffer` に集約する
+  - `frame_properties` の構築・`VTCompressionSessionEncodeFrame` の呼び出し・
+    status エラー時の `user_data` の Box 回収・`next_input_pts` の更新を 1 箇所にまとめる
+  - 両メソッドはピクセルバッファの取得と入力検証だけを担当する
+  - 公開 API の変更はない
+  - @melpon
 
 ## 2026.1.1
 
