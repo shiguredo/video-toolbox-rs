@@ -118,7 +118,6 @@ pub struct EncoderConfig {
     ///
     /// 空 `Vec` は上限なし (未設定) を意味する。指定できるリミットは Video Toolbox の仕様上
     /// 0〜2 個で、詳細は [`DataRateLimit`] を参照。
-    /// ([`crate::encoder::Encoder::reconfigure`] の rustdoc を参照)。
     pub data_rate_limits: Vec<DataRateLimit>,
 }
 
