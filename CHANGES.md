@@ -74,6 +74,10 @@
 
 ### misc
 
+- [UPDATE] `Encoder::reconfigure` の検証順序を `Encoder::new` と揃える
+  - フレームレートの検証を bitrate の検証より先に実行し、両方を同時に不正にした場合に
+    構築と再設定のどちらでもフレームレートのエラーが先に返るようにする
+  - @melpon
 - [UPDATE] 未使用の圧縮セッションを invalidate なしの `CFRelease` で解放してよい根拠をコメントに追記する
   - Apple Developer Documentation の `VTCompressionSessionInvalidate(_:)` と macOS SDK の
     `VTCompressionSession.h` に「retain count が 0 になった時点でセッションは自動的に

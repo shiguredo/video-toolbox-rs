@@ -87,6 +87,24 @@ fn validate_positive_i32_field(
     Ok(())
 }
 
+/// フレームレート値と `average_bitrate` を、フレームレートを先にして検証する
+///
+/// `None` の項目は検証しない。フレームレート側の `field` と上限超過の reason は用途によって
+/// 表示が異なるため `frame_rate_validator` に委ね、bitrate 側は常に同じ表示で検証する。
+fn validate_frame_rate_and_bitrate(
+    frame_rate_value: Option<u32>,
+    frame_rate_validator: impl FnOnce(u32) -> Result<(), Error>,
+    average_bitrate: Option<u64>,
+) -> Result<(), Error> {
+    if let Some(frame_rate) = frame_rate_value {
+        frame_rate_validator(frame_rate)?;
+    }
+    if let Some(bitrate) = average_bitrate {
+        validate_average_bitrate(bitrate)?;
+    }
+    Ok(())
+}
+
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダー設定を検証する
     pub(super) fn validate_config(config: &EncoderConfig) -> Result<(), Error> {
@@ -99,14 +117,17 @@ impl<H: EncodeHandler> Encoder<H> {
                 reason: "must not be zero".into(),
             });
         }
-        validate_positive_i32_field(
-            "fps_numerator",
-            "must fit in i32 for CMTime timescale",
-            config.fps_numerator,
+        validate_frame_rate_and_bitrate(
+            Some(config.fps_numerator),
+            |frame_rate| {
+                validate_positive_i32_field(
+                    "fps_numerator",
+                    "must fit in i32 for CMTime timescale",
+                    frame_rate,
+                )
+            },
+            config.average_bitrate,
         )?;
-        if let Some(bitrate) = config.average_bitrate {
-            validate_average_bitrate(bitrate)?;
-        }
         validate_data_rate_limits(&config.data_rate_limits)?;
         // NonZeroU32 から i32 へのキャストで負値に切り詰まるのを防ぐ
         if let Some(interval) = config.max_key_frame_interval
@@ -130,16 +151,16 @@ impl<H: EncodeHandler> Encoder<H> {
 
     /// [`crate::encoder::Encoder::reconfigure`] に渡された [`ReconfigureParams`] を検証する
     pub(super) fn validate_reconfigure_params(params: &ReconfigureParams) -> Result<(), Error> {
-        if let Some(bitrate) = params.average_bitrate {
-            validate_average_bitrate(bitrate)?;
-        }
-        if let Some(fps) = params.expected_frame_rate {
-            validate_positive_i32_field(
-                "expected_frame_rate",
-                "must fit in i32 for CFNumber",
-                fps,
-            )?;
-        }
-        Ok(())
+        validate_frame_rate_and_bitrate(
+            params.expected_frame_rate,
+            |frame_rate| {
+                validate_positive_i32_field(
+                    "expected_frame_rate",
+                    "must fit in i32 for CFNumber",
+                    frame_rate,
+                )
+            },
+            params.average_bitrate,
+        )
     }
 }
