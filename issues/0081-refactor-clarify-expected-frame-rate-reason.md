@@ -2,7 +2,7 @@
 
 - Priority: Low
 - Created: 2026-08-01
-- Completed:
+- Completed: 2026-10-01
 - Model: Opus 4.7
 - Branch: feature/refactor-clarify-expected-frame-rate-reason
 - Polished: {YYYY-MM-DD}
@@ -34,5 +34,9 @@
 
 ## 解決方法
 
-- `validate_config` / `validate_reconfigure_params` の 2 箇所の `reason_overflow` 引数を変更する
-- reason 文字列を検証しているテストの期待値を更新する
+実装せず closed にする。
+
+- 本 issue の対象は `Error::InvalidConfig` の `reason` という公開エラー出力の文面のみであり、挙動の欠陥ではない。`fps_numerator` / `expected_frame_rate` の `i32::MAX` 上限は `Encoder::validate_config` / `Encoder::validate_reconfigure_params` から呼ばれる `validate_positive_i32_field` で既に正しく検証されており、reason が用途の一部しか述べていないことによる実害がない
+- 文面を直すには公開エラーの文字列、それを文字列一致で固定している `tests/test_encoder.rs` の期待値、`CHANGES.md` を同時に変更する必要があり、得られる情報量の改善に対して変更とレビューのコストが見合わない
+- 両経路の文面を揃えると `validate_positive_i32_field` の `reason_overflow` 引数が不要になるが、その整理も必須ではないため併せて見送る
+- 将来 `reason` の文面を別の変更で触る機会があれば、そのときに用途の記述を合わせて見直す
