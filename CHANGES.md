@@ -11,7 +11,7 @@
 
 ## develop
 
-- [CHANGE] MSRV (rust-version) を 1.93 に上げる
+- [CHANGE] MSRV (rust-version) を 1.95 に上げる
   - @voluntas
 - [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
   - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
