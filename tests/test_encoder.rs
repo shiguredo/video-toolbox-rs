@@ -179,12 +179,47 @@ fn noop_encode_handler() -> FnEncodeHandler<()> {
 }
 
 /// 検証エラーを期待して `reconfigure` を呼び、返された `Error` を取り出す
+///
+/// `Encoder::reconfigure` は拒否時に `self.config` を変更しない契約のため、呼び出しの
+/// 前後で `ReconfigureParams` が触れ得るフィールド (`average_bitrate` / `fps_numerator` /
+/// `fps_denominator` / `data_rate_limits`) が初期値のまま保たれることもここで検証する。
+/// 拒否系テストはすべてこのヘルパーを経由するため、エラー種別の検証に加えて設定の
+/// 不変性が全ケースで確認される。
 fn reconfigure_err(params: ReconfigureParams) -> Error {
     let mut encoder = Encoder::new(encoder_config(false), noop_encode_handler())
         .expect("エンコーダーの構築が成功すること");
-    encoder
+    // 検証エラーは `self` に触れる前に返るため、呼び出し前の値をそのまま期待値にできる。
+    let before_bitrate = encoder.config().average_bitrate;
+    let before_fps_numerator = encoder.config().fps_numerator;
+    let before_fps_denominator = encoder.config().fps_denominator;
+    let before_data_rate_limits = encoder.config().data_rate_limits.clone();
+
+    let error = encoder
         .reconfigure(params)
-        .expect_err("無効なパラメータが拒否されること")
+        .expect_err("無効なパラメータが拒否されること");
+
+    assert_eq!(
+        encoder.config().average_bitrate,
+        before_bitrate,
+        "拒否された reconfigure が average_bitrate を変更している"
+    );
+    assert_eq!(
+        encoder.config().fps_numerator,
+        before_fps_numerator,
+        "拒否された reconfigure が fps_numerator を変更している"
+    );
+    assert_eq!(
+        encoder.config().fps_denominator,
+        before_fps_denominator,
+        "拒否された reconfigure が fps_denominator を変更している"
+    );
+    assert_eq!(
+        encoder.config().data_rate_limits,
+        before_data_rate_limits,
+        "拒否された reconfigure が data_rate_limits を変更している"
+    );
+
+    error
 }
 
 fn wait_and_take_results<T>(
