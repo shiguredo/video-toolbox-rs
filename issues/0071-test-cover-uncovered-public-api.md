@@ -1,7 +1,7 @@
 # 未カバーの公開 API テストを追加する
 
 - Created: 2026-07-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-10-02
 - Branch: feature/add-uncovered-api-tests
 - Polished: 2026-08-01
 
@@ -47,3 +47,13 @@
 - issue 0061: `encode_pixel_buffer` のテストで `CVPixelBufferCreate` の前準備を計画している
 - issue 0072: `I420Frame` / `Nv12Frame` の重複解消が同一領域に触れる（公開 API は変わらないため並行可能）
 - issue 0073: `encode` / `encode_pixel_buffer` の重複解消が同一領域に触れる（公開 API は変わらないため並行可能）
+
+## 解決方法
+
+完了条件を満たすテストを追加する。
+
+- `Decoder::update_format`: description 差し替えパスは、更新前のキーフレームを参照する P フレームを更新後にデコードして成功することで検証する。セッション再作成パスは H.264 から H.265 への変更で検証する（`update_format_with_same_parameter_sets_keeps_reference_frames` / `update_format_switching_to_h265_recreates_session`）
+- `Encoder::encode_pixel_buffer`: 正常系と、不正な FourCC による `UnknownPixelFormat`、別フォーマットの CVPixelBuffer による `PixelFormatMismatch` を検証する
+- `PixelFormat::Nv12` でのデコード: `DecoderConfig.pixel_format` に NV12 を指定して `Nv12Frame` の全メソッドを PSNR で検証する
+- `Error` の Display: 未テストだった 5 バリアントと `std::error::Error` の実装を検証する
+- `FrameData::Nv12` のエンコードを検証する過程で、`Encoder::encode` の UV プレーンのコピーが `CVPixelBufferGetWidthOfPlane` の戻り値（クロマサンプル対の数）を 1 行あたりのバイト数として比較し、必ず `Error::LimitExceeded` になる不具合を見つけた。同じブランチで修正し、`encode_nv12_frame_preserves_plane_content` でデコード結果と入力プレーンの内容を比較して検証する
