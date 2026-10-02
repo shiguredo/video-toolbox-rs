@@ -12,6 +12,7 @@ mod codec_info;
 mod decoder;
 mod encoder;
 mod error;
+mod stats;
 mod sys;
 mod types;
 
@@ -22,13 +23,14 @@ pub use codec_info::{
     HevcEncodingProfile, VideoCodecType,
 };
 pub use decoder::{
-    DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, FnDecodeHandler, I420Frame,
-    Nv12Frame,
+    DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, DecoderStats,
+    FnDecodeHandler, I420Frame, Nv12Frame,
 };
 pub use encoder::{
     CodecConfig, DataRateLimit, EncodeHandler, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
-    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
-    HevcProfile, ReconfigureParams,
+    EncoderStats, FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile,
+    HevcEncoderConfig, HevcProfile, ReconfigureParams,
 };
 pub use error::Error;
+pub use stats::{Counter, Gauge};
 pub use types::PixelFormat;

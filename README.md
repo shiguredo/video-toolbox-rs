@@ -385,6 +385,69 @@ decoder.update_format(DecoderCodec::Av1 {
 | 引数 | `ReconfigureParams` (動的更新可能項目のみ) | `DecoderCodec` (パラメータセットのみ) |
 | 対応外項目 | 解像度・コーデック・ピクセルフォーマット → `Encoder` を作り直す | (`DecoderCodec` バリアントが対応するもの以外) |
 
+## 統計値
+
+`Encoder::stats()` / `Decoder::stats()` で、エンコード / デコードの進行状況をメトリクスとして取得できます。
+
+統計値はエンコーダー / デコーダーを操作するスレッドと Video Toolbox のコールバックスレッドの
+両方が更新するため、戻り値はエンコーダー / デコーダーと共有されている値への参照です。
+複数のフィールドを読む間に値が変化し得るので、値を保存しておきたい場合は `clone()` してください。
+
+`Counter` は単調増加の通算値、`Gauge` は増減する時点値です。どちらも `clone()` は現在値の
+コピーを返します。
+
+### `EncoderStats`
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `total_encode_count` | `Counter` | `encode()` / `encode_pixel_buffer()` が Video Toolbox に受理された通算回数 |
+| `total_output_frame_count` | `Counter` | 出力コールバックに `Ok` を渡した通算回数 |
+| `total_error_count` | `Counter` | 出力コールバックに `Err` を渡した通算回数 |
+| `total_reconfigure_count` | `Counter` | `reconfigure()` が成功した通算回数 |
+| `in_flight_frames` | `Gauge` | 送信済みでまだ出力コールバックが来ていないフレーム数の現在値 |
+
+### `DecoderStats`
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `total_decode_count` | `Counter` | `decode()` が Video Toolbox に受理された通算回数 |
+| `total_output_frame_count` | `Counter` | 出力コールバックに `Ok` を渡した通算回数 |
+| `total_error_count` | `Counter` | 出力コールバックに `Err` を渡した通算回数 |
+| `total_create_session_count` | `Counter` | デコーダーセッションの作成に成功した通算回数 |
+| `total_update_format_count` | `Counter` | `update_format()` がセッションを流用した通算回数 |
+| `total_recreate_session_count` | `Counter` | `update_format()` がセッションを再作成した通算回数 |
+| `in_flight_frames` | `Gauge` | 送信済みでまだ出力コールバックが来ていないフレーム数の現在値 |
+
+`in_flight_frames` は送信の直前に増え、出力コールバックがユーザーデータを回収した時点で減ります。
+Video Toolbox が満杯を起こさない上限値は公開していないため、利用側で上限を決めて
+`finish()` を挟むことで、処理中のフレーム数を制御できます。
+
+`total_create_session_count` は `Decoder::new()` の初回作成を含みます。
+
+```rust
+// 送信済みで処理中のフレーム数を確認し、閾値に達したらフラッシュする
+let in_flight = encoder.stats().in_flight_frames.get();
+if in_flight >= 4 {
+    encoder.finish()?;
+}
+
+// 通算値のコピーを取得する (フィールド間の一貫性は保証されない)
+let stats = encoder.stats().clone();
+println!(
+    "encoded={} output={} error={}",
+    stats.total_encode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get()
+);
+
+// update_format() がセッションを流用したか再作成したかも統計値で確認できる
+println!(
+    "reuse={} recreate={}",
+    decoder.stats().total_update_format_count.get(),
+    decoder.stats().total_recreate_session_count.get()
+);
+```
+
 ## ライセンス
 
 Apache License 2.0

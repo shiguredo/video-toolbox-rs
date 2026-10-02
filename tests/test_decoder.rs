@@ -363,6 +363,191 @@ fn h265_decoder() -> Result<(), Error> {
     Ok(())
 }
 
+/// 統計値がデコードの進行に応じて増え、完了後に `in_flight_frames` が 0 に戻ることを検証する
+///
+/// `Decoder::stats` の参照はデコーダーと共有されているため、構築直後・送信後・
+/// 出力コールバック到着後の各時点で同じ参照を読んで値を確認する。
+#[test]
+fn decoder_stats_counts_decoded_frames_and_outputs() -> Result<(), Error> {
+    let (results, handler) = decode_collector();
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: h264_codec(),
+            pixel_format: PixelFormat::I420,
+        },
+        handler,
+    )?;
+
+    // 構築直後はセッション作成の 1 回だけが計上され、それ以外は 0 である
+    let stats = decoder.stats();
+    assert_eq!(stats.total_create_session_count.get(), 1);
+    assert_eq!(stats.total_decode_count.get(), 0);
+    assert_eq!(stats.total_output_frame_count.get(), 0);
+    assert_eq!(stats.total_error_count.get(), 0);
+    assert_eq!(stats.total_update_format_count.get(), 0);
+    assert_eq!(stats.total_recreate_session_count.get(), 0);
+    assert_eq!(stats.in_flight_frames.get(), 0);
+
+    // 2 フレームを送信し、すべての出力が届くまで待つ
+    let data = h264_nalu_data();
+    for user_data in 0..2u64 {
+        decoder.decode(&data, user_data)?;
+    }
+    decoder.finish()?;
+    wait_decode_callbacks(&results, 2);
+
+    // 統計値の計上はハンドラーの実行前に行われるため、結果の到着後は計上済みである
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.total_decode_count.get(),
+        2,
+        "送信したフレーム数だけ total_decode_count が増えること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        2,
+        "出力できたフレーム数だけ total_output_frame_count が増えること"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        0,
+        "正常な入力ではエラーが計上されないこと"
+    );
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "すべての出力コールバックの到着後に in_flight_frames が 0 に戻ること"
+    );
+
+    Ok(())
+}
+
+/// `in_flight_frames` が送信で計上され、出力コールバックの到着で 0 に戻ることを検証する
+///
+/// `kVTDecodeFrame_EnableAsynchronousDecompression` を指定しているため、Video Toolbox は
+/// `VTDecompressionSessionDecodeFrame` が戻る前に出力コールバックを呼ぶことがある。
+/// そのため「送信が戻った直後の in-flight が 1 である」ことは保証されず、コールバックが
+/// 先に届いていれば出力として計上済みである。どちらの順序でも成立する不変条件
+/// (送信数 = in-flight + 出力 + エラー) で送信時の計上を検証する。
+///
+/// 2 フレーム分の入力として、参照関係のあるキーフレームと P フレームを使う。
+#[test]
+fn decoder_stats_in_flight_frames_tracks_submitted_frames() -> Result<(), Error> {
+    let encoded = encode_frame_pair_with_reference();
+    let (results, handler) = decode_collector();
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::H264 {
+                sps: &encoded.sps,
+                pps: &encoded.pps,
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::I420,
+        },
+        handler,
+    )?;
+
+    // 送信したフレームは、コールバック未到着なら in-flight、到着済みなら出力または
+    // エラーとして、必ずどちらか一方に計上される。コールバックが未到着の間にこの不変条件が
+    // 崩れる場合は送信時の計上が欠けている。
+    decoder.decode(&encoded.key_frame, 0)?;
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.in_flight_frames.get()
+            + stats.total_output_frame_count.get()
+            + stats.total_error_count.get(),
+        stats.total_decode_count.get(),
+        "送信したフレームが in-flight と出力のどちらにも計上されていない"
+    );
+
+    // 出力コールバックが届くと in-flight から外れる
+    wait_decode_callbacks(&results, 1);
+    assert_eq!(
+        decoder.stats().in_flight_frames.get(),
+        0,
+        "出力コールバックが届いたフレームは in-flight から外れること"
+    );
+
+    // 2 件目も同じく送信で計上され、finish() の後に 0 に戻る
+    decoder.decode(&encoded.p_frame, 1)?;
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.in_flight_frames.get()
+            + stats.total_output_frame_count.get()
+            + stats.total_error_count.get(),
+        stats.total_decode_count.get(),
+        "2 件目のフレームが in-flight と出力のどちらにも計上されていない"
+    );
+    decoder.finish()?;
+    wait_decode_callbacks(&results, 2);
+
+    let stats = decoder.stats();
+    assert_eq!(stats.total_decode_count.get(), 2);
+    assert_eq!(stats.total_output_frame_count.get(), 2);
+    assert_eq!(stats.total_error_count.get(), 0);
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "全フレームの出力後に in_flight_frames が 0 に戻ること"
+    );
+
+    Ok(())
+}
+
+/// 壊れたビットストリームのデコードで `total_error_count` が増え、
+/// `total_output_frame_count` が増えないことを検証する
+///
+/// 長さプレフィクスだけを正しくした 4 バイトの中身が不正な NAL を渡す。Video Toolbox は
+/// デコード失敗を出力コールバックの status で通知するため、この経路がエラー計上を通る。
+#[test]
+fn decoder_stats_counts_decode_errors() -> Result<(), Error> {
+    let (results, handler) = decode_collector();
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: h264_codec(),
+            pixel_format: PixelFormat::I420,
+        },
+        handler,
+    )?;
+
+    // 長さプレフィクス (4 バイト) は正しいが中身が不正な NAL をデコードする
+    let garbage: Vec<u8> = vec![0, 0, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF];
+    decoder.decode(&garbage, 0)?;
+    decoder.finish()?;
+    wait_decode_callbacks(&results, 1);
+
+    // コールバックはエラーとして届く
+    match take_results(&results).remove(0) {
+        DecodeEvent::Err(_) => {}
+        DecodeEvent::I420 { .. } => panic!("不正な NAL のデコード結果が I420 になった"),
+        DecodeEvent::Nv12 { .. } => panic!("不正な NAL のデコード結果が NV12 になった"),
+    }
+
+    let stats = decoder.stats();
+    assert_eq!(
+        stats.total_decode_count.get(),
+        1,
+        "処理系に到達したフレームは total_decode_count に計上されること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        0,
+        "デコードに失敗したフレームは出力フレーム数に計上しないこと"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        1,
+        "デコードに失敗したフレームはエラーとして計上すること"
+    );
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "エラーで完了したフレームも in-flight から外れること"
+    );
+
+    Ok(())
+}
+
 /// H.264 デコーダーが長さプレフィクス 1 / 2 バイトの NAL ユニットをデコードできることを検証する
 ///
 /// `nalu_len_bytes` は Apple のドキュメントで 1, 2, 4 のいずれかが有効とされているが、
@@ -566,6 +751,13 @@ fn update_format_with_same_parameter_sets_keeps_reference_frames() -> Result<(),
         handler,
     )?;
 
+    // 構築時は total_create_session_count だけが 1 になる
+    assert_eq!(
+        decoder.stats().total_create_session_count.get(),
+        1,
+        "Decoder::new のセッション作成が 1 回計上されること"
+    );
+
     // 更新前にキーフレームをデコードして参照フレームを作る
     decoder.decode(&encoded.key_frame, 1)?;
     decoder.finish()?;
@@ -576,6 +768,23 @@ fn update_format_with_same_parameter_sets_keeps_reference_frames() -> Result<(),
 
     // 同一コーデック・同一パラメータセットでの更新。description 差し替えパスを通る
     decoder.update_format(codec())?;
+
+    // 流用パスを通ったことを統計値でも確認する (セッションは再作成されない)
+    assert_eq!(
+        decoder.stats().total_update_format_count.get(),
+        1,
+        "セッションを流用した update_format が 1 回計上されること"
+    );
+    assert_eq!(
+        decoder.stats().total_recreate_session_count.get(),
+        0,
+        "セッションを流用した場合は再作成が計上されないこと"
+    );
+    assert_eq!(
+        decoder.stats().total_create_session_count.get(),
+        1,
+        "セッションを流用した場合は作成回数が増えないこと"
+    );
 
     // 更新後に、更新前のキーフレームを参照する P フレームをデコードする。
     // セッションが作り直されていれば参照フレームが無いためここで失敗する。
@@ -618,6 +827,11 @@ fn update_format_switching_to_h265_recreates_session() -> Result<(), Error> {
         },
         handler,
     )?;
+    assert_eq!(
+        decoder.stats().total_create_session_count.get(),
+        1,
+        "Decoder::new のセッション作成が 1 回計上されること"
+    );
 
     let h264_data = h264_nalu_data();
     decoder.decode(&h264_data, 1)?;
@@ -626,6 +840,23 @@ fn update_format_switching_to_h265_recreates_session() -> Result<(), Error> {
     assert_eq!(user_data, 1);
 
     decoder.update_format(h265_codec())?;
+
+    // 再作成パスを通ったことを統計値で確認する。create は初回と再作成の 2 回になる
+    assert_eq!(
+        decoder.stats().total_recreate_session_count.get(),
+        1,
+        "セッションを再作成した update_format が 1 回計上されること"
+    );
+    assert_eq!(
+        decoder.stats().total_update_format_count.get(),
+        0,
+        "セッションを再作成した場合は流用が計上されないこと"
+    );
+    assert_eq!(
+        decoder.stats().total_create_session_count.get(),
+        2,
+        "再作成ぶんの VTDecompressionSessionCreate が計上されること"
+    );
 
     let h265_data = nalu_data(H265_NAL_UNIT);
     decoder.decode(&h265_data, 2)?;

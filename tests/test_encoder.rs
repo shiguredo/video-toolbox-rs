@@ -2166,3 +2166,214 @@ fn encode_with_panicking_handler() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// 統計値がエンコードの進行に応じて増え、完了後に `in_flight_frames` が 0 に戻ることを検証する
+///
+/// `Encoder::stats` の参照はエンコーダーと共有されているため、構築直後・送信後・
+/// 出力コールバック到着後の各時点で同じ参照を読んで値を確認する。
+#[test]
+fn encoder_stats_counts_encoded_frames_and_outputs() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    // 構築直後の統計値はすべて 0 である
+    let stats = encoder.stats();
+    assert_eq!(stats.total_encode_count.get(), 0);
+    assert_eq!(stats.total_output_frame_count.get(), 0);
+    assert_eq!(stats.total_error_count.get(), 0);
+    assert_eq!(stats.total_reconfigure_count.get(), 0);
+    assert_eq!(stats.in_flight_frames.get(), 0);
+
+    // 3 フレームを送信し、すべての出力が届くまで待つ
+    let (y, u, v) = build_i420_black_frame();
+    for user_data in 0..3u64 {
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            &EncodeOptions::default(),
+            user_data,
+        )?;
+    }
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 3);
+    assert_eq!(callbacks.len(), 3, "エンコード結果が 3 件届くこと");
+    for callback in &callbacks {
+        assert!(
+            callback.is_ok(),
+            "正常な入力のエンコードは成功すること: {callback:?}"
+        );
+    }
+
+    // 統計値の計上はハンドラーの実行前に行われるため、結果の到着後は計上済みである
+    let stats = encoder.stats();
+    assert_eq!(
+        stats.total_encode_count.get(),
+        3,
+        "送信したフレーム数だけ total_encode_count が増えること"
+    );
+    assert_eq!(
+        stats.total_output_frame_count.get(),
+        3,
+        "出力できたフレーム数だけ total_output_frame_count が増えること"
+    );
+    assert_eq!(
+        stats.total_error_count.get(),
+        0,
+        "正常な入力ではエラーが計上されないこと"
+    );
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "すべての出力コールバックの到着後に in_flight_frames が 0 に戻ること"
+    );
+
+    Ok(())
+}
+
+/// `in_flight_frames` が送信で増え、出力コールバックの到着で減ることを検証する
+///
+/// 1 件目のコールバックをハンドラー内でブロックし、Video Toolbox のコールバックが
+/// 直列に配信される性質を利用して後続フレームのコールバックを保留させる。
+/// 保留中に送信したフレームはまだユーザーデータを回収されていないため、
+/// その件数が `in_flight_frames` に現れる。
+#[test]
+fn encoder_stats_in_flight_frames_tracks_pending_callbacks() -> Result<(), Error> {
+    let (started_tx, started_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            // コールバックは Video Toolbox のコールバックスレッドから呼ばれるため、
+            // 1 件目かどうかの判定はアトミックに行う
+            let is_first = AtomicBool::new(true);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                // 1 件目のコールバックだけ、テスト本体が解放するまでブロックする
+                if is_first.swap(false, Ordering::Relaxed) {
+                    started_tx
+                        .send(())
+                        .expect("コールバック開始の通知に失敗した");
+                    release_rx.recv().expect("コールバックの解放待ちに失敗した");
+                }
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+
+    // 1 件目を送信し、そのコールバックがハンドラーに入ってブロックするまで待つ。
+    // この時点で 1 件目のユーザーデータは回収済みなので in-flight は 0 である。
+    encoder.encode(&frame, &EncodeOptions::default(), 0)?;
+    started_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("1 件目のエンコードコールバックが開始されること");
+    assert_eq!(
+        encoder.stats().in_flight_frames.get(),
+        0,
+        "ユーザーデータを回収したフレームは in-flight に数えないこと"
+    );
+
+    // コールバックがブロックされている間に 3 件を送信する。これらのコールバックは
+    // 直列な配信キューで保留されるため、いずれも in-flight として観測できる。
+    for user_data in 1..4u64 {
+        encoder.encode(&frame, &EncodeOptions::default(), user_data)?;
+    }
+    assert_eq!(
+        encoder.stats().in_flight_frames.get(),
+        3,
+        "送信済みでコールバック未到着のフレーム数が in_flight_frames に現れること"
+    );
+
+    // ブロックを解放して全フレームの出力を待つ
+    release_tx.send(()).expect("コールバックの解放に失敗した");
+    encoder.finish()?;
+    let callbacks = wait_and_take_results(&results, 4);
+    assert_eq!(callbacks.len(), 4, "エンコード結果が 4 件届くこと");
+
+    let stats = encoder.stats();
+    assert_eq!(stats.total_encode_count.get(), 4);
+    assert_eq!(stats.total_output_frame_count.get(), 4);
+    assert_eq!(stats.total_error_count.get(), 0);
+    assert_eq!(
+        stats.in_flight_frames.get(),
+        0,
+        "全フレームの出力後に in_flight_frames が 0 に戻ること"
+    );
+
+    Ok(())
+}
+
+/// `total_reconfigure_count` が成功した `reconfigure` だけで増えることを検証する
+///
+/// 更新対象が無い no-op と、検証で拒否された更新は Video Toolbox に到達しないため
+/// 計上しない。構築時に `EncoderStats` が 0 で初期化されることも合わせて確認する。
+#[test]
+fn encoder_stats_counts_successful_reconfigure_only() -> Result<(), Error> {
+    let mut encoder = Encoder::new(minimal_encoder_config(), noop_encode_handler())?;
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        0,
+        "構築直後の total_reconfigure_count は 0 であること"
+    );
+
+    // 全項目 None は no-op であり、VTSessionSetProperties を呼ばない
+    encoder.reconfigure(ReconfigureParams::default())?;
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        0,
+        "no-op の reconfigure は計上しないこと"
+    );
+
+    // 有効な更新は VTSessionSetProperties に成功する
+    encoder.reconfigure(ReconfigureParams {
+        average_bitrate: Some(1_000_000),
+        ..Default::default()
+    })?;
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        1,
+        "成功した reconfigure が 1 回計上されること"
+    );
+
+    // 検証で拒否された更新は self に触れる前にエラーになる
+    let err = encoder
+        .reconfigure(ReconfigureParams {
+            average_bitrate: Some(0),
+            ..Default::default()
+        })
+        .expect_err("average_bitrate 0 は拒否されること");
+    assert!(matches!(err, Error::InvalidConfig { .. }));
+    assert_eq!(
+        encoder.stats().total_reconfigure_count.get(),
+        1,
+        "拒否された reconfigure は計上しないこと"
+    );
+
+    Ok(())
+}

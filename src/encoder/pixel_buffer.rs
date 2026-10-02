@@ -207,6 +207,12 @@ impl<H: EncodeHandler> Encoder<H> {
                 .map_or(std::ptr::null(), |g| g.0.cast());
             let source_frame_ref_con = Box::into_raw(Box::new(user_data)).cast::<c_void>();
 
+            // 送信の前に in-flight フレーム数を増やす。VTCompressionSessionEncodeFrame は
+            // この呼び出しから戻る前に出力コールバックを別スレッドで呼び出すことがある。
+            // 送信後に増やすと、先に走ったコールバックの減算が 0 で飽和して失われ、
+            // in_flight_frames が実際より大きいまま残る。
+            self.context.stats.in_flight_frames.inc();
+
             let status = sys::VTCompressionSessionEncodeFrame(
                 self.session,
                 image_buffer.0,
@@ -219,9 +225,12 @@ impl<H: EncodeHandler> Encoder<H> {
             if let Err(e) = Error::check(status, "VTCompressionSessionEncodeFrame") {
                 // status エラー時は sourceFrameRefCon がコールバックされないため、ここで drop する
                 let _ = Box::from_raw(source_frame_ref_con.cast::<H::UserData>());
+                // コールバックも来ないため、送信前に増やした in-flight をここで戻す
+                self.context.stats.in_flight_frames.dec();
                 return Err(e);
             }
 
+            self.context.stats.total_encode_count.inc();
             self.next_input_pts = new_next_input_pts;
 
             Ok(())

@@ -6,6 +6,7 @@ mod frame;
 mod handler;
 mod pixel_buffer;
 mod session;
+mod stats;
 mod validation;
 
 pub use config::{
@@ -14,8 +15,10 @@ pub use config::{
 };
 pub use frame::{EncodedFrame, FrameData};
 pub use handler::{EncodeHandler, FnEncodeHandler};
+pub use stats::EncoderStats;
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::{
     encoder::session::{push_bitrate_property, push_expected_frame_rate_property},
@@ -23,6 +26,18 @@ use crate::{
     sys,
     types::{CfPtr, cf_dictionary},
 };
+
+/// Video Toolbox のコールバックへ渡すハンドラーと統計値の組
+///
+/// `VTCompressionSessionCreate` の `outputCallbackRefCon` にこの Box の中身のポインタを渡す。
+/// コールバックは Video Toolbox のコールバックスレッドから呼ばれるため、統計値は `Arc` で
+/// 共有し、[`Encoder`] も同じ統計値を参照できるようにする。
+struct EncodeCallbackContext<H: EncodeHandler> {
+    /// ユーザーが指定したハンドラー
+    handler: H,
+    /// コールバックと共有する統計値
+    stats: Arc<EncoderStats>,
+}
 
 /// H.264 / H.265 エンコーダー
 ///
@@ -33,27 +48,36 @@ pub struct Encoder<H: EncodeHandler> {
     config: EncoderConfig,
     next_input_pts: i64,
     // FFI の outputCallbackRefCon にこの Box の中身ポインタを渡しているため、
-    // Encoder の生存期間中は保持し続ける必要がある。Rust 側からは直接参照しない。
-    #[expect(
-        dead_code,
-        reason = "FFI コールバックが Box の中身を借用するので Rust からは触らない"
-    )]
-    handler: Box<H>,
+    // Encoder の生存期間中は保持し続ける必要がある。
+    context: Box<EncodeCallbackContext<H>>,
 }
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
-        let handler = Box::new(handler);
-        let session = unsafe { Self::create_compression_session(&config, handler.as_ref())? };
+        let context = Box::new(EncodeCallbackContext {
+            handler,
+            stats: Arc::new(EncoderStats::default()),
+        });
+        let session = unsafe { Self::create_compression_session(&config, context.as_ref())? };
 
         Ok(Self {
             session,
             config,
             next_input_pts: 0,
-            handler,
+            context,
         })
+    }
+
+    /// エンコーダーの統計値を返す
+    ///
+    /// 戻り値はエンコーダーと共有されている統計値への参照である。エンコーダーを
+    /// 操作するスレッドと Video Toolbox のコールバックスレッドの両方が随時更新する
+    /// ため、複数のフィールドを読む間に値が変化し得る。値を保存しておきたい場合は
+    /// `clone()` する。
+    pub fn stats(&self) -> &EncoderStats {
+        &self.context.stats
     }
 
     /// 現在エンコーダーが内部で保持している設定を返す
@@ -130,6 +154,9 @@ impl<H: EncodeHandler> Encoder<H> {
             let properties_dict = cf_dictionary(&properties)?;
             let status = sys::VTSessionSetProperties(self.session.cast(), properties_dict.0.cast());
             Error::check(status, "VTSessionSetProperties")?;
+
+            // 更新対象が無い no-op と失敗時はここに到達しないため、成功した更新だけを計上する
+            self.context.stats.total_reconfigure_count.inc();
         }
 
         // FFI 成功時のみ self の状態を更新する。
@@ -171,7 +198,8 @@ impl<H: EncodeHandler> Drop for Encoder<H> {
 
 // SAFETY: VTCompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// handler は Box<H> でヒープに隔離されており、Encoder の生存期間中はアドレス不変である。
+// ハンドラーは Box<EncodeCallbackContext<H>> でヒープに隔離されており、
+// Encoder の生存期間中はアドレス不変である。
 unsafe impl<H: EncodeHandler> Send for Encoder<H> {}
 
 #[cfg(test)]
@@ -628,6 +656,50 @@ mod tests {
                 "エンコード開始後に設定した上限が効くようになった (ウィンドウ {i}): {bytes} バイト"
             );
         }
+        Ok(())
+    }
+
+    /// 出力コールバックが `Err` を通知したときに `total_error_count` が増え、
+    /// `in_flight_frames` が減ることを検証する
+    ///
+    /// Video Toolbox のフレームドロップは実機で確実に再現できないため、フレームドロップと
+    /// 同じ「status は成功だが sample_buffer が NULL」の条件で出力コールバックを直接呼び出す。
+    /// この経路はエラーとして利用側へ通知し、in-flight のフレームとしては完了扱いにする。
+    #[test]
+    fn output_callback_counts_error_and_decrements_in_flight() -> Result<(), Error> {
+        let encoder = Encoder::new(base_encoder_config(), noop_handler())?;
+        // 送信済み 1 件ぶんの in-flight を再現する
+        encoder.context.stats.in_flight_frames.inc();
+
+        let context_ptr: *const EncodeCallbackContext<FnEncodeHandler<()>> =
+            encoder.context.as_ref();
+        let user_data_ptr = Box::into_raw(Box::new(()));
+        unsafe {
+            Encoder::<FnEncodeHandler<()>>::output_callback_h264(
+                context_ptr.cast_mut().cast::<c_void>(),
+                user_data_ptr.cast::<c_void>(),
+                0,
+                0,
+                std::ptr::null_mut(),
+            );
+        }
+
+        let stats = encoder.stats();
+        assert_eq!(
+            stats.total_output_frame_count.get(),
+            0,
+            "出力データが無いフレームは出力フレーム数に計上しないこと"
+        );
+        assert_eq!(
+            stats.total_error_count.get(),
+            1,
+            "sample_buffer が NULL のフレームはエラーとして計上すること"
+        );
+        assert_eq!(
+            stats.in_flight_frames.get(),
+            0,
+            "コールバックが来たフレームは in-flight から外れること"
+        );
         Ok(())
     }
 }

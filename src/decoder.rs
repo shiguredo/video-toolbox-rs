@@ -1,7 +1,9 @@
 use std::ffi::{c_int, c_void};
+use std::sync::Arc;
 
 use crate::{
     error::Error,
+    stats::{Counter, Gauge},
     sys::{self, OpaqueCMBlockBuffer, opaqueCMSampleBuffer},
     types::{
         CfPtrMut, PixelFormat, cf_dictionary, cf_number_i32, validate_video_dimensions_for_toolbox,
@@ -111,6 +113,76 @@ struct PendingDecode<T> {
     sample_buffer: CfPtrMut<opaqueCMSampleBuffer>,
 }
 
+/// デコーダーの統計値
+///
+/// [`Decoder::stats`] が返す共有統計値である。値はデコーダーを操作するスレッドと、
+/// コールバックを実行する Video Toolbox のコールバックスレッドの両方から更新される
+/// ため、各フィールドはスレッドセーフな [`Counter`] / [`Gauge`] で保持する。
+///
+/// `clone()` は各フィールドの現在値を個別にコピーするため、フィールド間の一貫性は
+/// 保証されない。
+#[derive(Debug, Clone, Default)]
+pub struct DecoderStats {
+    /// [`Decoder::decode`] が `VTDecompressionSessionDecodeFrame` に受理された通算回数
+    ///
+    /// CoreMedia オブジェクトの生成に失敗した場合や
+    /// `VTDecompressionSessionDecodeFrame` 自体が失敗した場合は計上しない。
+    pub total_decode_count: Counter,
+
+    /// [`DecodeHandler::on_decoded`] に `Ok` を渡した通算回数
+    ///
+    /// フレームドロップなどで出力画像が得られなかった場合は `Err` になるため、
+    /// このカウンターは増えない ([`DecoderStats::total_error_count`] が増える)。
+    pub total_output_frame_count: Counter,
+
+    /// [`DecodeHandler::on_decoded`] に `Err` を渡した通算回数
+    ///
+    /// `VTDecompressionSessionDecodeFrame` が受理したフレームは、フレームドロップを
+    /// 含めて必ず 1 回コールバックが呼ばれる。出力画像を組み立てられなかった場合は
+    /// エラーとして計上し、正常に出力できた場合だけ
+    /// [`DecoderStats::total_output_frame_count`] に計上する。
+    pub total_error_count: Counter,
+
+    /// `VTDecompressionSessionCreate` に成功した通算回数
+    ///
+    /// [`Decoder::new`] の初回作成と、[`Decoder::update_format`] がセッションを
+    /// 受け入れ不可と判断した場合の再作成の合計である。
+    pub total_create_session_count: Counter,
+
+    /// [`Decoder::update_format`] が現在のセッションを流用した通算回数
+    ///
+    /// `VTDecompressionSessionCanAcceptFormatDescription` が新しい
+    /// FormatDescription を受け入れた場合に計上する。
+    pub total_update_format_count: Counter,
+
+    /// [`Decoder::update_format`] がセッションを再作成した通算回数
+    ///
+    /// [`DecoderStats::total_create_session_count`] の増分のうち、[`Decoder::new`] の
+    /// 初回作成を除いた回数と一致する。
+    pub total_recreate_session_count: Counter,
+
+    /// `VTDecompressionSessionDecodeFrame` に受理されたが、まだ出力コールバックが
+    /// ユーザーデータを回収していないフレーム数の現在値
+    ///
+    /// 送信の直前に増やし、出力コールバックがユーザーデータを回収した時点
+    /// (ユーザーハンドラーの実行前) に減らす。`VTDecompressionSessionDecodeFrame` が
+    /// 失敗した場合は増やさない。フレームドロップでもコールバックは呼ばれるため、
+    /// [`Decoder::finish`] の完了後に 0 に戻る。
+    pub in_flight_frames: Gauge,
+}
+
+/// Video Toolbox のコールバックへ渡すハンドラーと統計値の組
+///
+/// `VTDecompressionSessionCreate` の `decompressionOutputRefCon` にこの Box の中身の
+/// ポインタを渡す。コールバックは Video Toolbox のコールバックスレッドから呼ばれるため、
+/// 統計値は `Arc` で共有し、[`Decoder`] も同じ統計値を参照できるようにする。
+struct DecodeCallbackContext<H: DecodeHandler> {
+    /// ユーザーが指定したハンドラー
+    handler: H,
+    /// コールバックと共有する統計値
+    stats: Arc<DecoderStats>,
+}
+
 /// H.264 / H.265 / VP9 / AV1 デコーダー
 ///
 /// デコード完了時に [`DecodeHandler::on_decoded`] を呼び出す。
@@ -119,13 +191,18 @@ pub struct Decoder<H: DecodeHandler> {
     description: sys::CMVideoFormatDescriptionRef,
     session: sys::VTDecompressionSessionRef,
     pixel_format: PixelFormat,
-    handler: Box<H>,
+    // FFI の decompressionOutputRefCon にこの Box の中身ポインタを渡しているため、
+    // Decoder の生存期間中は保持し続ける必要がある。
+    context: Box<DecodeCallbackContext<H>>,
 }
 
 impl<H: DecodeHandler> Decoder<H> {
     /// デコーダーのインスタンスを生成する
     pub fn new(config: DecoderConfig<'_>, handler: H) -> Result<Self, Error> {
-        let handler = Box::new(handler);
+        let context = Box::new(DecodeCallbackContext {
+            handler,
+            stats: Arc::new(DecoderStats::default()),
+        });
 
         unsafe {
             let description = Self::create_format_description(&config.codec)
@@ -133,7 +210,7 @@ impl<H: DecodeHandler> Decoder<H> {
             let session = Self::create_decompression_session(
                 description,
                 config.pixel_format,
-                handler.as_ref(),
+                context.as_ref(),
             )
             .map_err(|e| {
                 sys::CFRelease(description as *const c_void);
@@ -144,9 +221,19 @@ impl<H: DecodeHandler> Decoder<H> {
                 description,
                 session,
                 pixel_format: config.pixel_format,
-                handler,
+                context,
             })
         }
+    }
+
+    /// デコーダーの統計値を返す
+    ///
+    /// 戻り値はデコーダーと共有されている統計値への参照である。デコーダーを操作する
+    /// スレッドと Video Toolbox のコールバックスレッドの両方が随時更新するため、
+    /// 複数のフィールドを読む間に値が変化し得る。値を保存しておきたい場合は
+    /// `clone()` する。
+    pub fn stats(&self) -> &DecoderStats {
+        &self.context.stats
     }
 
     /// VP9/AV1 コーデックの場合、Video Toolbox の失敗のみ `UnsupportedCodec` に変換する（設定不整合の `InvalidConfig` はそのまま返す）。
@@ -190,13 +277,14 @@ impl<H: DecodeHandler> Decoder<H> {
                 // 受け入れ可能: description のみ差し替え
                 sys::CFRelease(self.description as *const c_void);
                 self.description = new_description;
+                self.context.stats.total_update_format_count.inc();
             } else {
                 // 受け入れ不可能: セッションを再作成
                 // 新しいセッションを先に作成し、失敗時に self が不整合にならないようにする
                 let new_session = match Self::create_decompression_session(
                     new_description,
                     self.pixel_format,
-                    self.handler.as_ref(),
+                    self.context.as_ref(),
                 ) {
                     Ok(session) => session,
                     Err(e) => {
@@ -210,6 +298,7 @@ impl<H: DecodeHandler> Decoder<H> {
                 sys::CFRelease(self.description as *const c_void);
                 self.description = new_description;
                 self.session = new_session;
+                self.context.stats.total_recreate_session_count.inc();
             }
 
             Ok(())
@@ -335,16 +424,22 @@ impl<H: DecodeHandler> Decoder<H> {
     }
 
     /// CMVideoFormatDescription と PixelFormat から VTDecompressionSession を作成する
+    ///
+    /// 成功した場合は [`DecoderStats::total_create_session_count`] を計上する。
+    /// この関数は [`Decoder::new`] の初回作成と [`Decoder::update_format`] の再作成の
+    /// 両方から呼ばれるため、計上も両方の経路をまとめて行う。
     unsafe fn create_decompression_session(
         description: sys::CMVideoFormatDescriptionRef,
         pixel_format: PixelFormat,
-        handler: &H,
+        callback_context: &DecodeCallbackContext<H>,
     ) -> Result<sys::VTDecompressionSessionRef, Error> {
         unsafe {
             let mut session: sys::VTDecompressionSessionRef = std::ptr::null_mut();
             let record = sys::VTDecompressionOutputCallbackRecord {
                 decompressionOutputCallback: Some(Self::output_callback),
-                decompressionOutputRefCon: (handler as *const H).cast::<c_void>().cast_mut(),
+                decompressionOutputRefCon: (callback_context as *const DecodeCallbackContext<H>)
+                    .cast::<c_void>()
+                    .cast_mut(),
             };
 
             let cv_pixel_format = match pixel_format {
@@ -362,6 +457,8 @@ impl<H: DecodeHandler> Decoder<H> {
                 &mut session,
             );
             Error::check(status, "VTDecompressionSessionCreate")?;
+
+            callback_context.stats.total_create_session_count.inc();
 
             Ok(session)
         }
@@ -419,6 +516,11 @@ impl<H: DecodeHandler> Decoder<H> {
 
             let decode_flags = sys::kVTDecodeFrame_EnableAsynchronousDecompression;
             let mut info_flags = 0;
+            // 送信の前に in-flight フレーム数を増やす。VTDecompressionSessionDecodeFrame は
+            // この呼び出しから戻る前に出力コールバックを別スレッドで呼び出すことがある。
+            // 送信後に増やすと、先に走ったコールバックの減算が 0 で飽和して失われ、
+            // in_flight_frames が実際より大きいまま残る。
+            self.context.stats.in_flight_frames.inc();
             let status = sys::VTDecompressionSessionDecodeFrame(
                 self.session,
                 sample_buffer_ref,
@@ -428,8 +530,12 @@ impl<H: DecodeHandler> Decoder<H> {
             );
             if let Err(e) = Error::check(status, "VTDecompressionSessionDecodeFrame") {
                 let _ = Box::from_raw(source_frame_ref_con.cast::<PendingDecode<H::UserData>>());
+                // コールバックも来ないため、送信前に増やした in-flight をここで戻す
+                self.context.stats.in_flight_frames.dec();
                 return Err(e);
             }
+
+            self.context.stats.total_decode_count.inc();
 
             Ok(())
         }
@@ -455,24 +561,35 @@ impl<H: DecodeHandler> Decoder<H> {
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut H> {
+    ) -> Option<&'a mut DecodeCallbackContext<H>> {
         if output_callback_ref_con.is_null() {
             tracing::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
         // SAFETY:
-        // - `output_callback_ref_con` は `Box<H>` のヒープアドレスを指す。
-        //   `Box<H>` のヒープアドレスは `Decoder` の生存期間中不変である。
-        // - FFI コールバックは `&mut H` で排他的にアクセスする。
-        Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
+        // - `output_callback_ref_con` は `Box<DecodeCallbackContext<H>>` のヒープアドレスを指す。
+        //   `Box` のヒープアドレスは `Decoder` の生存期間中不変である。
+        // - FFI コールバックは `&mut DecodeCallbackContext<H>` で排他的にアクセスする。
+        Some(unsafe { &mut *output_callback_ref_con.cast::<DecodeCallbackContext<H>>() })
     }
 
+    /// ハンドラーへ結果を通知し、対応する統計値を計上する
+    ///
+    /// ユーザーハンドラーの panic は [`crate::types::catch_user_panic`] が捕捉するため、
+    /// この関数は必ず戻る。`Ok` は出力フレーム数、`Err` はエラー数として計上する。
+    /// 計上はハンドラーの実行前に行う。ハンドラーが結果を外部へ公開した直後に
+    /// 利用側が統計値を読んでも、その結果ぶんが計上済みであるようにするため。
     fn invoke_callback(
-        handler: &mut H,
+        context: &mut DecodeCallbackContext<H>,
         result: Result<DecodedFrame<H::UserData>, H::Error>,
         callback_name: &'static str,
     ) {
-        crate::types::catch_user_panic(callback_name, || handler.on_decoded(result));
+        if result.is_ok() {
+            context.stats.total_output_frame_count.inc();
+        } else {
+            context.stats.total_error_count.inc();
+        }
+        crate::types::catch_user_panic(callback_name, || context.handler.on_decoded(result));
     }
 
     unsafe extern "C" fn output_callback(
@@ -485,7 +602,7 @@ impl<H: DecodeHandler> Decoder<H> {
         _presentation_duration: sys::CMTime,
     ) {
         let callback_name = "output_callback";
-        let handler =
+        let context =
             unsafe { Self::callback_from_ref_con(decompression_output_ref_con, callback_name) };
 
         // `source_frame_ref_con` の Box は status の成否にかかわらず必ず回収する。
@@ -495,17 +612,23 @@ impl<H: DecodeHandler> Decoder<H> {
             match unsafe { Self::take_pending_decode(source_frame_ref_con, callback_name) } {
                 Ok(p) => p,
                 Err(e) => {
-                    if let Some(h) = handler {
-                        Self::invoke_callback(h, Err(e.into()), callback_name);
+                    if let Some(context) = context {
+                        Self::invoke_callback(context, Err(e.into()), callback_name);
                     }
                     return;
                 }
             };
 
-        let Some(handler) = handler else {
+        let Some(context) = context else {
             // callback_from_ref_con が null。source_frame_ref_con は take_pending_decode 内で消費済み。
+            // この経路は Video Toolbox が refcon を渡さなかった場合に限られ、
+            // 統計値を参照できないため in_flight_frames の減算も行わない。
             return;
         };
+
+        // ユーザーデータを回収した時点でフレームは Video Toolbox の管理から外れるため、
+        // ユーザーハンドラーの実行前に in-flight フレーム数を減らす。
+        context.stats.in_flight_frames.dec();
 
         let PendingDecode {
             user_data,
@@ -514,7 +637,7 @@ impl<H: DecodeHandler> Decoder<H> {
         } = *pending;
 
         if let Err(e) = Error::check(status, callback_name) {
-            Self::invoke_callback(handler, Err(e.into()), callback_name);
+            Self::invoke_callback(context, Err(e.into()), callback_name);
             return;
         }
 
@@ -523,14 +646,14 @@ impl<H: DecodeHandler> Decoder<H> {
             let e = Error::LimitExceeded {
                 reason: "decoded image buffer is null".into(),
             };
-            Self::invoke_callback(handler, Err(e.into()), callback_name);
+            Self::invoke_callback(context, Err(e.into()), callback_name);
             return;
         }
 
         let buffer = match unsafe { PixelBuffer::new(image_buffer) } {
             Ok(buffer) => buffer,
             Err(e) => {
-                Self::invoke_callback(handler, Err(e.into()), callback_name);
+                Self::invoke_callback(context, Err(e.into()), callback_name);
                 return;
             }
         };
@@ -544,7 +667,7 @@ impl<H: DecodeHandler> Decoder<H> {
                 user_data,
             },
         };
-        Self::invoke_callback(handler, Ok(frame), callback_name);
+        Self::invoke_callback(context, Ok(frame), callback_name);
     }
 }
 
@@ -564,7 +687,8 @@ impl<H: DecodeHandler> Drop for Decoder<H> {
 
 // SAFETY: VTDecompressionSession は内部でスレッドセーフに管理されており、
 // Apple のドキュメントでもセッションの操作は異なるスレッドから呼び出し可能とされている。
-// handler は Box<H> でヒープに隔離されており、Decoder の生存期間中はアドレス不変である。
+// ハンドラーは Box<DecodeCallbackContext<H>> でヒープに隔離されており、
+// Decoder の生存期間中はアドレス不変である。
 unsafe impl<H: DecodeHandler> Send for Decoder<H> {}
 
 /// デコードされた映像フレーム

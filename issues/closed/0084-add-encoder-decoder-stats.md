@@ -1,7 +1,7 @@
 # エンコーダー / デコーダーの統計値 API を追加する
 
 - Created: 2026-09-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-10-02
 - Branch: feature/add-encoder-decoder-stats
 - Polished: {YYYY-MM-DD}
 
@@ -73,4 +73,14 @@ nvcodec-rs の `src/stats.rs` と同じ設計を本クレートにも置く。�
 
 ## 解決方法
 
-未着手。
+`src/stats.rs` に `Counter` (通算値) / `Gauge` (時点値) を新設し、`src/lib.rs` から再公開した。`Gauge` の crate 内 API は、`in_flight_frames` を送信側スレッドと出力コールバック側スレッドの双方から増減させるため、nvcodec-rs の `set` ではなく `inc` / `dec` とした。`dec` は 0 で飽和させ、増減の対応が崩れた場合に `u64` の桁溢れで巨大な値に見えるのを避けている。
+
+`src/encoder/stats.rs` の `EncoderStats` と `src/decoder.rs` の `DecoderStats` を新設し、`Encoder::stats()` / `Decoder::stats()` が共有統計値への参照を返すようにした。`Encoder` / `Decoder` は統計値を `Arc` で保持し、Video Toolbox へ渡す refcon の `EncodeCallbackContext` / `DecodeCallbackContext` から同じ統計値を更新する。
+
+`in_flight_frames` は送信の前に増やし、出力コールバックがユーザーデータを回収した時点 (ユーザーハンドラーの実行前) に減らす。`VTCompressionSessionEncodeFrame` / `VTDecompressionSessionDecodeFrame` はこの呼び出しから戻る前にコールバックを呼ぶことがあるため、送信後に増やすとコールバック側の減算が 0 で飽和して失われる。送信関数が失敗した場合はコールバックが来ないため、送信前に増やした分をその場で戻す。通算値の計上はユーザーハンドラーの実行前に行い、ハンドラーが panic しても計上済みの値が変わらないようにした。
+
+`DecoderStats::total_update_format_count` / `total_recreate_session_count` は `Decoder::update_format` の `VTDecompressionSessionCanAcceptFormatDescription` の分岐で計上し、`total_create_session_count` は `VTDecompressionSessionCreate` の成功時に計上する。
+
+テストは `src/stats.rs` と `src/encoder.rs` の単体テスト、`tests/test_encoder.rs` / `tests/test_decoder.rs` に追加した。`in_flight_frames` は、エンコーダーでは出力コールバックをハンドラー内でブロックして保留中の件数を直接検証し、デコーダーでは非同期デコードの完了順序に依存しない不変条件 (送信数 = in-flight + 出力 + エラー) で検証している。
+
+README に「統計値」節、CODEBASE.md の「re-export の許可」に統計値型を再公開する理由、CHANGES.md に `[ADD]` エントリを追加した。
