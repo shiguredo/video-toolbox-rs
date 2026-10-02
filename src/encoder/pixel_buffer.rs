@@ -10,16 +10,17 @@ use crate::{
 };
 
 impl<H: EncodeHandler> Encoder<H> {
-    /// 入力プレーンデータを CVPixelBuffer のプレーンにコピーする
+    /// 入力プレーンの各行を CVPixelBuffer のプレーンの対応する行へコピーする
     ///
-    /// CVPixelBuffer のストライド（bytes_per_row）が入力幅より大きい場合は
-    /// 行ごとにコピーする。
+    /// コピー元とコピー先のストライドがともに `src_width` と一致する場合は一括でコピーし、
+    /// 一致しない場合は行ごとにコピーする。
     unsafe fn copy_plane(
         pixel_buffer: sys::CVPixelBufferRef,
         plane_index: usize,
         src: &[u8],
         src_width: usize,
         src_height: usize,
+        src_stride: usize,
     ) -> Result<(), Error> {
         unsafe {
             let dst = sys::CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, plane_index) as *mut u8;
@@ -30,16 +31,13 @@ impl<H: EncodeHandler> Encoder<H> {
             }
             let dst_stride = sys::CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane_index);
             let cv_plane_height = sys::CVPixelBufferGetHeightOfPlane(pixel_buffer, plane_index);
-            let cv_plane_width = sys::CVPixelBufferGetWidthOfPlane(pixel_buffer, plane_index);
             // 行あたり `dst_stride` バイトしかないのに `src_width` バイトを書くとバッファ外になる
             if dst_stride < src_width {
                 return Err(Error::LimitExceeded {
                     reason: "plane destination stride is less than copy width".into(),
                 });
             }
-            // Core Video の契約では、プレーンは少なくとも `height * bytesPerRow` バイトを指す。
-            // コピー範囲が `CVPixelBuffer` が報告するプレーン寸法を超えないことを検証する。
-            if src_width > cv_plane_width || src_height > cv_plane_height {
+            if src_height > cv_plane_height {
                 return Err(Error::LimitExceeded {
                     reason: "plane copy dimensions exceed CVPixelBuffer plane bounds".into(),
                 });
@@ -50,41 +48,31 @@ impl<H: EncodeHandler> Encoder<H> {
                     .ok_or(Error::LimitExceeded {
                         reason: "plane storage byte length overflow".into(),
                     })?;
-            let write_span = if src_height == 0 {
-                0
-            } else if dst_stride == src_width {
-                src_width
-                    .checked_mul(src_height)
-                    .ok_or(Error::LimitExceeded {
-                        reason: "plane copy byte length overflow".into(),
-                    })?
-            } else {
-                src_height
-                    .checked_sub(1)
-                    .and_then(|r| r.checked_mul(dst_stride))
-                    .and_then(|o| o.checked_add(src_width))
-                    .ok_or(Error::LimitExceeded {
-                        reason: "plane row copy span overflow".into(),
-                    })?
-            };
+            let write_span = Self::plane_copy_span(src_width, src_height, dst_stride)?;
             if write_span > plane_storage {
                 return Err(Error::LimitExceeded {
                     reason: "plane copy would exceed CVPixelBuffer plane storage".into(),
                 });
             }
+            let read_span = Self::plane_copy_span(src_width, src_height, src_stride)?;
+            if read_span > src.len() {
+                return Err(Error::LimitExceeded {
+                    reason: "plane source data is shorter than the copy range".into(),
+                });
+            }
 
-            let copy_size = src_width
-                .checked_mul(src_height)
-                .ok_or(Error::LimitExceeded {
-                    reason: "plane copy byte length overflow".into(),
-                })?;
-            if dst_stride == src_width {
-                // ストライドと入力幅が一致する場合は一括コピー
+            if dst_stride == src_width && src_stride == src_width {
+                // コピー元とコピー先のストライドがコピー幅と一致する場合は一括コピー
+                let copy_size = src_width
+                    .checked_mul(src_height)
+                    .ok_or(Error::LimitExceeded {
+                        reason: "plane copy byte length overflow".into(),
+                    })?;
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, copy_size);
             } else {
                 // ストライドが異なる場合は行ごとにコピー
                 for row in 0..src_height {
-                    let src_off = row.checked_mul(src_width).ok_or(Error::LimitExceeded {
+                    let src_off = row.checked_mul(src_stride).ok_or(Error::LimitExceeded {
                         reason: "plane row source offset overflow".into(),
                     })?;
                     let dst_off = row.checked_mul(dst_stride).ok_or(Error::LimitExceeded {
@@ -99,6 +87,24 @@ impl<H: EncodeHandler> Encoder<H> {
             }
             Ok(())
         }
+    }
+
+    /// 1 行 `width` バイト、`height` 行、行の間隔 `stride` バイトのプレーンを
+    /// コピーするのに必要な範囲の長さを返す
+    ///
+    /// 最終行の先頭から `width` バイトまでを範囲とするため、最終行の後ろの詰め物は含まない。
+    /// コピー元から読み出す範囲とコピー先へ書き込む範囲は、どちらもこの式で求められる。
+    fn plane_copy_span(width: usize, height: usize, stride: usize) -> Result<usize, Error> {
+        if height == 0 {
+            return Ok(0);
+        }
+        height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(stride))
+            .and_then(|offset| offset.checked_add(width))
+            .ok_or(Error::LimitExceeded {
+                reason: "plane copy span overflow".into(),
+            })
     }
 
     /// フレームデータの長さが必要なサイズを満たしているか検証する
@@ -281,27 +287,40 @@ impl<H: EncodeHandler> Encoder<H> {
                 let status = sys::CVPixelBufferLockBaseAddress(image_buffer.0, 0);
                 Error::check(status, "CVPixelBufferLockBaseAddress")?;
                 let _pixel_unlock = CvPixelBufferUnlockGuard(image_buffer.0);
+                // 入力プレーン (FrameData) は行間に詰め物がないため、コピー元のストライドは
+                // 1 行あたりのバイト数と等しい。
                 match frame {
                     FrameData::I420 { y, u, v } => {
-                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
+                        // 4:2:0 なので U / V プレーンは縦横とも輝度の半分になる
+                        let chroma_width = width.div_ceil(2);
+                        let chroma_height = height.div_ceil(2);
+                        Self::copy_plane(image_buffer.0, 0, y, width, height, width)?;
                         Self::copy_plane(
                             image_buffer.0,
                             1,
                             u,
-                            width.div_ceil(2),
-                            height.div_ceil(2),
+                            chroma_width,
+                            chroma_height,
+                            chroma_width,
                         )?;
                         Self::copy_plane(
                             image_buffer.0,
                             2,
                             v,
-                            width.div_ceil(2),
-                            height.div_ceil(2),
+                            chroma_width,
+                            chroma_height,
+                            chroma_width,
                         )?;
                     }
                     FrameData::Nv12 { y, uv } => {
-                        Self::copy_plane(image_buffer.0, 0, y, width, height)?;
-                        Self::copy_plane(image_buffer.0, 1, uv, width, height.div_ceil(2))?;
+                        Self::copy_plane(image_buffer.0, 0, y, width, height, width)?;
+                        // UV プレーンはインターリーブされた 1 プレーンなので、1 行のコピー元は
+                        // 輝度と同じ `width` バイトになる (U と V が 1 サンプルずつ交互に並ぶ)。
+                        // `CVPixelBufferGetWidthOfPlane` が返すのはクロマサンプル対の数
+                        // (`width.div_ceil(2)`) であってバイト数ではないため、幅には使わない。
+                        // 高さは 4:2:0 なので輝度の半分になる。
+                        let chroma_height = height.div_ceil(2);
+                        Self::copy_plane(image_buffer.0, 1, uv, width, chroma_height, width)?;
                     }
                 }
             }

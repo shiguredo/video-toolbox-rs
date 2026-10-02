@@ -71,6 +71,17 @@
     オーバーフロー時はフレームを送信せずに `Error::LimitExceeded` を返す
   - オーバーフロー時は `next_input_pts` を変更しないため、以後の呼び出しも同じエラーを返す
   - @voluntas
+- [FIX] `Encoder::encode` の NV12 入力が UV プレーンのコピーで `Error::LimitExceeded` になり必ず失敗する問題を修正する
+  - プレーンのコピー幅の検査が、1 行あたりのバイト数を `CVPixelBufferGetWidthOfPlane` の戻り値と
+    比較していた。バイプラナー形式のクロマプレーンではこの関数はクロマサンプル対の数を返すため、
+    1 行あたり `width` バイトある UV プレーンが常に寸法超過と判定されていた
+  - プレーンの寸法検査を行数 (`CVPixelBufferGetHeightOfPlane`) のみに限定し、1 行あたりのバイト数は
+    コピー先のストライド (`CVPixelBufferGetBytesPerRowOfPlane`) との比較で検証するようにして、
+    `pixel_format: PixelFormat::Nv12` の `Encoder` で `FrameData::Nv12` をエンコードできるようにする
+  - コピー元の 1 行あたりのバイト数 `src_width` と行の間隔 `src_stride` を別の引数に分け、
+    1 行あたりのバイト数とストライドを混同しないようにする。
+    あわせてコピー元のデータがコピー範囲を満たすことも検証する
+  - @melpon
 
 ### misc
 
