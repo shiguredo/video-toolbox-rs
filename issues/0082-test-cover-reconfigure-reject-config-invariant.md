@@ -2,7 +2,7 @@
 
 - Priority: Low
 - Created: 2026-08-06
-- Completed:
+- Completed: 2026-10-02
 - Model: deepseek-v4-flash
 - Branch: feature/add-reconfigure-reject-config-invariant-test
 - Polished: {YYYY-MM-DD}
@@ -28,3 +28,21 @@
 - `reconfigure_rejects_*` 系テストがすべて通過する
 - `cargo test --test test_encoder` で全テストが通る
 - `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` が通る
+
+## 解決方法
+
+`tests/test_encoder.rs` の `reconfigure_err` ヘルパーを変更し、`reconfigure` 呼び出しの前後で
+`config()` の `average_bitrate` / `fps_numerator` / `fps_denominator` / `data_rate_limits` を
+比較して、拒否時に設定が変更されないことを検証するようにした。拒否系テストはすべて同ヘルパーを
+経由するため、エラー種別の検証に加えて設定の不変性が全ケースで確認される。
+
+期待値は呼び出し前の `config()` から取得している。検証エラーは `validate_reconfigure_params` が
+`self` に触れる前に返すため、呼び出し前の値がそのまま拒否後の期待値になる。
+
+検証が実際に回帰を検出することは、`Encoder::reconfigure` の検証前に `self.config` を書き換える
+回帰を一時注入し、`reconfigure_rejects_zero_bitrate` が
+`拒否された reconfigure が average_bitrate を変更している` で失敗することを確認した。
+
+なお、本文の「`reconfigure_rejects_*` 系 7 テスト」は実数と一致していなかった。
+`tests/test_encoder.rs` 側の拒否系テストは 5 件で、同じ不変性は
+`pbt/tests/prop_encoder.rs` の `encoder_reconfigure_rejects_invalid_params` が既に検証している。
