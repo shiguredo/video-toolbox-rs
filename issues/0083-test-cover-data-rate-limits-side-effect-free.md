@@ -2,7 +2,7 @@
 
 - Priority: Low
 - Created: 2026-08-06
-- Completed:
+- Completed: 2026-10-02
 - Model: deepseek-v4-flash
 - Branch: feature/add-data-rate-limits-side-effect-free-test
 - Polished: {YYYY-MM-DD}
@@ -27,3 +27,23 @@
 - `data_rate_limits` の反映・解除の検証が維持されている
 - `cargo test --test test_encoder` で全テストが通る
 - `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` が通る
+
+## 解決方法
+
+コード変更なしで closed にした。本 issue の前提が既に失われており、現行 API に「`data_rate_limits` のみ更新」というパターン自体が存在しないため。
+
+- `ReconfigureParams` から `data_rate_limits` が外れ、`EncoderConfig` の構築時専用フィールドになっている。
+  動的に更新できる項目は `average_bitrate` / `expected_frame_rate` の 2 つだけである
+- 本 issue が前提にしていた `reconfigure_updates_data_rate_limits` テストと
+  「3 フィールドのうち 3 パターン目を追加する」という論点は、この変更に伴い消滅した
+- 2 項目になった `ReconfigureParams` の片肺更新は、`reconfigure_updates_only_average_bitrate` と
+  `reconfigure_updates_only_expected_frame_rate` で対側不変まで検証済みであり、
+  単独更新パターンは網羅されている
+
+`data_rate_limits` 自体の検証は、構築時の反映 (`encoder_accepts_two_data_rate_limits` /
+`new_accepts_empty_data_rate_limits`)、拒否時の不変 (`encoder_reconfigure_rejects_invalid_params`)、
+エンコード開始後の変更が効かないこと (`data_rate_limits_mid_stream_change_has_no_effect`) で
+別途カバーされている。
+
+`cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` /
+`cargo test --test test_encoder` はいずれも成功することを確認した。
