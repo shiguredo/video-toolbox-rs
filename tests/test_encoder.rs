@@ -3,18 +3,21 @@
 mod helpers;
 
 use std::{
+    ffi::c_void,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, channel},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use shiguredo_video_toolbox::{
-    CodecConfig, DataRateLimit, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error,
-    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
-    HevcProfile, PixelFormat, ReconfigureParams,
+    CodecConfig, DataRateLimit, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, EncodeHandler,
+    EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
+    PixelFormat, ReconfigureParams,
 };
 
 const WIDTH: u32 = 960;
@@ -22,6 +25,74 @@ const HEIGHT: u32 = 480;
 const SIZE: usize = WIDTH as usize * HEIGHT as usize;
 type EncodeResult<T> = Result<EncodedFrame<T>, Error>;
 type SharedEncodeResults<T> = Arc<Mutex<Vec<EncodeResult<T>>>>;
+
+/// `sys` モジュールは private のため、`Encoder::encode_pixel_buffer` に渡す CVPixelBuffer を
+/// 用意するために CoreVideo の関数をテスト側で宣言する。宣言は bindgen が生成する
+/// `src/sys.rs` のシグネチャと一致させること。
+mod cv {
+    use std::ffi::c_void;
+
+    /// CFAllocatorRef (null 許容)
+    pub type CFAllocatorRef = *const c_void;
+    /// CFDictionaryRef (null 許容)
+    pub type CFDictionaryRef = *const c_void;
+    /// CVImageBufferRef / CVPixelBufferRef
+    pub type CVImageBufferRef = *mut c_void;
+    /// CVReturn
+    pub type CVReturn = i32;
+
+    /// kCVPixelFormatType_32BGRA
+    pub const PIXEL_FORMAT_32BGRA: u32 = 0x4247_5241;
+    /// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange (FourCC '420v')
+    pub const PIXEL_FORMAT_420_BIPLANAR_VIDEO_RANGE: u32 = 0x3432_3076;
+    /// kCVPixelFormatType_420YpCbCr8Planar (FourCC 'y420')
+    pub const PIXEL_FORMAT_420_PLANAR: u32 = 0x7934_3230;
+
+    unsafe extern "C" {
+        /// 指定サイズ・ピクセルフォーマットの CVPixelBuffer を生成する
+        pub fn CVPixelBufferCreate(
+            allocator: CFAllocatorRef,
+            width: usize,
+            height: usize,
+            pixel_format_type: u32,
+            pixel_buffer_attributes: CFDictionaryRef,
+            pixel_buffer_out: *mut CVImageBufferRef,
+        ) -> CVReturn;
+
+        /// CVPixelBuffer の参照カウントを 1 減らす
+        pub fn CVPixelBufferRelease(pixel_buffer: CVImageBufferRef);
+    }
+}
+
+/// 指定サイズ・ピクセルフォーマットの CVPixelBuffer を生成し、`f` に生ポインタを渡す
+///
+/// `f` の実行中はバッファを所有し、終了後に `CVPixelBufferRelease` で解放する。
+/// `f` の中で `CVPixelBufferRetain` されることを前提とした使い方を想定している。
+fn with_pixel_buffer<T>(
+    width: u32,
+    height: u32,
+    pixel_format_type: u32,
+    f: impl FnOnce(*mut c_void) -> T,
+) -> T {
+    let mut image_buffer: cv::CVImageBufferRef = std::ptr::null_mut();
+    let status = unsafe {
+        cv::CVPixelBufferCreate(
+            std::ptr::null(),
+            width as usize,
+            height as usize,
+            pixel_format_type,
+            std::ptr::null(),
+            &mut image_buffer,
+        )
+    };
+    assert_eq!(status, 0, "CVPixelBufferCreate が失敗した: status={status}");
+    assert!(!image_buffer.is_null(), "CVPixelBuffer が NULL になった");
+
+    let result = f(image_buffer.cast::<c_void>());
+
+    unsafe { cv::CVPixelBufferRelease(image_buffer) };
+    result
+}
 
 fn minimal_encoder_config() -> EncoderConfig {
     EncoderConfig {
@@ -89,6 +160,19 @@ fn build_i420_black_frame() -> ([u8; SIZE], [u8; SIZE / 4], [u8; SIZE / 4]) {
     ([0; SIZE], [0; SIZE / 4], [0; SIZE / 4])
 }
 
+/// `minimal_encoder_config` (640x480) に合わせた黒の I420 フレームを生成する
+fn build_i420_black_frame_640x480() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let w: usize = 640;
+    let h: usize = 480;
+    let uv_w = w.div_ceil(2);
+    let uv_h = h.div_ceil(2);
+    (
+        vec![0u8; w * h],
+        vec![0u8; uv_w * uv_h],
+        vec![0u8; uv_w * uv_h],
+    )
+}
+
 /// エンコード結果を無視するハンドラー (構築・設定の検証だけで完結するテスト用)
 fn noop_encode_handler() -> FnEncodeHandler<()> {
     FnEncodeHandler::new(|_: Result<EncodedFrame<()>, Error>| {})
@@ -127,6 +211,104 @@ fn wait_and_take_results<T>(
         .lock()
         .expect("結果バッファの mutex が poison になっている");
     std::mem::take(&mut *guard)
+}
+
+/// NV12 のデコード結果から取り出したプレーン
+///
+/// `Nv12Frame` のプレーンはデコードコールバックを抜けると無効になるため、コピーして保持する。
+/// エンコード結果をデコードし直し、入力したプレーンの内容が変化していないかを確認するために使う。
+enum DecodedNv12 {
+    /// NV12 でデコードされた結果
+    Frame {
+        /// Y プレーン
+        y_plane: Vec<u8>,
+        /// Y プレーンのストライド
+        y_stride: usize,
+        /// UV プレーン
+        uv_plane: Vec<u8>,
+        /// UV プレーンのストライド
+        uv_stride: usize,
+    },
+    /// NV12 以外のフォーマットでデコードされた (テストの前提が壊れている)
+    UnexpectedFormat,
+    /// デコードに失敗した
+    Failed(String),
+}
+
+/// NV12 のデコード結果をテスト本体のスレッドへ受け流すチャネルを返す
+///
+/// `DecodeHandler` は Video Toolbox のコールバックスレッドから呼ばれるため、結果を
+/// `mpsc::channel` でテスト本体のスレッドへ渡す。`DecodedFrame` は `Send` ではなく、
+/// コールバックを抜けるとプレーンも無効になるため、プレーンをコピーして送る。
+fn nv12_decode_collector() -> (Receiver<DecodedNv12>, FnDecodeHandler<u64>) {
+    let (sender, receiver) = channel();
+    let handler = FnDecodeHandler::new(move |result: Result<DecodedFrame<u64>, Error>| {
+        let decoded = match result {
+            Ok(DecodedFrame::Nv12 { frame, .. }) => DecodedNv12::Frame {
+                y_plane: frame.y_plane().to_vec(),
+                y_stride: frame.y_stride(),
+                uv_plane: frame.uv_plane().to_vec(),
+                uv_stride: frame.uv_stride(),
+            },
+            Ok(DecodedFrame::I420 { .. }) => DecodedNv12::UnexpectedFormat,
+            Err(e) => DecodedNv12::Failed(format!("デコードに失敗した: {e}")),
+        };
+        if sender.send(decoded).is_err() {
+            eprintln!("デコード結果の受信側が既に破棄されている");
+        }
+    });
+    (receiver, handler)
+}
+
+/// デコードコールバックの結果を 1 件受け取る
+fn recv_decoded_nv12(receiver: &Receiver<DecodedNv12>) -> DecodedNv12 {
+    receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("デコードコールバックが 3 秒以内に届くこと")
+}
+
+/// 16 と 235 の 2 値だけで構成したプレーンが、欠落やずれなく転送されていることを検証する
+///
+/// 非可逆圧縮で値そのものは変化するが、この 2 値が入れ替わることはないため、
+/// 中間値の 128 を境にした大小関係で判定する。転送されなかった領域は 0 のまま残るので、
+/// 期待値が 235 の位置が 0 になれば検出できる。
+///
+/// `original_stride` / `decoded_stride` はそれぞれの行の先頭から次の行の先頭までのバイト数で、
+/// 有効な `width` バイトだけを比較する。
+fn assert_binary_plane_matches(
+    original: &[u8],
+    original_stride: usize,
+    decoded: &[u8],
+    decoded_stride: usize,
+    width: usize,
+    height: usize,
+    label: &str,
+) {
+    assert!(
+        decoded_stride >= width,
+        "{label} プレーンのストライドが幅より小さい: {decoded_stride} < {width}"
+    );
+    assert!(
+        decoded.len() >= height * decoded_stride,
+        "{label} プレーンの長さが不足している: {} < {}",
+        decoded.len(),
+        height * decoded_stride
+    );
+    for row in 0..height {
+        for col in 0..width {
+            let expected = original[row * original_stride + col];
+            let actual = decoded[row * decoded_stride + col];
+            let matched = if expected >= 128 {
+                actual >= 128
+            } else {
+                actual < 128
+            };
+            assert!(
+                matched,
+                "{label} プレーンの内容が入力と一致しない: 行 {row} 列 {col} 期待 {expected} 実際 {actual}"
+            );
+        }
+    }
 }
 
 fn encode_black_frame_roundtrip(is_h265: bool) -> Result<(), Error> {
@@ -490,6 +672,691 @@ fn encode_rejects_pixel_format_mismatch_i420_encoder_with_nv12_frame() -> Result
             .expect("結果バッファの mutex が poison になっている")
             .is_empty()
     );
+    Ok(())
+}
+
+/// Nv12 設定のエンコーダーに Nv12 フレームを渡すと、2 プレーンの CVPixelBuffer を生成して
+/// エンコードが成功することを検証する (I420 経路だけが通っていた Nv12 のプラナーコピーを検証する)
+#[test]
+fn encode_nv12_frame_succeeds() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut enc = Encoder::new(
+        minimal_nv12_encoder_config(),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    // 640x480 の NV12: Y が 640*480、UV が 640*240
+    let y = vec![0u8; 640 * 480];
+    let uv = vec![128u8; 640 * 240];
+    enc.encode(
+        &FrameData::Nv12 { y: &y, uv: &uv },
+        &EncodeOptions::default(),
+        42,
+    )?;
+    enc.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match &callbacks[0] {
+        Ok(frame) => {
+            assert_eq!(frame.user_data, 42);
+            assert!(
+                !frame.data.is_empty(),
+                "Nv12 フレームのエンコード結果が空になっている"
+            );
+        }
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+    }
+    Ok(())
+}
+
+/// Nv12 設定のエンコーダーに Nv12 フレームを渡したとき、Y / UV プレーンの内容が
+/// 欠落せずにエンコードされていることを、デコード結果との比較で検証する
+///
+/// `Encoder::encode` は入力プレーンを `CVPixelBuffer` へコピーするが、コピー幅を誤っても
+/// エンコード自体は成功し、結果のビットストリームも空にならない。そのため
+/// `encode_nv12_frame_succeeds` ではこの不具合を検出できない。エンコード結果をデコードし直して
+/// 入力プレーンと比較することで、コピーの欠落を検出する。
+///
+/// プレーンは 16 と 235 の 2 値だけで構成する。UV プレーンの各行の後半が転送されない不具合では
+/// 右半分が 0 のまま残るため、2 値の大小関係が崩れて検出できる。
+#[test]
+fn encode_nv12_frame_preserves_plane_content() -> Result<(), Error> {
+    const W: usize = 640;
+    const H: usize = 480;
+    // 4:2:0 なので UV プレーンの行数は Y の半分になる
+    const CHROMA_H: usize = H / 2;
+
+    // Y は左半分を 16、右半分を 235 にする。Y プレーンのコピーは元から正しいため、
+    // この検証が通ることはエンコードとデコードの経路自体が生きていることの対照になる。
+    let mut y = vec![16u8; W * H];
+    for row in 0..H {
+        for col in W / 2..W {
+            y[row * W + col] = 235;
+        }
+    }
+
+    // UV は偶数バイト目が U、奇数バイト目が V のインターリーブ。
+    // 左半分を U=16 / V=235、右半分を U=235 / V=16 にする。U と V を左右で入れ替えているため、
+    // U / V の取り違えも検出できる。
+    let mut uv = vec![16u8; W * CHROMA_H];
+    for row in 0..CHROMA_H {
+        for col in 0..W {
+            let is_u = col % 2 == 0;
+            let is_left = col < W / 2;
+            let high = if is_u { !is_left } else { is_left };
+            uv[row * W + col] = if high { 235 } else { 16 };
+        }
+    }
+
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        minimal_nv12_encoder_config(),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+    // パラメータセットをデコーダーに渡すため、キーフレームとしてエンコードする
+    encoder.encode(
+        &FrameData::Nv12 { y: &y, uv: &uv },
+        &EncodeOptions {
+            force_key_frame: true,
+        },
+        0,
+    )?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1, "エンコードコールバックは 1 件届くこと");
+    let encoded = match &callbacks[0] {
+        Ok(frame) => frame,
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+    };
+    assert_eq!(encoded.sps_list.len(), 1, "SPS は 1 組得られること");
+    assert_eq!(encoded.pps_list.len(), 1, "PPS は 1 組得られること");
+
+    let (receiver, handler) = nv12_decode_collector();
+    let mut decoder = Decoder::new(
+        DecoderConfig {
+            codec: DecoderCodec::H264 {
+                sps: &encoded.sps_list[0],
+                pps: &encoded.pps_list[0],
+                nalu_len_bytes: 4,
+            },
+            pixel_format: PixelFormat::Nv12,
+        },
+        handler,
+    )?;
+    decoder.decode(&encoded.data, 0)?;
+    decoder.finish()?;
+
+    let event = recv_decoded_nv12(&receiver);
+    let (y_plane, y_stride, uv_plane, uv_stride) = match &event {
+        DecodedNv12::Frame {
+            y_plane,
+            y_stride,
+            uv_plane,
+            uv_stride,
+        } => (y_plane, *y_stride, uv_plane, *uv_stride),
+        DecodedNv12::UnexpectedFormat => {
+            panic!("NV12 のデコード結果を期待したが I420 が届いた")
+        }
+        DecodedNv12::Failed(message) => panic!("デコード結果が得られていない: {message}"),
+    };
+
+    assert_binary_plane_matches(&y, W, y_plane, y_stride, W, H, "Y");
+    assert_binary_plane_matches(&uv, W, uv_plane, uv_stride, W, CHROMA_H, "UV");
+    Ok(())
+}
+
+/// `Encoder::encode_pixel_buffer` に I420 の CVPixelBuffer を渡すとエンコードが成功し、
+/// `user_data` がそのままコールバックに届くことを検証する
+#[test]
+fn encode_pixel_buffer_submits_valid_i420_buffer() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        minimal_encoder_config(),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    with_pixel_buffer(640, 480, cv::PIXEL_FORMAT_420_PLANAR, |image_buffer| {
+        // SAFETY: `image_buffer` は有効な CVPixelBuffer であり、`encode_pixel_buffer` は
+        // 内部で CFRetain するため、このスコープを抜けて解放されても問題ない
+        unsafe { encoder.encode_pixel_buffer(image_buffer, &EncodeOptions::default(), 7) }
+    })?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match &callbacks[0] {
+        Ok(frame) => {
+            assert_eq!(frame.user_data, 7);
+            assert!(
+                !frame.data.is_empty(),
+                "encode_pixel_buffer のエンコード結果が空になっている"
+            );
+        }
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+    }
+    Ok(())
+}
+
+/// `Encoder::encode_pixel_buffer` に I420 / Nv12 のいずれでもない FourCC の CVPixelBuffer を
+/// 渡すと UnknownPixelFormat で拒否され、実際の FourCC が診断情報として返ることを検証する
+#[test]
+fn encode_pixel_buffer_rejects_unknown_pixel_format() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        minimal_encoder_config(),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let result = with_pixel_buffer(640, 480, cv::PIXEL_FORMAT_32BGRA, |image_buffer| {
+        // SAFETY: `image_buffer` は有効な CVPixelBuffer
+        unsafe { encoder.encode_pixel_buffer(image_buffer, &EncodeOptions::default(), 1) }
+    });
+    let err = result.expect_err("32BGRA の CVPixelBuffer は未知のフォーマットとして拒否されること");
+    assert!(matches!(
+        err,
+        Error::UnknownPixelFormat {
+            expected: PixelFormat::I420,
+            fourcc,
+        } if fourcc == cv::PIXEL_FORMAT_32BGRA
+    ));
+    // 画素フォーマットの検証で拒否されるためフレームは送信されない
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// I420 設定のエンコーダーに Nv12 の CVPixelBuffer を渡すと
+/// PixelFormatMismatch (expected: I420 / actual: Nv12) で拒否されることを検証する
+#[test]
+fn encode_pixel_buffer_rejects_pixel_format_mismatch() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        minimal_encoder_config(),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let result = with_pixel_buffer(
+        640,
+        480,
+        cv::PIXEL_FORMAT_420_BIPLANAR_VIDEO_RANGE,
+        |image_buffer| {
+            // SAFETY: `image_buffer` は有効な CVPixelBuffer
+            unsafe { encoder.encode_pixel_buffer(image_buffer, &EncodeOptions::default(), 1) }
+        },
+    );
+    let err = result.expect_err("Nv12 の CVPixelBuffer はフォーマット不一致として拒否されること");
+    assert!(matches!(
+        err,
+        Error::PixelFormatMismatch {
+            expected: PixelFormat::I420,
+            actual: PixelFormat::Nv12,
+        }
+    ));
+    // 画素フォーマットの検証で拒否されるためフレームは送信されない
+    assert!(
+        results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// H.264 のキーフレーム出力が `keyframe: true` かつ SPS / PPS 1 組ずつを持ち、
+/// 2 枚目の非キーフレームにはパラメータセットが付かないことを検証する
+#[test]
+fn h264_keyframe_carries_parameter_sets() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        encoder_config(false),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    // 1 枚目は明示的にキーフレームを要求し、2 枚目は既定 (キーフレーム指定なし) で送る
+    encoder.encode(
+        &frame,
+        &EncodeOptions {
+            force_key_frame: true,
+        },
+        1,
+    )?;
+    encoder.encode(&frame, &EncodeOptions::default(), 2)?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 2);
+    assert_eq!(callbacks.len(), 2);
+    let frames: Vec<EncodedFrame<u64>> = callbacks
+        .into_iter()
+        .map(|r| match r {
+            Ok(frame) => frame,
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+        })
+        .collect();
+
+    let keyframe = frames
+        .iter()
+        .find(|f| f.user_data == 1)
+        .expect("1 枚目のエンコード結果が届いていない");
+    assert!(
+        keyframe.keyframe,
+        "force_key_frame の結果がキーフレームになっていない"
+    );
+    assert_eq!(keyframe.sps_list.len(), 1, "キーフレームには SPS が付く");
+    assert_eq!(keyframe.pps_list.len(), 1, "キーフレームには PPS が付く");
+    assert!(keyframe.vps_list.is_empty(), "H.264 に VPS は無い");
+    assert!(!keyframe.sps_list[0].is_empty(), "SPS が空になっている");
+    assert!(!keyframe.pps_list[0].is_empty(), "PPS が空になっている");
+
+    let delta = frames
+        .iter()
+        .find(|f| f.user_data == 2)
+        .expect("2 枚目のエンコード結果が届いていない");
+    assert!(!delta.keyframe, "2 枚目はキーフレームでないこと");
+    assert!(delta.sps_list.is_empty(), "非キーフレームに SPS は付かない");
+    assert!(delta.pps_list.is_empty(), "非キーフレームに PPS は付かない");
+    assert!(delta.vps_list.is_empty(), "非キーフレームに VPS は付かない");
+    Ok(())
+}
+
+/// H.265 のキーフレーム出力が VPS / SPS / PPS を 1 組ずつ持ち、
+/// 2 枚目の非キーフレームにはパラメータセットが付かないことを検証する
+#[test]
+fn h265_keyframe_carries_parameter_sets() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        encoder_config(true),
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    encoder.encode(
+        &frame,
+        &EncodeOptions {
+            force_key_frame: true,
+        },
+        1,
+    )?;
+    encoder.encode(&frame, &EncodeOptions::default(), 2)?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 2);
+    assert_eq!(callbacks.len(), 2);
+    let frames: Vec<EncodedFrame<u64>> = callbacks
+        .into_iter()
+        .map(|r| match r {
+            Ok(frame) => frame,
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+        })
+        .collect();
+
+    let keyframe = frames
+        .iter()
+        .find(|f| f.user_data == 1)
+        .expect("1 枚目のエンコード結果が届いていない");
+    assert!(
+        keyframe.keyframe,
+        "force_key_frame の結果がキーフレームになっていない"
+    );
+    assert_eq!(keyframe.vps_list.len(), 1, "キーフレームには VPS が付く");
+    assert_eq!(keyframe.sps_list.len(), 1, "キーフレームには SPS が付く");
+    assert_eq!(keyframe.pps_list.len(), 1, "キーフレームには PPS が付く");
+    assert!(!keyframe.vps_list[0].is_empty(), "VPS が空になっている");
+    assert!(!keyframe.sps_list[0].is_empty(), "SPS が空になっている");
+    assert!(!keyframe.pps_list[0].is_empty(), "PPS が空になっている");
+
+    let delta = frames
+        .iter()
+        .find(|f| f.user_data == 2)
+        .expect("2 枚目のエンコード結果が届いていない");
+    assert!(!delta.keyframe, "2 枚目はキーフレームでないこと");
+    assert!(delta.vps_list.is_empty(), "非キーフレームに VPS は付かない");
+    assert!(delta.sps_list.is_empty(), "非キーフレームに SPS は付かない");
+    assert!(delta.pps_list.is_empty(), "非キーフレームに PPS は付かない");
+    Ok(())
+}
+
+/// H.264 の全プロファイル / エントロピー符号化モードの組合せでセッションを構築できることを検証する
+#[test]
+fn encoder_accepts_all_h264_profiles_and_entropy_modes() {
+    for profile in [H264Profile::Baseline, H264Profile::Main, H264Profile::High] {
+        for entropy_mode in [H264EntropyMode::Cavlc, H264EntropyMode::Cabac] {
+            let mut config = minimal_encoder_config();
+            config.codec = CodecConfig::H264(H264EncoderConfig {
+                profile,
+                entropy_mode,
+            });
+            let encoder = Encoder::new(config, noop_encode_handler())
+                .unwrap_or_else(|e| panic!("{profile:?} / {entropy_mode:?} の構築に失敗した: {e}"));
+            assert_eq!(encoder.config().width, 640);
+        }
+    }
+}
+/// H.265 の全プロファイルでセッションを構築できることを検証する
+#[test]
+fn encoder_accepts_all_hevc_profiles() {
+    for profile in [HevcProfile::Main, HevcProfile::Main10] {
+        let mut config = minimal_encoder_config();
+        config.codec = CodecConfig::Hevc(HevcEncoderConfig {
+            profile,
+            allow_open_gop: false,
+        });
+        let encoder = Encoder::new(config, noop_encode_handler())
+            .unwrap_or_else(|e| panic!("{profile:?} のセッション構築に失敗した: {e}"));
+        assert_eq!(encoder.config().width, 640);
+    }
+}
+
+/// I420 の V プレーン長が不足していると InsufficientFrameData (plane: V) で拒否されることを検証する
+///
+/// Y / U の不足は既存テストで検証済みだが、V の検証が欠落していても Y / U のテストでは検出できない。
+#[test]
+fn encode_rejects_insufficient_i420_v_plane() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_encoder_config(), noop_encode_handler())?;
+    let y = vec![0u8; 640 * 480];
+    let u = vec![0u8; 320 * 240];
+    let v = [0u8; 1];
+    let r = enc.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        (),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::InsufficientFrameData { plane, expected, actual })
+            if plane == "V" && expected == 320 * 240 && actual == 1
+    ));
+    Ok(())
+}
+
+/// Nv12 の Y プレーン長が不足していると InsufficientFrameData (plane: Y) で拒否されることを検証する
+///
+/// UV プレーンの不足は既存テストで検証済みだが、Y の検証が欠落していても UV のテストでは検出できない。
+#[test]
+fn encode_rejects_insufficient_nv12_y_plane() -> Result<(), Error> {
+    let mut enc = Encoder::new(minimal_nv12_encoder_config(), noop_encode_handler())?;
+    let y = [0u8; 1];
+    let uv = vec![0u8; 640 * 240];
+    let r = enc.encode(
+        &FrameData::Nv12 { y: &y, uv: &uv },
+        &EncodeOptions::default(),
+        (),
+    );
+    assert!(matches!(
+        r,
+        Err(Error::InsufficientFrameData { plane, expected, actual })
+            if plane == "Y" && expected == 640 * 480 && actual == 1
+    ));
+    Ok(())
+}
+
+/// `allow_open_gop: false` / `allow_temporal_compression: false` のセッションでも
+/// エンコードが成功することを検証する
+///
+/// どちらも false のときにのみ Video Toolbox のプロパティを設定する分岐を持つため、
+/// true の組み合わせだけでは分岐が実行されない。
+#[test]
+fn encoder_accepts_disabled_open_gop_and_temporal_compression() -> Result<(), Error> {
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut config = encoder_config(true);
+    config.allow_temporal_compression = false;
+    config.max_key_frame_interval = std::num::NonZeroU32::new(30);
+    config.codec = CodecConfig::Hevc(HevcEncoderConfig {
+        profile: HevcProfile::Main,
+        allow_open_gop: false,
+    });
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        1,
+    )?;
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 1);
+    assert_eq!(callbacks.len(), 1);
+    match &callbacks[0] {
+        Ok(frame) => assert!(!frame.data.is_empty()),
+        Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+    }
+    Ok(())
+}
+
+/// `data_rate_limits` に 2 個のリミットを指定したセッションを構築できることを検証する
+///
+/// Video Toolbox の仕様上指定できるのは 0〜2 個で、3 個以上の拒否は既存テストで検証済みだが、
+/// 上限個数 (2 個) の受理は検証されていない。
+#[test]
+fn encoder_accepts_two_data_rate_limits() -> Result<(), Error> {
+    let mut config = minimal_encoder_config();
+    config.data_rate_limits = vec![
+        DataRateLimit {
+            bytes: 93_750,
+            window: Duration::from_secs(1),
+        },
+        DataRateLimit {
+            bytes: 187_500,
+            window: Duration::from_secs(2),
+        },
+    ];
+    let encoder = Encoder::new(config, noop_encode_handler())?;
+    assert_eq!(encoder.config().data_rate_limits.len(), 2);
+    Ok(())
+}
+
+/// `Encoder::config()` が H.265 / Nv12 の設定も入力どおりに返すことを検証する
+///
+/// 既存の `encoder_config_returns_initial_value` は H.264 / I420 のみを検証しているため、
+/// `CodecConfig::Hevc` バリアントと `PixelFormat::Nv12` の保持も固定する。
+#[test]
+fn encoder_config_returns_hevc_and_nv12_values() -> Result<(), Error> {
+    let mut config = minimal_nv12_encoder_config();
+    config.codec = CodecConfig::Hevc(HevcEncoderConfig {
+        profile: HevcProfile::Main10,
+        allow_open_gop: true,
+    });
+    let encoder = Encoder::new(config, noop_encode_handler())?;
+
+    assert_eq!(encoder.config().pixel_format, PixelFormat::Nv12);
+    match &encoder.config().codec {
+        CodecConfig::Hevc(hevc) => {
+            assert_eq!(hevc.profile, HevcProfile::Main10);
+            assert!(hevc.allow_open_gop);
+        }
+        other => panic!("Hevc バリアントが保持されていない: {other:?}"),
+    }
+    Ok(())
+}
+
+/// ユーザー定義の [`EncodeHandler`] 実装が、独自の `UserData` / `Error` 型で動作することを検証する
+///
+/// 本クレートはバックエンド間でコールバックモデルを揃えるため `EncodeHandler` トレイトを
+/// 公開しているが、既存テストは `FnEncodeHandler` しか使っていない。トレイトの契約
+/// (`type UserData` / `type Error: From<Error>` / `on_encoded`) を独自実装で固定する。
+/// なおエンコードコールバックが `Err` になる経路 (フレームドロップ等) は公開 API から
+/// 確実に再現できないため、ここでは正常系のみを検証する。
+#[test]
+fn custom_encode_handler_receives_user_data() -> Result<(), Error> {
+    /// テスト内で使う結果バッファの型 (型の入れ子が深いため別名を付ける)
+    type Results = Arc<Mutex<Vec<Result<EncodedFrame<String>, CustomError>>>>;
+
+    /// ユーザー定義のエラー型 (`From<Error>` を実装する)
+    #[derive(Debug)]
+    struct CustomError(Error);
+
+    impl From<Error> for CustomError {
+        fn from(e: Error) -> Self {
+            Self(e)
+        }
+    }
+
+    /// 包んだエラーを表示できるようにする (この実装がフィールドを読む)
+    impl std::fmt::Display for CustomError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "custom error: {}", self.0)
+        }
+    }
+
+    /// ユーザー定義のハンドラー
+    ///
+    /// Video Toolbox のコールバックは別スレッドから呼ばれるため、結果は `Mutex` で保護した
+    /// ベクターに積む。検証は `encode` / `finish` の完了後に同じテストスレッドで行う。
+    struct CustomHandler {
+        /// 受け取った結果を蓄積する
+        results: Results,
+    }
+
+    impl EncodeHandler for CustomHandler {
+        type UserData = String;
+        type Error = CustomError;
+
+        fn on_encoded(&mut self, result: Result<EncodedFrame<String>, Self::Error>) {
+            self.results
+                .lock()
+                .expect("結果バッファの mutex が poison になっている")
+                .push(result);
+        }
+    }
+
+    let results: Results = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        minimal_encoder_config(),
+        CustomHandler {
+            results: Arc::clone(&results),
+        },
+    )?;
+    let (y, u, v) = build_i420_black_frame_640x480();
+    encoder.encode(
+        &FrameData::I420 {
+            y: &y,
+            u: &u,
+            v: &v,
+        },
+        &EncodeOptions::default(),
+        "custom user data".to_string(),
+    )?;
+    encoder.finish()?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let count = results
+            .lock()
+            .expect("結果バッファの mutex が poison になっている")
+            .len();
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "独自ハンドラーのコールバックが届くのを待ってタイムアウトした"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut guard = results
+        .lock()
+        .expect("結果バッファの mutex が poison になっている");
+    assert_eq!(guard.len(), 1, "コールバックは 1 件届くこと");
+    match guard.pop().expect("コールバック結果が届いていない") {
+        Ok(frame) => {
+            assert_eq!(frame.user_data, "custom user data");
+            assert!(!frame.data.is_empty());
+        }
+        Err(e) => panic!("独自ハンドラーにエラーが届いた: {e:?}"),
+    }
     Ok(())
 }
 

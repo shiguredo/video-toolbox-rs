@@ -172,6 +172,18 @@
   - 圧縮セッション生成の成功パスで `std::mem::forget` を直接呼んでいた箇所を `into_raw` に置き換え、
     所有権の移転をコード上で明示する
   - @melpon
+- [UPDATE] 未カバーだった公開 API のテストを追加する
+  - `Decoder::update_format` の description 差し替えパスとセッション再作成パス、
+    および空のパラメータセット・不正な `nalu_len_bytes` の拒否を検証する
+  - `Encoder::encode_pixel_buffer` の正常系と `UnknownPixelFormat` / `PixelFormatMismatch` を検証する
+  - `PixelFormat::Nv12` でのデコードと `Nv12Frame` の全メソッド、
+    `I420Frame` の U / V プレーン関連メソッドを PSNR で検証する
+  - `Error` の Display の未テスト 5 バリアントと `std::error::Error` の実装を検証する
+  - `FrameData::Nv12` のエンコード（UV プレーンの内容をデコード結果と比較して検証する）、
+    キーフレームの `keyframe` / パラメータセット、
+    `nalu_len_bytes` 1 / 2 の受理、全プロファイル・エントロピー符号化モードでのセッション構築、
+    ユーザー定義の `EncodeHandler` / `DecodeHandler`、`supported_codecs` のプロファイル照会も検証する
+  - @melpon
 
 ## 2026.1.1
 
