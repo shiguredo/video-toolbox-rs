@@ -26,16 +26,21 @@
 ## re-export の許可
 
 - `shiguredo-rust` 規約は原則として re-export を禁止しているが、本クレートでは
-  `encoder` モジュールのサブモジュール分割に伴い、公開 API のパス維持のため
-  `src/encoder.rs` での `pub use` による再公開を**許可済み**とする
+  公開 API のパス維持と統計値型の公開のため、`pub use` による再公開を**許可済み**とする
 - 許可の根拠
   - `src/encoder.rs` をディレクトリモジュール (`src/encoder/`) に分割した際、
     `EncoderConfig` / `ReconfigureParams` / `FrameData` / `EncodeHandler` 等の公開型が
     サブモジュール (`config` / `frame` / `handler`) に移動した
   - `src/lib.rs` の `pub use encoder::{...}` と外部呼び出し側 (`use shiguredo_video_toolbox::Encoder`)
     のパスを変えずに分割を実現するため、親モジュールでの re-export が必要
-  - モジュール構造の内部変更（分割）で公開 API のパスを維持するための例外的な許可であり、
-    新たな re-export を追加する場合は、必ず本ドキュメントに理由と共に追記すること
+  - 統計値型 (`Counter` / `Gauge` / `EncoderStats` / `DecoderStats`) は、実装モジュール
+    (`src/stats.rs` / `src/encoder/stats.rs`) を公開 API のパスに出さず、
+    `shiguredo_video_toolbox::Counter` のように参照できるようにするため `src/lib.rs` から再公開する
+  - 統計値型は shiguredo のビデオコーデックバックエンド 4 クレート
+    （`nvcodec-rs` / `vpl-rs` / `amf-rs` / 本クレート）で型名と参照パスを揃えており、
+    利用側 (Hisui 等) がバックエンドを切り替えても同じコードでメトリクスを扱えるようにする必要がある
+  - モジュール構造の内部変更（分割）や統計値型の公開で API のパスを維持し、統一するための
+    例外的な許可であり、新たな re-export を追加する場合は、必ず本ドキュメントに理由と共に追記すること
 
 ## catch_unwind の許可
 

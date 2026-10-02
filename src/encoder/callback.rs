@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 
 use crate::{
-    encoder::{Encoder, frame::EncodedFrame, handler::EncodeHandler},
+    encoder::{EncodeCallbackContext, Encoder, frame::EncodedFrame, handler::EncodeHandler},
     error::Error,
     sys,
 };
@@ -32,24 +32,35 @@ impl<H: EncodeHandler> Encoder<H> {
     unsafe fn callback_from_ref_con<'a>(
         output_callback_ref_con: *mut c_void,
         callback_name: &'static str,
-    ) -> Option<&'a mut H> {
+    ) -> Option<&'a mut EncodeCallbackContext<H>> {
         if output_callback_ref_con.is_null() {
             tracing::error!("{callback_name}: output_callback_ref_con is null");
             return None;
         }
         // SAFETY:
-        // - `output_callback_ref_con` は `Box<H>` のヒープアドレスを指す。
-        //   `Box<H>` のヒープアドレスは `Encoder` の生存期間中不変である。
-        // - FFI コールバックは `&mut H` で排他的にアクセスする。
-        Some(unsafe { &mut *output_callback_ref_con.cast::<H>() })
+        // - `output_callback_ref_con` は `Box<EncodeCallbackContext<H>>` のヒープアドレスを指す。
+        //   `Box` のヒープアドレスは `Encoder` の生存期間中不変である。
+        // - FFI コールバックは `&mut EncodeCallbackContext<H>` で排他的にアクセスする。
+        Some(unsafe { &mut *output_callback_ref_con.cast::<EncodeCallbackContext<H>>() })
     }
 
+    /// ハンドラーへ結果を通知し、対応する統計値を計上する
+    ///
+    /// ユーザーハンドラーの panic は [`crate::types::catch_user_panic`] が捕捉するため、
+    /// この関数は必ず戻る。`Ok` は出力フレーム数、`Err` はエラー数として計上する。
+    /// 計上はハンドラーの実行前に行う。ハンドラーが結果を外部へ公開した直後に
+    /// 利用側が統計値を読んでも、その結果ぶんが計上済みであるようにするため。
     fn invoke_callback(
-        handler: &mut H,
+        context: &mut EncodeCallbackContext<H>,
         result: Result<EncodedFrame<H::UserData>, H::Error>,
         callback_name: &'static str,
     ) {
-        crate::types::catch_user_panic(callback_name, || handler.on_encoded(result));
+        if result.is_ok() {
+            context.stats.total_output_frame_count.inc();
+        } else {
+            context.stats.total_error_count.inc();
+        }
+        crate::types::catch_user_panic(callback_name, || context.handler.on_encoded(result));
     }
 
     /// VTCompressionSessionCreate に渡す H.264 用の出力コールバック
@@ -107,7 +118,7 @@ impl<H: EncodeHandler> Encoder<H> {
         callback_name: &'static str,
         extract_params: unsafe fn(sys::CMVideoFormatDescriptionRef) -> Result<ParameterSets, Error>,
     ) {
-        let handler =
+        let context =
             unsafe { Self::callback_from_ref_con(output_callback_ref_con, callback_name) };
 
         // `source_frame_ref_con` の Box は status の成否にかかわらず必ず回収する。
@@ -116,20 +127,26 @@ impl<H: EncodeHandler> Encoder<H> {
         let user_data = match unsafe { Self::take_user_data(source_frame_ref_con, callback_name) } {
             Ok(data) => data,
             Err(e) => {
-                if let Some(h) = handler {
-                    Self::invoke_callback(h, Err(e.into()), callback_name);
+                if let Some(context) = context {
+                    Self::invoke_callback(context, Err(e.into()), callback_name);
                 }
                 return;
             }
         };
 
-        let Some(handler) = handler else {
+        let Some(context) = context else {
             // callback_from_ref_con が null。source_frame_ref_con は take_user_data 内で消費済み。
+            // この経路は Video Toolbox が refcon を渡さなかった場合に限られ、
+            // 統計値を参照できないため in_flight_frames の減算も行わない。
             return;
         };
 
+        // ユーザーデータを回収した時点でフレームは Video Toolbox の管理から外れるため、
+        // ユーザーハンドラーの実行前に in-flight フレーム数を減らす。
+        context.stats.in_flight_frames.dec();
+
         if let Err(e) = Error::check(status, callback_name) {
-            Self::invoke_callback(handler, Err(e.into()), callback_name);
+            Self::invoke_callback(context, Err(e.into()), callback_name);
             return;
         }
 
@@ -138,7 +155,7 @@ impl<H: EncodeHandler> Encoder<H> {
             let e = Error::LimitExceeded {
                 reason: "encoded sample buffer is null".into(),
             };
-            Self::invoke_callback(handler, Err(e.into()), callback_name);
+            Self::invoke_callback(context, Err(e.into()), callback_name);
             return;
         }
 
@@ -148,7 +165,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 let e = Error::LimitExceeded {
                     reason: "CMSampleBufferGetDataBuffer returned null".into(),
                 };
-                Self::invoke_callback(handler, Err(e.into()), callback_name);
+                Self::invoke_callback(context, Err(e.into()), callback_name);
                 return;
             }
             // `CMBlockBufferGetDataPointer` の戻り長はオフセットからの連続領域長であり、ブロック全体長ではない。
@@ -160,7 +177,7 @@ impl<H: EncodeHandler> Encoder<H> {
                         "CMBlockBufferGetDataLength {block_len} exceeds defensive maximum {MAX_ENCODED_BLOCK_COPY_BYTES}"
                     ),
                 };
-                Self::invoke_callback(handler, Err(e.into()), callback_name);
+                Self::invoke_callback(context, Err(e.into()), callback_name);
                 return;
             }
             let mut data = vec![0u8; block_len];
@@ -171,7 +188,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 data.as_mut_ptr().cast(),
             );
             if let Err(e) = Error::check(status, "CMBlockBufferCopyDataBytes") {
-                Self::invoke_callback(handler, Err(e.into()), callback_name);
+                Self::invoke_callback(context, Err(e.into()), callback_name);
                 return;
             }
 
@@ -184,13 +201,13 @@ impl<H: EncodeHandler> Encoder<H> {
                         reason: "CMSampleBufferGetFormatDescription returned null for keyframe"
                             .into(),
                     };
-                    Self::invoke_callback(handler, Err(e.into()), callback_name);
+                    Self::invoke_callback(context, Err(e.into()), callback_name);
                     return;
                 }
                 match extract_params(description) {
                     Ok(params) => params,
                     Err(e) => {
-                        Self::invoke_callback(handler, Err(e.into()), callback_name);
+                        Self::invoke_callback(context, Err(e.into()), callback_name);
                         return;
                     }
                 }
@@ -206,7 +223,7 @@ impl<H: EncodeHandler> Encoder<H> {
                 data,
                 user_data,
             };
-            Self::invoke_callback(handler, Ok(frame), callback_name);
+            Self::invoke_callback(context, Ok(frame), callback_name);
         }
     }
 

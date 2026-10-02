@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use crate::{
     encoder::{
-        Encoder,
+        EncodeCallbackContext, Encoder,
         config::{
             CodecConfig, DataRateLimit, EncoderConfig, H264EncoderConfig, H264EntropyMode,
             H264Profile, HevcEncoderConfig, HevcProfile,
@@ -94,7 +94,7 @@ impl<H: EncodeHandler> Encoder<H> {
     /// 失敗時は生成済みセッションを関数内で解放してから `Err` を返す。
     pub(super) unsafe fn create_compression_session(
         config: &EncoderConfig,
-        handler: &H,
+        callback_context: &EncodeCallbackContext<H>,
     ) -> Result<sys::VTCompressionSessionRef, Error> {
         unsafe {
             let mut session = std::ptr::null_mut();
@@ -126,9 +126,10 @@ impl<H: EncodeHandler> Encoder<H> {
             };
 
             // SAFETY:
-            // - `outputCallbackRefCon` には `&H` のポインタを渡す。
-            //   `handler` は `Box<H>` でヒープに隔離されており、`Encoder` の生存期間中はアドレス不変である。
-            // - 出力コールバック内で `&mut H` として復元し、ユーザー指定のハンドラを呼び出す (`process_encoded_output`)。
+            // - `outputCallbackRefCon` には `EncodeCallbackContext<H>` のポインタを渡す。
+            //   この構造体は `Box` でヒープに隔離されており、`Encoder` の生存期間中はアドレス不変である。
+            // - 出力コールバック内で `&mut EncodeCallbackContext<H>` として復元し、
+            //   ユーザー指定のハンドラを呼び出す (`process_encoded_output`)。
             let status = VTCompressionSessionCreate(
                 std::ptr::null_mut(),
                 config.width as i32,
@@ -138,7 +139,9 @@ impl<H: EncodeHandler> Encoder<H> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 Some(callback),
-                (handler as *const H).cast::<c_void>().cast_mut(),
+                (callback_context as *const EncodeCallbackContext<H>)
+                    .cast::<c_void>()
+                    .cast_mut(),
                 &mut session,
             );
             Error::check(status, "VTCompressionSessionCreate")?;

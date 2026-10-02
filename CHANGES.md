@@ -82,6 +82,14 @@
     1 行あたりのバイト数とストライドを混同しないようにする。
     あわせてコピー元のデータがコピー範囲を満たすことも検証する
   - @melpon
+- [ADD] エンコーダー / デコーダーの統計値 API (`Counter` / `Gauge` / `EncoderStats` / `DecoderStats`) を追加する
+  - `Encoder::stats()` / `Decoder::stats()` で `total_encode_count` / `total_output_frame_count` /
+    `total_error_count` / `in_flight_frames` などの通算値と現在値を取得できるようにする
+  - `in_flight_frames` で Video Toolbox が処理中のフレーム数を観測でき、利用側が
+    `finish()` を挟む間隔を判断できるようにする
+  - デコーダーでは `update_format()` のセッション流用と再作成の回数を
+    `total_update_format_count` / `total_recreate_session_count` で確認できるようにする
+  - @melpon
 
 ### misc
 
