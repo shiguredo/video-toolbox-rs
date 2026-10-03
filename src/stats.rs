@@ -75,20 +75,14 @@ impl Gauge {
     /// 想定外の挙動で崩れた場合に、`u64` の桁溢れで巨大な値に見えるのを避けるため。
     pub(crate) fn dec(&self) {
         // `AtomicU64::try_update` は 1.95.0 で安定化されたため MSRV 1.93 では使えない。
-        // `AtomicU64::fetch_update` も 1.99.0 で `try_update` への改名により非推奨と
-        // なったため stable では警告になる。どちらのツールチェーンでも警告なしに使える
-        // `compare_exchange_weak` のループで同等の処理を実装する。
-        loop {
-            let current = self.0.load(Ordering::Relaxed);
-            let next = current.saturating_sub(1);
-            if self
-                .0
-                .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-        }
+        // `fetch_update` は 1.99.0 で `try_update` への改名により非推奨となるが、
+        // 開発と CI はツールチェーンを MSRV の 1.93 に固定しているため警告にならない。
+        // MSRV を 1.95 以上に上げる際は `try_update` に置き換えること。
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
     }
 }
 
