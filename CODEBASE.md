@@ -64,3 +64,13 @@
 
 - 本クレートは Video Toolbox の実 FFI を叩くため、テスト実行には macOS が必須
 - CI はセルフホスト（`macOS` / `ARM64`）で動作する。詳細は `README.md` を参照
+
+## MSRV とツールチェーン
+
+- MSRV (最小 Rust バージョン) は `Cargo.toml` と `pbt/Cargo.toml` の `rust-version` に記載する
+- 開発と CI で使うツールチェーンは `rust-toolchain.toml` の `channel` に記載し、MSRV と同じ値に揃えること
+  - rustup は `Cargo.toml` の `rust-version` を参照できず、Cargo も `rust-toolchain.toml` を参照できないため、
+    両者を自動で連携させる仕組みはない
+  - MSRV を変更するときは `Cargo.toml` / `pbt/Cargo.toml` / `rust-toolchain.toml` の 3 ファイルを同時に更新すること
+  - これによりローカルと CI の `cargo` / `rustc` / `clippy` が常に MSRV で動作し、
+    MSRV より新しい API や言語機能の使用を検出できる
