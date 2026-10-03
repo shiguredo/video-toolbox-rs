@@ -251,11 +251,36 @@ fn test_query_encoding_capabilities_depends_on_resolution() {
             "{codec:?} の 1920x1080 と 16384x16384 で同じエンコーダーが選ばれている"
         );
 
-        // ソフトウェアエンコーダーでもプロファイルは取得できる
-        assert!(
-            software.profiles.is_some(),
-            "{codec:?} の 16384x16384 のプロファイルが取得できていない"
-        );
+        // ソフトウェアエンコーダーでもプロファイルは取得できる。
+        // ハードウェア経路と同じくバリアントと中身まで固定する (空の一覧や別のバリアントが
+        // 返っても is_some() だけでは検出できないため)
+        match (codec, software.profiles.as_ref()) {
+            (VideoCodecType::H264, Some(EncodingProfiles::H264(profiles))) => {
+                assert!(
+                    !profiles.is_empty(),
+                    "16384x16384 の H.264 のプロファイルが空になっている"
+                );
+                for profile in [H264EncodingProfile::Main, H264EncodingProfile::High] {
+                    assert!(
+                        profiles.contains(&profile),
+                        "16384x16384 の H.264 のプロファイルに {profile:?} が含まれない: {profiles:?}"
+                    );
+                }
+            }
+            (VideoCodecType::Hevc, Some(EncodingProfiles::Hevc(profiles))) => {
+                assert!(
+                    !profiles.is_empty(),
+                    "16384x16384 の HEVC のプロファイルが空になっている"
+                );
+                assert!(
+                    profiles.contains(&HevcEncodingProfile::Main),
+                    "16384x16384 の HEVC のプロファイルに Main が含まれない: {profiles:?}"
+                );
+            }
+            (codec, profiles) => panic!(
+                "{codec:?} の 16384x16384 のプロファイルが対応するバリアントで返っていない: {profiles:?}"
+            ),
+        }
     }
 }
 

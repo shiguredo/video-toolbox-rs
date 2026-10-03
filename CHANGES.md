@@ -91,9 +91,10 @@
     `total_update_format_count` / `total_recreate_session_count` で確認できるようにする
   - @melpon
 - [CHANGE] `CodecInfo::encoding` をエンコーダー 1 件ずつの一覧 `CodecInfo::encoders` に変更し、`EncodingInfo` を 1 つのエンコーダーの情報にする
-  - `EncodingInfo` の `supported` / `hardware_accelerated` / `supports_frame_reordering` /
-    `supports_multi_pass` を削除する。これらは対象コーデックのエンコーダーの論理和であり、
-    `encoders` が空かどうかと各エントリの属性で判定できる
+  - `EncodingInfo` の `supported` を削除する。これは対象コーデックのエンコーダーが存在するかを
+    表す集計値であり、`encoders` が空かどうかで判定できる
+  - `EncodingInfo` の `hardware_accelerated` / `supports_frame_reordering` / `supports_multi_pass` は、
+    対象コーデックのエンコーダー全体の論理和ではなく、エンコーダー 1 件ごとの属性に変更する
   - `EncodingInfo::profiles` を削除する。利用できるプロファイルは解像度によって変わるため、
     解像度を指定して照会する API に移す
   - `EncodingProfiles` から `None` を削除する。プロファイル情報を取得できなかったことは
@@ -102,6 +103,8 @@
     `supports_frame_reordering` / `supports_multi_pass` / `performance_rating` / `quality_rating` /
     `has_instance_limit` を持つ
   - 解像度の上下限と数値プロパティの範囲は、Video Toolbox から信頼できる値を取得できないため追加しない
+  - `CodecInfo` / `EncodingInfo` / `EncodingCapabilities` は `#[non_exhaustive]` ではないため、
+    構造体リテラルで構築しているコードはフィールドの追加・変更が必要になる
   - @melpon
 - [CHANGE] `DecodingInfo::supported` を削除し、`hardware_accelerated` に一本化する
   - `supported` は `hardware_accelerated` と同じ `VTIsHardwareDecodeSupported` の結果であり、

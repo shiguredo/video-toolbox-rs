@@ -92,12 +92,12 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 | `CodecInfo` | `codec`, `decoding: DecodingInfo`, `encoders: Vec<EncodingInfo>` (`encoders` が空ならエンコード非対応) |
 | `DecodingInfo` | `hardware_accelerated` (`VTIsHardwareDecodeSupported` ベース) |
 | `EncodingInfo` | エンコーダー 1 件の情報。`encoder_id`, `encoder_name`, `codec_name`, `hardware_accelerated`, `supports_frame_reordering`, `supports_multi_pass`, `performance_rating`, `quality_rating`, `has_instance_limit` |
-| `EncodingCapabilities` | `encoder: EncodingInfo` (この解像度で選ばれる 1 件), `profiles: Option<EncodingProfiles>` |
+| `EncodingCapabilities` | `encoder: EncodingInfo` (この解像度で選ばれる 1 件), `profiles: Option<EncodingProfiles>` (このクレートが表現できるプロファイルのみ) |
 | `EncodingProfiles` | `H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)` |
 | `H264EncodingProfile` | `Baseline`, `ConstrainedBaseline`, `Main`, `High`, `ConstrainedHigh` |
 | `HevcEncodingProfile` | `Main`, `Main10`, `Main42210` |
 
-コーデック単位の判定には `VTCopyVideoEncoderList` を使用する。エンコーダーの一覧と各エントリの属性は解像度に依存しないため `supported_codecs()` で取得できる。解像度に依存する情報 (どのエンコーダーが選ばれるか、利用できるプロファイル、その解像度でハードウェアエンコーダーが使えるか) は `supported_codecs()` には含まれず、`query_encoding_capabilities()` で照会する。この関数は `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使うため、`VTCompressionSessionCreate` と同じ既定の選択 (解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ) の結果が返る。この解像度でハードウェアエンコーダーが使えるかは、返る `EncodingInfo::hardware_accelerated` で判定する (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と一致する)。
+コーデック単位の判定には `VTCopyVideoEncoderList` を使用する。エンコーダーの一覧と各エントリの属性は解像度に依存しないため `supported_codecs()` で取得できる。解像度に依存する情報 (どのエンコーダーが選ばれるか、選ばれるエンコーダーが扱うプロファイル、その解像度でハードウェアエンコーダーが使えるか) は `supported_codecs()` には含まれず、`query_encoding_capabilities()` で照会する。この関数は `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使うため、`VTCompressionSessionCreate` と同じ既定の選択 (解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ) の結果が返る。この解像度でハードウェアエンコーダーが使えるかは、返る `EncodingInfo::hardware_accelerated` で判定する (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と一致する)。`profiles` に入るのは、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが `H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけであり、含まれないことが「そのプロファイルが使えない」ことを意味するとは限らない。
 
 ## エラー型
 

@@ -158,7 +158,7 @@ pub struct EncodingInfo {
 /// コーデック固有のエンコードプロファイル情報
 ///
 /// 現在は H.264 と HEVC のプロファイルのみ対応している。
-/// VideoToolbox が VP9 / AV1 エンコードに対応した場合はバリアントを追加する。
+/// Video Toolbox が VP9 / AV1 エンコードに対応した場合はバリアントを追加する。
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodingProfiles {
     /// H.264 プロファイル一覧
@@ -206,9 +206,14 @@ pub struct EncodingCapabilities {
     /// この解像度でハードウェアエンコーダーが使えるかは
     /// [`EncodingInfo::hardware_accelerated`] で判定する。
     pub encoder: EncodingInfo,
-    /// この解像度で利用できるプロファイル
+    /// この解像度で選ばれるエンコーダーが扱うプロファイルの一覧
     ///
-    /// [`EncodingCapabilities::encoder`] が扱うプロファイルの一覧。
+    /// Video Toolbox がプロファイルレベルに指定できる値のうち、本クレートが
+    /// [`H264EncodingProfile`] / [`HevcEncodingProfile`] として表現できるものを格納する。
+    /// Video Toolbox はこれ以外の値も返しうる (H.264 の High 4:2:2 / High 4:4:4 Predictive、
+    /// HEVC の 4:4:4 系や Monochrome 系など) ため、ここに含まれないことが非対応を意味するとは限らない。
+    /// 公開する値は、本クレートのエンコーダー設定で選択できるプロファイルに限っている。
+    ///
     /// Video Toolbox がプロファイル一覧を返さなかった場合は `None`
     /// (`None` はエンコード非対応を意味しない)。
     pub profiles: Option<EncodingProfiles>,
@@ -278,7 +283,7 @@ pub fn query_encoding_capabilities(
 
     // 選ばれたエンコーダーの属性をエンコーダー一覧から引く。一覧から特定できない場合は
     // エンコーダー ID 以外の情報を返せないため、情報が取得できなかったものとして扱う。
-    let encoder = find_encoder_info(codec, query.encoder_id.as_deref()?)?;
+    let encoder = find_encoder_info(codec, &query.encoder_id)?;
 
     // プロファイルは同じサポートプロパティ辞書から読み出す
     let profiles = query_encoding_profiles(codec, query.properties.as_ref());
@@ -292,9 +297,9 @@ pub fn query_encoding_capabilities(
 /// 辞書から文字列や数値を読み出す処理はこの値の生存期間内に完了させること。
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct EncoderQuery {
+struct EncoderQueryResult {
     /// 選択されたエンコーダーの ID
-    encoder_id: Option<String>,
+    encoder_id: String,
     /// 選択されたエンコーダーのサポートプロパティ辞書
     properties: Option<CfPtr<c_void>>,
 }
@@ -306,8 +311,10 @@ struct EncoderQuery {
 /// ハードウェアエンコーダーを要求する `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder`
 /// は使わない。この指定を付けた照会が失敗するかどうかと、NULL を渡した照会でハードウェアの
 /// エントリが選ばれるかどうかは一致するため、1 回の照会で判定できる。
+///
+/// 照会に失敗した場合と、選ばれたエンコーダーの ID を取得できなかった場合は `None` を返す。
 #[cfg(target_os = "macos")]
-fn query_encoder_properties(fourcc: u32, width: i32, height: i32) -> Option<EncoderQuery> {
+fn query_encoder_properties(fourcc: u32, width: i32, height: i32) -> Option<EncoderQueryResult> {
     unsafe {
         let mut encoder_id: sys::CFStringRef = std::ptr::null_mut();
         let mut properties: sys::CFDictionaryRef = std::ptr::null_mut();
@@ -320,7 +327,8 @@ fn query_encoder_properties(fourcc: u32, width: i32, height: i32) -> Option<Enco
             &mut properties,
         );
         if status != 0 {
-            // 失敗時の出力は NULL になる仕様だが、非 NULL で返った場合に備えて解放する
+            // 失敗した場合は出力引数が設定されない (NULL で初期化した状態のままになる) が、
+            // 非 NULL が返った場合に備えて解放してから戻す
             if !encoder_id.is_null() {
                 sys::CFRelease(encoder_id.cast());
             }
@@ -336,14 +344,16 @@ fn query_encoder_properties(fourcc: u32, width: i32, height: i32) -> Option<Enco
         } else {
             Some(CfPtr(properties as *const c_void))
         };
-        let encoder_id = if encoder_id.is_null() {
-            None
-        } else {
+        if encoder_id.is_null() {
+            // エンコーダー ID を取得できない場合は、エンコーダーを特定できなかったものとして扱う
+            return None;
+        }
+        let encoder_id = {
             let _encoder_id_guard = CfPtr(encoder_id as *const c_void);
-            cf_string_to_string(encoder_id)
+            cf_string_to_string(encoder_id)?
         };
 
-        Some(EncoderQuery {
+        Some(EncoderQueryResult {
             encoder_id,
             properties,
         })
@@ -374,6 +384,11 @@ fn encoder_list(fourcc: u32) -> Option<EncoderList> {
         let mut list: sys::CFArrayRef = std::ptr::null_mut();
         let status = sys::VTCopyVideoEncoderList(std::ptr::null_mut(), &mut list);
         if status != 0 || list.is_null() {
+            // 失敗した場合は出力引数が設定されない (NULL で初期化した状態のままになる) が、
+            // 非 NULL が返った場合に備えて解放してから戻す
+            if !list.is_null() {
+                sys::CFRelease(list.cast());
+            }
             return None;
         }
         let list_guard = CfPtr(list as *const c_void);
@@ -481,7 +496,9 @@ fn find_encoder_info(codec: VideoCodecType, encoder_id: &str) -> Option<Encoding
 
 /// `kVTVideoEncoderList_CodecType` から FourCC を取り出す
 ///
-/// キーが存在しない、`CFNumber` でない、`u32` として読めない場合は `None` を返す。
+/// キーが存在しない、`CFNumber` でない、数値として取り出せない場合は `None` を返す。
+/// FourCC は `UInt32` だが `CFNumber` からは符号付き 32 bit として読み出し、
+/// ビット列をそのまま `u32` として扱う。
 #[cfg(target_os = "macos")]
 unsafe fn encoder_fourcc(entry: sys::CFDictionaryRef) -> Option<u32> {
     unsafe {
@@ -492,16 +509,16 @@ unsafe fn encoder_fourcc(entry: sys::CFDictionaryRef) -> Option<u32> {
             return None;
         }
 
-        let mut fourcc: u32 = 0;
+        let mut fourcc: i32 = 0;
         let ok = sys::CFNumberGetValue(
             value.cast(),
             sys::kCFNumberSInt32Type as sys::CFNumberType,
-            (&mut fourcc as *mut u32).cast(),
+            (&mut fourcc as *mut i32).cast(),
         );
         if ok == 0 {
             return None;
         }
-        Some(fourcc)
+        Some(fourcc as u32)
     }
 }
 

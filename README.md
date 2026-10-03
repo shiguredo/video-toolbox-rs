@@ -250,7 +250,7 @@ Video Toolbox にデコーダーの一覧を返す API が無いため、ソフ�
 use shiguredo_video_toolbox::{VideoCodecType, supported_codecs};
 
 for info in supported_codecs() {
-    println!("{:?}: decoding={}, encoders={}",
+    println!("{:?}: decoding_hw={}, encoders={}",
         info.codec, info.decoding.hardware_accelerated, info.encoders.len());
 
     // ハードウェアデコードが使えるか (ソフトウェアデコードを含めた可否ではない)
@@ -274,9 +274,9 @@ for info in supported_codecs() {
 ```
 
 `CodecInfo::encoders` が空の場合は、そのコーデックではエンコードできません。
-`supported_codecs()` には、解像度によって変わる情報（どのエンコーダーが選ばれるか、ハードウェアエンコーダーが使えるか、利用できるプロファイル）は含まれません。
+`supported_codecs()` には、解像度によって変わる情報（どのエンコーダーが選ばれるか、ハードウェアエンコーダーが使えるか、選ばれるエンコーダーが扱うプロファイル）は含まれません。
 
-エンコーダーの選択結果と利用できるプロファイルはエンコードする解像度によって変わるため、
+エンコーダーの選択結果と選ばれるエンコーダーが扱うプロファイルはエンコードする解像度によって変わるため、
 解像度が決まっている場合は `query_encoding_capabilities()` を使います。
 
 ```rust
@@ -305,6 +305,11 @@ if let Some(capabilities) = query_encoding_capabilities(VideoCodecType::H264, 19
 `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と、
 この照会で選ばれるエンコーダーの `hardware_accelerated` は一致します。
 ハードウェアエンコーダーの資源が枯渇している場合、この照会が成功してもセッションの生成に失敗することがあります。
+
+`profiles` には、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが
+`H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけが入ります。
+Video Toolbox は H.264 の High 4:2:2 / High 4:4:4 Predictive、HEVC の 4:4:4 系や Monochrome 系なども
+返しうるため、`profiles` に含まれないことが「そのプロファイルが使えない」ことを意味するとは限りません。
 
 解像度の上下限は公開していません。ハードウェアエンコーダーが対応する解像度の範囲はコーデックによって異なり、
 幅と高さの単一の上限では表せない場合がある (HEVC は対応範囲が 2 つの矩形の和集合になる) ためです。
