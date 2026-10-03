@@ -1248,7 +1248,7 @@ fn h264_decoder_i420_uv_planes_match_source() -> Result<(), Error> {
 fn init_av1_decoder() -> Result<(), Error> {
     if !supported_codecs()
         .iter()
-        .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.supported)
+        .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.hardware_accelerated)
     {
         return Ok(());
     }
@@ -1689,7 +1689,7 @@ fn encode_frame_pair_with_reference() -> EncodedFramePair {
 fn vp9_decoder() -> Result<(), Error> {
     if !supported_codecs()
         .iter()
-        .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
+        .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.hardware_accelerated)
     {
         return Ok(());
     }
