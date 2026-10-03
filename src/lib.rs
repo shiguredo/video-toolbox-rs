@@ -16,12 +16,12 @@ mod stats;
 mod sys;
 mod types;
 
-#[cfg(target_os = "macos")]
-pub use codec_info::supported_codecs;
 pub use codec_info::{
-    CodecInfo, DecodingInfo, EncodingInfo, EncodingProfiles, H264EncodingProfile,
-    HevcEncodingProfile, VideoCodecType,
+    CodecInfo, DecodingInfo, EncodingCapabilities, EncodingInfo, EncodingProfiles,
+    H264EncodingProfile, HevcEncodingProfile, VideoCodecType,
 };
+#[cfg(target_os = "macos")]
+pub use codec_info::{query_encoding_capabilities, supported_codecs};
 pub use decoder::{
     DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, DecoderStats,
     FnDecodeHandler, I420Frame, Nv12Frame,

@@ -90,6 +90,41 @@
   - デコーダーでは `update_format()` のセッション流用と再作成の回数を
     `total_update_format_count` / `total_recreate_session_count` で確認できるようにする
   - @melpon
+- [CHANGE] `CodecInfo::encoding` をエンコーダー 1 件ずつの一覧 `CodecInfo::encoders` に変更し、`EncodingInfo` を 1 つのエンコーダーの情報にする
+  - `EncodingInfo` の `supported` / `hardware_accelerated` / `supports_frame_reordering` /
+    `supports_multi_pass` を削除する。これらは対象コーデックのエンコーダーの論理和であり、
+    `encoders` が空かどうかと各エントリの属性で判定できる
+  - `EncodingInfo::profiles` を削除する。利用できるプロファイルは解像度によって変わるため、
+    解像度を指定して照会する API に移す
+  - `EncodingProfiles` から `None` を削除する。プロファイル情報を取得できなかったことは
+    `Option<EncodingProfiles>` の `None` で表す
+  - `EncodingInfo` は `encoder_id` / `encoder_name` / `codec_name` / `hardware_accelerated` /
+    `supports_frame_reordering` / `supports_multi_pass` / `performance_rating` / `quality_rating` /
+    `has_instance_limit` を持つ
+  - 解像度の上下限と数値プロパティの範囲は、Video Toolbox から信頼できる値を取得できないため追加しない
+  - @melpon
+- [CHANGE] `DecodingInfo::supported` を削除し、`hardware_accelerated` に一本化する
+  - `supported` は `hardware_accelerated` と同じ `VTIsHardwareDecodeSupported` の結果であり、
+    常に同じ値になっていた。名前から「デコードできるか」と誤読されるため削除する
+  - ソフトウェアデコードを含めたデコード可否は Video Toolbox から事前に取得できない。
+    `VTRegisterSupplementalVideoDecoderIfAvailable` でデコーダーを登録すると結果が変わりうる
+  - @melpon
+- [ADD] `query_encoding_capabilities()` と `EncodingCapabilities` を追加する
+  - `query_encoding_capabilities(codec, width, height)` で「指定した解像度でエンコードできるか」と、
+    その解像度で選ばれるエンコーダー・利用できるプロファイルを事前に判定できるようにする
+  - エンコーダーを特定できない場合は `None` を返す。この解像度でハードウェアエンコーダーが
+    使えるかは、返る `EncodingCapabilities::encoder` の `hardware_accelerated` で判定する
+  - `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使う。
+    これは `VTCompressionSessionCreate` と同じ既定の選択であり、
+    `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と、
+    選ばれるエンコーダーの `hardware_accelerated` が一致することを確認している
+  - @melpon
+- [FIX] エンコーダー情報の `supports_frame_reordering` が常に `false` になる問題を修正する
+  - `kVTVideoEncoderList_SupportsFrameReordering` は、キーが無い場合に true と見なす仕様だが、
+    キーの有無を区別せずに `false` として扱っていた
+  - `CFBoolean` を取り出す処理を `Option<bool>` を返すようにし、キーごとに異なる既定値を
+    呼び出し側で適用するように変更する
+  - @melpon
 
 ### misc
 
