@@ -30,14 +30,14 @@ fn test_supported_codecs() {
     assert!(hevc.decoding.hardware_accelerated);
     assert!(!hevc.encoders.is_empty());
 
-    // VP9 エンコードは VideoToolbox ではサポートされていない
+    // VP9 エンコードは Video Toolbox ではサポートされていない
     let vp9 = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::Vp9)
         .expect("VP9 のコーデック情報が返ってくること");
     assert!(vp9.encoders.is_empty());
 
-    // AV1 エンコードは VideoToolbox ではサポートされていない
+    // AV1 エンコードは Video Toolbox ではサポートされていない
     let av1 = codecs
         .iter()
         .find(|c| c.codec == VideoCodecType::Av1)
@@ -61,8 +61,7 @@ fn test_encoder_infos_are_listed_per_codec() {
             );
 
             // `kVTVideoEncoderList_SupportsFrameReordering` はキーが無い場合に true と見なす
-            // 仕様なので、このキーを設定しない Apple 製エンコーダーでは true になる。
-            // macOS がこのキーを設定するようになり値が変わった場合は、この assert を見直すこと。
+            // 仕様なので、値が取得できないエンコーダーでは true になる
             assert!(
                 encoder.supports_frame_reordering,
                 "{:?} の {} がフレームリオーダリングに対応していない",
@@ -252,8 +251,7 @@ fn test_query_encoding_capabilities_depends_on_resolution() {
         );
 
         // ソフトウェアエンコーダーでもプロファイルは取得できる。
-        // ハードウェア経路と同じくバリアントと中身まで固定する (空の一覧や別のバリアントが
-        // 返っても is_some() だけでは検出できないため)
+        // ハードウェア経路と同じくバリアントと中身まで固定する
         match (codec, software.profiles.as_ref()) {
             (VideoCodecType::H264, Some(EncodingProfiles::H264(profiles))) => {
                 assert!(
@@ -286,8 +284,7 @@ fn test_query_encoding_capabilities_depends_on_resolution() {
 
 /// エンコード非対応のコーデックでは、解像度を指定しても情報が取得できないことを検証する
 ///
-/// 非対応コーデックでエンコーダーの情報が返ると、利用側が「この ID を使えばエンコードできる」と
-/// 誤読する。取得できなかった値を `false` や `0` で埋めない契約をここで固定する。
+/// 情報が取得できなかった場合に `None` を返す契約をここで固定する。
 #[test]
 fn test_query_encoding_capabilities_unsupported_codec() {
     for codec in [VideoCodecType::Vp9, VideoCodecType::Av1] {

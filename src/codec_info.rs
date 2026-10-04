@@ -35,9 +35,6 @@ impl VideoCodecType {
 }
 
 /// コーデックごとの情報
-///
-/// 解像度に依存しない情報だけを持つ。解像度を指定して初めて分かる情報は持たないため、
-/// 必要なら `query_encoding_capabilities()` を解像度付きで呼び出すこと。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodecInfo {
     /// コーデック種別
@@ -51,27 +48,6 @@ pub struct CodecInfo {
 }
 
 /// デコード情報
-///
-/// `hardware_accelerated` は `VTIsHardwareDecodeSupported` (`supported_codecs()` の内部で
-/// 呼び出す) の結果であり、**ハードウェアデコード可否**を表す。Video Toolbox にはデコーダーの
-/// 一覧を返す API が無いため、**ソフトウェアデコードを含めたデコード可否**は事前に取得できない
-/// (`hardware_accelerated` が `false` でもソフトウェアデコードが使える場合があり、
-/// 実際に `Decoder` を生成するまで分からない)。
-/// 単一コーデックの情報も `supported_codecs()` から取得する (コーデック単体の照会関数は用意していない)。
-///
-/// `VTRegisterSupplementalVideoDecoderIfAvailable` で追加のデコーダーを登録すると結果が変わりうる。
-/// macOS 26.5.2 / M1 では、VP9 はこの関数を呼ぶ前は `false`、呼んだ後は `true` になった。
-/// このクレートはこの登録を行わないため、登録を行うアプリケーションでは値が異なりうる。
-///
-/// デコンプレッションセッションのサポートプロパティ辞書
-/// (`VTSessionCopySupportedPropertyDictionary`) が返す「そのコーデックで実際に設定可能な項目」は
-/// 公開していない。辞書の取得には有効な `CMVideoFormatDescription` を持つセッションが必要で、
-/// H.264 / HEVC では SPS / PPS などのパラメータセットが要求されるため、
-/// コーデック情報の照会時には用意できない。
-///
-/// 対応解像度の上下限も公開していない。Video Toolbox にはデコーダーの対応解像度の上下限を
-/// 返す API が無く、`VTDecompressionSessionCanAcceptFormatDescription` は
-/// セッションを生成した後に個別のフォーマットについてしか判定できないためである。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodingInfo {
     /// ハードウェアデコードが可能か（`VTIsHardwareDecodeSupported`）
@@ -80,20 +56,9 @@ pub struct DecodingInfo {
 
 /// エンコーダー 1 つの情報
 ///
-/// `VTCopyVideoEncoderList` が返すエンコーダー一覧のエントリ 1 件に対応し、解像度に依存しない
-/// 情報だけを持つ。同じコーデックに複数のエンコーダーがある場合、そのうちどれが使われるかは
-/// 解像度によって変わるため、選ばれるエンコーダーは `query_encoding_capabilities()` で照会すること。
-///
-/// 解像度の上下限は持たない。Video Toolbox のハードウェアエンコーダーが対応する解像度の範囲は
-/// 幅と高さの単一の上限では表せない（H.264 は 4096x4096 の矩形だが、HEVC は
-/// 8192x16384 と 65536x8192 の和集合になる）ため、単一の下限・上限を返すと
-/// 「65536x16384 もエンコードできる」といった誤った判定を招く。
-/// 解像度ごとの可否は `query_encoding_capabilities()` で判定すること。
-///
-/// ビットレート・フレームレート・キーフレーム間隔などの数値プロパティの上下限も持たない。
-/// `kVTPropertySupportedValueMinimumKey` / `kVTPropertySupportedValueMaximumKey` は、
-/// エンコーダーのサポートプロパティ辞書にも圧縮セッションのサポートプロパティ辞書にも
-/// 含まれないため、値を取得できない。
+/// `VTCopyVideoEncoderList` が返すエンコーダー一覧のエントリ 1 件に対応する。
+/// どのエンコーダーが使われるかは解像度によって変わるため、解像度が決まっている場合は
+/// [`EncodingCapabilities`] を照会すること。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodingInfo {
     /// エンコーダーの ID（`kVTVideoEncoderList_EncoderID`）
@@ -113,9 +78,6 @@ pub struct EncodingInfo {
     pub codec_name: Option<String>,
     /// このエンコーダーがハードウェア実装か（`kVTVideoEncoderList_IsHardwareAccelerated`）
     ///
-    /// エントリ自身の属性であり解像度には依存しない。指定した解像度でハードウェアエンコーダーが
-    /// 使えるかは、その解像度で選ばれるエンコーダーのこの値を
-    /// `query_encoding_capabilities()` で照会して判定すること。
     /// キーが無い場合は false として扱う (キーが無いエンコーダーはハードウェアではない)。
     pub hardware_accelerated: bool,
     /// このエンコーダーがフレームリオーダリング（B フレーム）に対応するか
@@ -156,9 +118,6 @@ pub struct EncodingInfo {
 }
 
 /// コーデック固有のエンコードプロファイル情報
-///
-/// 現在は H.264 と HEVC のプロファイルのみ対応している。
-/// Video Toolbox が VP9 / AV1 エンコードに対応した場合はバリアントを追加する。
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodingProfiles {
     /// H.264 プロファイル一覧
@@ -194,17 +153,12 @@ pub enum HevcEncodingProfile {
 }
 
 /// 指定した解像度でエンコードするときの情報
-///
-/// どのエンコーダーが選ばれるかと、利用できるプロファイルは解像度によって変わるため、
-/// エンコードする解像度が決まっている場合は `query_encoding_capabilities()` でこちらを照会する。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodingCapabilities {
     /// この解像度で選ばれるエンコーダー
     ///
     /// [`CodecInfo::encoders`] のいずれかの要素である。ハードウェアエンコーダーが使える
-    /// 解像度ではハードウェアのエントリ、使えない解像度ではソフトウェアのエントリになる。
-    /// この解像度でハードウェアエンコーダーが使えるかは
-    /// [`EncodingInfo::hardware_accelerated`] で判定する。
+    /// 解像度ではハードウェアのエントリになる。
     pub encoder: EncodingInfo,
     /// この解像度で選ばれるエンコーダーが扱うプロファイルの一覧
     ///
@@ -212,7 +166,6 @@ pub struct EncodingCapabilities {
     /// [`H264EncodingProfile`] / [`HevcEncodingProfile`] として表現できるものを格納する。
     /// Video Toolbox はこれ以外の値も返しうる (H.264 の High 4:2:2 / High 4:4:4 Predictive、
     /// HEVC の 4:4:4 系や Monochrome 系など) ため、ここに含まれないことが非対応を意味するとは限らない。
-    /// 公開する値は、本クレートのエンコーダー設定で選択できるプロファイルに限っている。
     ///
     /// Video Toolbox がプロファイル一覧を返さなかった場合は `None`
     /// (`None` はエンコード非対応を意味しない)。
@@ -220,8 +173,6 @@ pub struct EncodingCapabilities {
 }
 
 /// このバックエンドで利用可能なコーデック情報の一覧を返す
-///
-/// 各要素の [`CodecInfo::decoding`] は [`DecodingInfo`] を参照する。デコード可否の意味は [`DecodingInfo`] の rustdoc を参照すること。
 #[cfg(target_os = "macos")]
 pub fn supported_codecs() -> Vec<CodecInfo> {
     VideoCodecType::all()
@@ -248,15 +199,14 @@ fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
 
 /// 指定したコーデック・解像度でエンコードするときの情報を返す
 ///
-/// 解像度によって選ばれるエンコーダーと利用できるプロファイルが変わるため、エンコードする
-/// 解像度が決まっている場合は [`supported_codecs`] ではなくこの関数を使う。
+/// 解像度によって選ばれるエンコーダーが変わるため、エンコードする解像度が決まっている場合は
+/// [`supported_codecs`] ではなくこの関数を使う。
 ///
 /// `encoderSpecification` に NULL を渡して `VTCopySupportedPropertyDictionaryForEncoder` を
 /// 呼び出すため、`VTCompressionSessionCreate` と同じ既定の選択（解像度に対応する
 /// ハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ）の結果を返す。
-/// `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と、
-/// この照会で選ばれるエンコーダーの [`EncodingInfo::hardware_accelerated`] は、14 種類の解像度で
-/// 一致することを確認している。
+/// この照会で選ばれるエンコーダーの [`EncodingInfo::hardware_accelerated`] が、その解像度で
+/// ハードウェアエンコーダーが使えるかどうかを表す。
 ///
 /// 次の場合は `None` を返す。
 ///
@@ -264,9 +214,8 @@ fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
 /// - `width` または `height` が 0 の場合と、`i32` に収まらない場合
 /// - 照会に失敗した場合と、選ばれたエンコーダーを一覧から特定できなかった場合
 ///
-/// ハードウェアエンコーダーの資源が枯渇している場合、この照会が成功しても
-/// `VTCompressionSessionCreate` に失敗することがある。この照会は現在の資源の空き状況ではなく、
-/// その解像度で選択されるエンコーダーを返す。
+/// この関数は圧縮セッションを生成しないため、実際にその解像度でエンコードできるかは、
+/// セッションを生成するまで分からない。
 #[cfg(target_os = "macos")]
 pub fn query_encoding_capabilities(
     codec: VideoCodecType,
@@ -308,9 +257,6 @@ struct EncoderQueryResult {
 ///
 /// `encoderSpecification` に NULL を渡すため、`VTCompressionSessionCreate` と同じ既定の選択
 /// （ハードウェア優先、使えなければソフトウェアにフォールバック）で選ばれたエンコーダーを返す。
-/// ハードウェアエンコーダーを要求する `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder`
-/// は使わない。この指定を付けた照会が失敗するかどうかと、NULL を渡した照会でハードウェアの
-/// エントリが選ばれるかどうかは一致するため、1 回の照会で判定できる。
 ///
 /// 照会に失敗した場合と、選ばれたエンコーダーの ID を取得できなかった場合は `None` を返す。
 #[cfg(target_os = "macos")]
@@ -613,12 +559,10 @@ unsafe fn cf_string_to_string(s: sys::CFStringRef) -> Option<String> {
 ///
 /// `properties` は `VTCopySupportedPropertyDictionaryForEncoder` が返した辞書で、
 /// 呼び出し元が所有権を保持している必要がある。
-/// 利用できるプロファイルは照会した解像度とエンコーダーによって変わるため、
-/// 解像度ごとのプロファイルは [`query_encoding_capabilities`] で照会すること。
 ///
 /// 辞書に `kVTCompressionPropertyKey_ProfileLevel` が無い場合や、その値に
 /// `kVTPropertySupportedValueListKey` が無い場合は、プロファイル情報を取得できなかったものとして
-/// `None` を返す (空の一覧で埋めると「プロファイルが 0 個」と誤読される)。
+/// `None` を返す。
 #[cfg(target_os = "macos")]
 fn query_encoding_profiles(
     codec: VideoCodecType,
