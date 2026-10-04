@@ -185,9 +185,7 @@ pub fn supported_codecs() -> Vec<CodecInfo> {
         .collect()
 }
 
-/// `VTIsHardwareDecodeSupported` でデコード情報を判定する
-///
-/// 返却する `hardware_accelerated` は **ハードウェアパス**の可否に対応する。
+/// 指定したコーデックのデコード情報を返す
 #[cfg(target_os = "macos")]
 fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
     let hardware_accelerated = unsafe { sys::VTIsHardwareDecodeSupported(codec.to_fourcc()) != 0 };
@@ -202,11 +200,10 @@ fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
 /// 解像度によって選ばれるエンコーダーが変わるため、エンコードする解像度が決まっている場合は
 /// [`supported_codecs`] ではなくこの関数を使う。
 ///
-/// `encoderSpecification` に NULL を渡して `VTCopySupportedPropertyDictionaryForEncoder` を
-/// 呼び出すため、`VTCompressionSessionCreate` と同じ既定の選択（解像度に対応する
-/// ハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ）の結果を返す。
-/// この照会で選ばれるエンコーダーの [`EncodingInfo::hardware_accelerated`] が、その解像度で
-/// ハードウェアエンコーダーが使えるかどうかを表す。
+/// 解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを
+/// 選ぶ既定の選択で選ばれたエンコーダーの情報を返す。返る
+/// [`EncodingInfo::hardware_accelerated`] が、指定した解像度でハードウェアエンコーダーが使える
+/// かどうかを表す。
 ///
 /// 次の場合は `None` を返す。
 ///
@@ -250,10 +247,12 @@ struct EncoderQueryResult {
     properties: Option<CfPtr<c_void>>,
 }
 
-/// `VTCopySupportedPropertyDictionaryForEncoder` を指定した解像度で呼び出す
+/// 指定したコーデック・解像度で選ばれるエンコーダーの ID と、そのエンコーダーのサポート
+/// プロパティ辞書を返す
 ///
-/// `encoderSpecification` に NULL を渡すため、`VTCompressionSessionCreate` と同じ既定の選択
-/// （ハードウェア優先、使えなければソフトウェアにフォールバック）で選ばれたエンコーダーを返す。
+/// ハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ既定の選択の
+/// 結果を返す。サポートプロパティ辞書を取得できなかった場合は `properties` を `None` にして
+/// エンコーダーの ID だけを返す。
 ///
 /// 照会に失敗した場合と、選ばれたエンコーダーの ID を取得できなかった場合は `None` を返す。
 #[cfg(target_os = "macos")]
@@ -317,10 +316,10 @@ struct EncoderList {
     entries: Vec<sys::CFDictionaryRef>,
 }
 
-/// `VTCopyVideoEncoderList` から対象コーデックのエントリを集める
+/// `VTCopyVideoEncoderList` が返す一覧から、指定したコーデックのエントリだけを抜き出す
 ///
-/// 一覧の取得に失敗した場合と、対象コーデックのエンコーダーが 1 つも無い場合は `None` を返す。
-/// 辞書でない要素はスキップする (NULL チェックだけでは型は保証されない)。
+/// 辞書でない要素は格納しない。一覧の取得に失敗した場合と、対象コーデックのエントリが
+/// 1 つも無い場合は `None` を返す。
 #[cfg(target_os = "macos")]
 fn encoder_list(fourcc: u32) -> Option<EncoderList> {
     unsafe {
@@ -343,7 +342,7 @@ fn encoder_list(fourcc: u32) -> Option<EncoderList> {
             if entry.is_null() {
                 continue;
             }
-            // 配列要素が辞書でない場合はスキップ（NULL チェックだけでは型は保証されない）
+            // 配列要素が辞書でない場合はスキップする
             if sys::CFGetTypeID(entry as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
                 continue;
             }
@@ -656,6 +655,9 @@ fn query_encoding_profiles(
     }
 }
 
+/// 値リストのうち `map` に載っている値を、値リストの順に重複なく集める
+///
+/// `CFString` でない値と `map` に無い値は無視する。
 #[cfg(target_os = "macos")]
 unsafe fn match_profiles<T: Copy + PartialEq>(
     value_array: sys::CFArrayRef,
