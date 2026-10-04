@@ -87,15 +87,17 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 
 | 型 / 関数 | 説明 |
 |-----------|------|
-| `supported_codecs() -> Vec<CodecInfo>` | 実行環境で利用可能なコーデック情報の一覧を返す (macOS のみ) |
-| `CodecInfo` | `codec`, `decoding: DecodingInfo`, `encoding: EncodingInfo` |
-| `DecodingInfo` | `supported`, `hardware_accelerated` (`VTIsHardwareDecodeSupported` ベース) |
-| `EncodingInfo` | `supported`, `hardware_accelerated`, `supports_frame_reordering`, `supports_multi_pass`, `profiles: EncodingProfiles` |
-| `EncodingProfiles` | `H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)`, `None` |
+| `supported_codecs() -> Vec<CodecInfo>` | 解像度に依存しないコーデック情報の一覧を返す (macOS のみ) |
+| `query_encoding_capabilities(codec, width, height) -> Option<EncodingCapabilities>` | 指定した解像度でエンコードするときの情報を返す (macOS のみ) |
+| `CodecInfo` | `codec`, `decoding: DecodingInfo`, `encoders: Vec<EncodingInfo>` (`encoders` が空ならエンコード非対応) |
+| `DecodingInfo` | `hardware_accelerated` (`VTIsHardwareDecodeSupported` ベース) |
+| `EncodingInfo` | エンコーダー 1 件の情報。`encoder_id`, `encoder_name`, `codec_name`, `hardware_accelerated`, `supports_frame_reordering`, `supports_multi_pass`, `performance_rating`, `quality_rating`, `has_instance_limit` |
+| `EncodingCapabilities` | `encoder: EncodingInfo` (`query_encoding_capabilities()` の照会で選ばれた 1 件), `profiles: Option<EncodingProfiles>` (このクレートが表現できるプロファイルのみ) |
+| `EncodingProfiles` | `H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)` |
 | `H264EncodingProfile` | `Baseline`, `ConstrainedBaseline`, `Main`, `High`, `ConstrainedHigh` |
 | `HevcEncodingProfile` | `Main`, `Main10`, `Main42210` |
 
-エンコード判定には `VTCopyVideoEncoderList` と `VTCopySupportedPropertyDictionaryForEncoder` を使用する。プロファイル照会は 1920x1080 を代表値として行うため、解像度固有の制約は反映されない。
+コーデック単位の判定には `VTCopyVideoEncoderList` を使用する。エンコーダーの一覧と各エントリの属性は解像度に依存しないため `supported_codecs()` で取得できる。解像度に依存する情報 (どのエンコーダーが選ばれるか、選ばれるエンコーダーが扱うプロファイル、その解像度でハードウェアエンコーダーが使えるか) は `supported_codecs()` には含まれず、`query_encoding_capabilities()` で照会する。この関数は `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使うため、`VTCompressionSessionCreate` と同じ既定の選択 (解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ) の結果が返る。この解像度でハードウェアエンコーダーが使えるかは、返る `EncodingInfo::hardware_accelerated` で判定する (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と一致する)。`profiles` に入るのは、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが `H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけであり、含まれないことが「そのプロファイルが使えない」ことを意味するとは限らない。
 
 ## エラー型
 
@@ -268,15 +270,15 @@ match Decoder::<()>::new(
 }
 ```
 
-実行環境で本当に対応しているかを事前に判定したい場合は `supported_codecs()` を使う。
+VP9 / AV1 のように環境によって対応が変わるコーデックは、`supported_codecs()` の `DecodingInfo::hardware_accelerated` で事前に判定できる。Video Toolbox にデコーダーの一覧を返す API が無いため、ソフトウェアデコードを含めた可否は取得できない (`false` でも `Decoder::new` が成功する場合がある)。
 
 ```rust
 use shiguredo_video_toolbox::{supported_codecs, VideoCodecType};
 
-let vp9_supported = supported_codecs()
+let vp9_hardware_decode = supported_codecs()
     .iter()
     .find(|info| info.codec == VideoCodecType::Vp9)
-    .map(|info| info.decoding.supported)
+    .map(|info| info.decoding.hardware_accelerated)
     .unwrap_or(false);
 ```
 
@@ -443,4 +445,4 @@ bindgen = "0.72"
 
 - `examples/raden_to_mp4.rs`: raden で描画したアニメーションを H.264 / H.265 でエンコードし MP4 に書き出す (mpsc でコールバック結果を main スレッドに受け流すパターンの参考)
 - `tests/test_encoder.rs` / `tests/test_decoder.rs`: 単体テスト (セルフホストランナーで実行、Intel Mac や古い macOS では失敗しうる)
-- `tests/test_codec_info.rs`: `supported_codecs()` のテスト
+- `tests/test_codec_info.rs`: `supported_codecs()` と `query_encoding_capabilities()` のテスト

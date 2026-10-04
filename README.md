@@ -241,31 +241,73 @@ decoder.finish()?;
 
 ## コーデック情報の取得
 
-`supported_codecs()` で、実行環境で利用可能なコーデック情報を一覧取得できます。
+`supported_codecs()` で、解像度に依存しないコーデック情報を一覧取得できます。
+デコード判定に `VTIsHardwareDecodeSupported`、エンコーダーの一覧に `VTCopyVideoEncoderList` を使用しています。
 
-デコード判定に `VTIsHardwareDecodeSupported`、エンコード判定に `VTCopyVideoEncoderList` と `VTCopySupportedPropertyDictionaryForEncoder` を使用しています。
+`DecodingInfo` の `hardware_accelerated` は「ハードウェアデコードが可能か」です。
 
 ```rust
-use shiguredo_video_toolbox::{supported_codecs, VideoCodecType, EncodingProfiles};
+use shiguredo_video_toolbox::{VideoCodecType, supported_codecs};
 
 for info in supported_codecs() {
-    println!("{:?}: decoding={}, encoding={}",
-        info.codec, info.decoding.supported, info.encoding.supported);
+    println!("{:?}: decoding_hw={}, encoders={}",
+        info.codec, info.decoding.hardware_accelerated, info.encoders.len());
 
-    if info.decoding.supported {
-        println!("  decoding: hw={}", info.decoding.hardware_accelerated);
-    }
+    // ハードウェアデコードが使えるか
+    println!("  decoding: hw={}", info.decoding.hardware_accelerated);
 
-    if info.encoding.supported {
-        println!("  encoding: hw={}", info.encoding.hardware_accelerated);
-        match &info.encoding.profiles {
-            EncodingProfiles::H264(profiles) => println!("  profiles: {:?}", profiles),
-            EncodingProfiles::Hevc(profiles) => println!("  profiles: {:?}", profiles),
-            EncodingProfiles::None => {}
-        }
+    // エンコーダー 1 件ずつの属性。hardware_accelerated はこのエントリ自身が
+    // ハードウェア実装かどうかを表す
+    for encoder in &info.encoders {
+        println!("  encoder: id={}, hw={}",
+            encoder.encoder_id, encoder.hardware_accelerated);
+        println!("    encoder_name={:?}, codec_name={:?}",
+            encoder.encoder_name, encoder.codec_name);
+        println!("    frame_reordering={}, multi_pass={}",
+            encoder.supports_frame_reordering, encoder.supports_multi_pass);
+
+        // 同じコーデックの他のエンコーダーとの相対値。None は「不明」
+        println!("    ratings: performance={:?}, quality={:?}",
+            encoder.performance_rating, encoder.quality_rating);
     }
 }
 ```
+
+`CodecInfo::encoders` が空の場合は、そのコーデックではエンコードできません。
+
+どのエンコーダーが選ばれるかは解像度によって変わるため、解像度が決まっている場合は `query_encoding_capabilities()` を使います。
+
+```rust
+use shiguredo_video_toolbox::{EncodingProfiles, VideoCodecType, query_encoding_capabilities};
+
+// エンコーダーが無いコーデック (VP9 / AV1) や、解像度が不正な場合は None になります
+if let Some(capabilities) = query_encoding_capabilities(VideoCodecType::H264, 1920, 1080) {
+    // この解像度でハードウェアエンコーダーが使えるかは、選ばれるエンコーダーの属性で判定します
+    println!("hardware_accelerated={}", capabilities.encoder.hardware_accelerated);
+    println!("encoder_id={}", capabilities.encoder.encoder_id);
+
+    match &capabilities.profiles {
+        Some(EncodingProfiles::H264(profiles)) => println!("profiles: {profiles:?}"),
+        Some(EncodingProfiles::Hevc(profiles)) => println!("profiles: {profiles:?}"),
+        // Video Toolbox がプロファイル一覧を返さなかった場合
+        None => println!("profiles: unknown"),
+    }
+}
+```
+
+`query_encoding_capabilities()` は `encoderSpecification` に NULL を渡した
+`VTCopySupportedPropertyDictionaryForEncoder` を使用します。これは `VTCompressionSessionCreate` と
+同じ既定の選択（解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェア
+エンコーダーを選ぶ）なので、返る `encoder` は実際に使われるエンコーダーです。
+ハードウェアエンコーダーの資源が枯渇している場合、この照会が成功してもセッションの生成に失敗することがあります。
+
+`profiles` には、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが
+`H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけが入ります。
+Video Toolbox は H.264 の High 4:2:2 / High 4:4:4 Predictive、HEVC の 4:4:4 系や Monochrome 系なども
+返しうるため、`profiles` に含まれないことが「そのプロファイルが使えない」ことを意味するとは限りません。
+
+解像度の上下限と、ビットレート・フレームレートなどの数値プロパティの範囲は公開していません。
+解像度ごとの可否は `query_encoding_capabilities()` で判定してください。
 
 ## サポートコーデック
 

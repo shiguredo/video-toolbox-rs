@@ -1241,14 +1241,14 @@ fn h264_decoder_i420_uv_planes_match_source() -> Result<(), Error> {
     Ok(())
 }
 
-/// AV1 デコーダーが構築できることを検証する。非対応環境では supported_codecs() の
-/// 事前検査でスキップする。ビットストリームなしの最小構築ではコーデック固有の
+/// AV1 デコーダーが構築できることを検証する。ハードウェアデコードに対応しない環境では
+/// supported_codecs() の事前検査でスキップする。ビットストリームなしの最小構築ではコーデック固有の
 /// パラメータ不足で UnsupportedCodec が返り得るため、Ok と UnsupportedCodec の両方を許容する
 #[test]
 fn init_av1_decoder() -> Result<(), Error> {
     if !supported_codecs()
         .iter()
-        .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.supported)
+        .any(|c| c.codec == VideoCodecType::Av1 && c.decoding.hardware_accelerated)
     {
         return Ok(());
     }
@@ -1684,12 +1684,12 @@ fn encode_frame_pair_with_reference() -> EncodedFramePair {
 }
 
 /// shiguredo_libvpx の VP9 エンコーダーで生成したフレームをデコードし、
-/// Y プレーンの PSNR が下限を満たすことを検証する (対応環境でない場合はスキップ)
+/// Y プレーンの PSNR が下限を満たすことを検証する (ハードウェアデコードに対応しない場合はスキップ)
 #[test]
 fn vp9_decoder() -> Result<(), Error> {
     if !supported_codecs()
         .iter()
-        .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.supported)
+        .any(|c| c.codec == VideoCodecType::Vp9 && c.decoding.hardware_accelerated)
     {
         return Ok(());
     }
