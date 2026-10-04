@@ -104,3 +104,13 @@
 - 作業の後は、退避した内容と現在のファイルを `diff` で突き合わせ、意図した変更だけが入っていることを確認すること
 - `git commit --amend` は index 全体を巻き込むため、実行前に `git diff --cached` で意図したファイルだけがステージされていることを確認すること
 - コミットの後は `git status` と `git diff HEAD` が空であることを確認すること。空でなければ commit が作業ツリーを取りこぼしている
+
+## MSRV とツールチェーン
+
+- MSRV (最小 Rust バージョン) は `Cargo.toml` と `pbt/Cargo.toml` の `rust-version` に記載する
+- 開発と CI で使うツールチェーンは `rust-toolchain.toml` の `channel` に記載し、MSRV と同じ値に揃えること
+  - rustup は `Cargo.toml` の `rust-version` を参照できず、Cargo も `rust-toolchain.toml` を参照できないため、
+    両者を自動で連携させる仕組みはない
+  - MSRV を変更するときは `Cargo.toml` / `pbt/Cargo.toml` / `rust-toolchain.toml` の 3 ファイルを同時に更新すること
+  - これによりローカルと CI の `cargo` / `rustc` / `clippy` が常に MSRV で動作し、
+    MSRV より新しい API や言語機能の使用を検出できる

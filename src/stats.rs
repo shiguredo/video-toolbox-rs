@@ -74,10 +74,14 @@ impl Gauge {
     /// 減算が 0 を下回る場合は 0 で止める。増減の対応が実装バグや Video Toolbox の
     /// 想定外の挙動で崩れた場合に、`u64` の桁溢れで巨大な値に見えるのを避けるため。
     pub(crate) fn dec(&self) {
+        // `AtomicU64::try_update` は 1.95.0 で安定化されたため MSRV 1.93 では使えない。
+        // `fetch_update` は 1.99.0 で `try_update` への改名により非推奨となるが、
+        // 開発と CI はツールチェーンを MSRV の 1.93 に固定しているため警告にならない。
+        // MSRV を 1.95 以上に上げる際は `try_update` に置き換えること。
         let _ = self
             .0
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
             });
     }
 }

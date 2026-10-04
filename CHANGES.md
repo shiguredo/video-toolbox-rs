@@ -11,8 +11,6 @@
 
 ## develop
 
-- [CHANGE] MSRV (rust-version) を 1.95 に上げる
-  - @voluntas
 - [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
   - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
   - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える
@@ -131,6 +129,10 @@
 
 ### misc
 
+- [UPDATE] `rust-toolchain.toml` のツールチェーンを MSRV と同じ 1.93 に揃える
+  - ローカルと CI で常に MSRV (1.93) の `cargo` / `rustc` / `clippy` が使われるようになり、
+    MSRV より新しい API や言語機能の使用を検出できる
+  - @voluntas
 - [UPDATE] `Encoder::reconfigure` の検証順序を `Encoder::new` と揃える
   - フレームレートの検証を bitrate の検証より先に実行し、両方を同時に不正にした場合に
     構築と再設定のどちらでもフレームレートのエラーが先に返るようにする
