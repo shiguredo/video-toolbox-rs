@@ -4,6 +4,7 @@ mod helpers;
 
 use std::{
     ffi::c_void,
+    num::NonZeroU32,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -17,7 +18,7 @@ use shiguredo_video_toolbox::{
     CodecConfig, DataRateLimit, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, EncodeHandler,
     EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnDecodeHandler, FnEncodeHandler,
     FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile,
-    PixelFormat, ReconfigureParams,
+    PictureType, PixelFormat, ReconfigureParams, Timestamp,
 };
 
 const WIDTH: u32 = 960;
@@ -461,6 +462,277 @@ fn callback_keeps_user_data_per_frame() -> Result<(), Error> {
         .collect::<Vec<_>>();
     user_data.sort_unstable();
     assert_eq!(user_data, vec![10, 20]);
+
+    Ok(())
+}
+
+/// フレーム再順序付けを有効にしたときに現れると想定する B フレームの下限数
+///
+/// Video Toolbox は常に B フレームを生成するわけではないため、実測値より小さな値を下限にする。
+/// この値なら B フレームの判定が壊れたときに 2 種類の設定 (H.264 / H.265) の両方で検出できる
+/// (12 フレームの実測は H.264 が 4 枚、H.265 が 5 枚)。
+const MIN_B_FRAMES_WITH_REORDERING: usize = 2;
+
+/// 合成フレーム 12 枚をエンコードし、各出力の時刻とピクチャータイプを検証する
+///
+/// - 有効な時刻がすべての出力で取得でき、時刻を秒に直して昇順に並べると狭義単調増加する
+///   (提示時刻そのものはフレーム再順序付けを有効にすると出力順に並ばないため並べ替えて検証する)
+/// - 最初の出力のピクチャータイプが `I` である
+/// - フレーム再順序付けが無効な場合は `B` が現れず、有効な場合は
+///   [`MIN_B_FRAMES_WITH_REORDERING`] 枚以上の `B` が現れる
+fn assert_picture_type_and_timestamp(is_h265: bool, reorder: bool) -> Result<(), Error> {
+    const FRAMES: u64 = 12;
+    const FPS: u32 = 30;
+
+    let mut config = encoder_config(is_h265);
+    config.average_bitrate = Some(2_000_000);
+    config.allow_frame_reordering = reorder;
+    config.fps_numerator = FPS;
+    config.fps_denominator = 1;
+    config.max_key_frame_interval = Some(NonZeroU32::new(10).expect("10 は非ゼロ"));
+
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    for i in 0..FRAMES {
+        let (y, u, v) = synthetic_i420_frame(i as usize, &mut seed);
+        encoder.encode(
+            &FrameData::I420 {
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            &EncodeOptions::default(),
+            i,
+        )?;
+    }
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, FRAMES as usize);
+    assert_eq!(
+        callbacks.len(),
+        FRAMES as usize,
+        "投入したフレームすべてのエンコード結果が届くこと"
+    );
+    let frames = callbacks
+        .into_iter()
+        .map(|callback| match callback {
+            Ok(frame) => frame,
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+        })
+        .collect::<Vec<_>>();
+
+    // 出力順は投入順の frame_idx で引ける (Video Toolbox の保証ではなく実測前提)。
+    // user_data に投入時のフレーム番号を入れているため、最初の出力は frame_idx = 0 である。
+    assert_eq!(
+        frames[0].user_data, 0,
+        "最初の出力は最初に投入したフレームであること"
+    );
+    assert_eq!(
+        frames[0].picture_type,
+        PictureType::I,
+        "最初の出力のピクチャータイプは I であること"
+    );
+
+    // 各出力の時刻の目盛りは、エンコーダーが入力フレームのタイムスタンプに使った値と一致する
+    let times = frames
+        .iter()
+        .map(|frame| {
+            let timestamp = frame.timestamp.expect("有効な提示時刻が取得できること") as Timestamp;
+            assert_eq!(
+                timestamp.timescale, FPS as i32,
+                "時刻の目盛りは EncoderConfig::fps_numerator と一致すること"
+            );
+            timestamp.seconds()
+        })
+        .collect::<Vec<_>>();
+
+    // 提示時刻はフレーム再順序付けを有効にすると出力順に並ばないため、並べ替えて単調性を見る
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("時刻に NaN が含まれないこと"));
+    for pair in sorted.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "提示時刻が狭義単調増加すること: {:?} の並びで {} <= {} になった",
+            sorted,
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // ピクチャータイプは I (キーフレーム) と B 以外が P になる。キーフレームは
+    // max_key_frame_interval の指定と最初のフレームによって複数あり得るため、
+    // I の枚数は出力から数える。
+    let keyframes = frames
+        .iter()
+        .filter(|frame| frame.picture_type == PictureType::I)
+        .count();
+    assert!(
+        keyframes >= 1,
+        "キーフレームが 1 枚以上あること (実際は {keyframes} 枚)"
+    );
+
+    let b_frames = frames
+        .iter()
+        .filter(|frame| frame.picture_type == PictureType::B)
+        .count();
+    if reorder {
+        assert!(
+            b_frames >= MIN_B_FRAMES_WITH_REORDERING,
+            "フレーム再順序付けを有効にすると B フレームが {MIN_B_FRAMES_WITH_REORDERING} 枚以上現れること (実際は {b_frames} 枚)"
+        );
+    } else {
+        assert_eq!(
+            b_frames, 0,
+            "フレーム再順序付けを無効にすると B フレームは現れないこと"
+        );
+    }
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.picture_type == PictureType::P)
+            .count(),
+        FRAMES as usize - keyframes - b_frames,
+        "I でも B でもない出力は P であること"
+    );
+
+    Ok(())
+}
+
+/// H.264 でフレーム再順序付けを無効にしたときに、時刻の目盛りが設定と一致し
+/// ピクチャータイプが I / P だけになることを検証する
+#[test]
+fn encode_h264_reports_picture_type_without_reordering() -> Result<(), Error> {
+    assert_picture_type_and_timestamp(false, false)
+}
+
+/// H.264 でフレーム再順序付けを有効にしたときに、提示時刻が出力順に並ばず
+/// B フレームが現れることを検証する
+#[test]
+fn encode_h264_reports_picture_type_with_reordering() -> Result<(), Error> {
+    assert_picture_type_and_timestamp(false, true)
+}
+
+/// H.265 でフレーム再順序付けを無効にしたときに、時刻の目盛りが設定と一致し
+/// ピクチャータイプが I / P だけになることを検証する
+#[test]
+fn encode_h265_reports_picture_type_without_reordering() -> Result<(), Error> {
+    assert_picture_type_and_timestamp(true, false)
+}
+
+/// H.265 でフレーム再順序付けを有効にしたときに、提示時刻が出力順に並ばず
+/// B フレームが現れることを検証する
+#[test]
+fn encode_h265_reports_picture_type_with_reordering() -> Result<(), Error> {
+    assert_picture_type_and_timestamp(true, true)
+}
+
+/// エンコード結果の提示時刻が、`Encoder::reconfigure` でフレームレートを変更した後も
+/// 物理時間として単調増加し、変更後の時刻の目盛りが新しいフレームレートになることを検証する
+///
+/// 30000/1001 (約 29.97 fps) で 2 フレーム投入してから 60 fps へ変更し、さらに 2 フレーム
+/// 投入する。提示時刻は投入したフレームのものなので、変更をまたいでも投入順に並ぶ
+/// (`allow_frame_reordering: false`)。
+#[test]
+fn encode_timestamp_is_monotonic_across_reconfigure() -> Result<(), Error> {
+    const FPS_NUMERATOR: u32 = 30_000;
+    const FPS_DENOMINATOR: u32 = 1_001;
+    const NEW_FPS: u32 = 60;
+
+    let mut config = encoder_config(false);
+    config.average_bitrate = Some(2_000_000);
+    config.fps_numerator = FPS_NUMERATOR;
+    config.fps_denominator = FPS_DENOMINATOR;
+
+    let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            let results = Arc::clone(&results);
+            move |result: Result<EncodedFrame<u64>, Error>| {
+                results
+                    .lock()
+                    .expect("結果バッファの mutex が poison になっている")
+                    .push(result);
+            }
+        }),
+    )?;
+
+    let (y, u, v) = build_i420_black_frame();
+    let frame = FrameData::I420 {
+        y: &y,
+        u: &u,
+        v: &v,
+    };
+    for user_data in 0..2u64 {
+        encoder.encode(&frame, &EncodeOptions::default(), user_data)?;
+    }
+    encoder.reconfigure(ReconfigureParams {
+        expected_frame_rate: Some(NEW_FPS),
+        ..Default::default()
+    })?;
+    for user_data in 2..4u64 {
+        encoder.encode(&frame, &EncodeOptions::default(), user_data)?;
+    }
+    encoder.finish()?;
+
+    let callbacks = wait_and_take_results(&results, 4);
+    assert_eq!(callbacks.len(), 4, "投入した 4 フレームの出力が届くこと");
+
+    let mut timestamps = Vec::new();
+    for callback in callbacks {
+        let frame = match callback {
+            Ok(frame) => frame,
+            Err(e) => panic!("想定外のエンコードコールバックエラー: {e}"),
+        };
+        timestamps.push(frame.timestamp.expect("有効な提示時刻が取得できること") as Timestamp);
+    }
+
+    // 変更前の 2 フレームは元の目盛り、変更後の 2 フレームは新しい目盛りで通知される
+    assert_eq!(
+        timestamps[0].timescale, FPS_NUMERATOR as i32,
+        "変更前のフレームの目盛りは元のフレームレートの分子であること"
+    );
+    assert_eq!(
+        timestamps[1].timescale, FPS_NUMERATOR as i32,
+        "変更前のフレームの目盛りは元のフレームレートの分子であること"
+    );
+    assert_eq!(
+        timestamps[2].timescale, NEW_FPS as i32,
+        "変更後のフレームの目盛りは新しいフレームレートであること"
+    );
+    assert_eq!(
+        timestamps[3].timescale, NEW_FPS as i32,
+        "変更後のフレームの目盛りは新しいフレームレートであること"
+    );
+
+    // 目盛りが変わるため、それぞれを秒に直して比較する
+    let seconds = timestamps
+        .iter()
+        .map(|timestamp| timestamp.seconds())
+        .collect::<Vec<_>>();
+    for pair in seconds.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "フレームレートの変更をまたいでも提示時刻が狭義単調増加すること: {seconds:?}"
+        );
+    }
+    assert!(
+        seconds[0] < 1.0 / FPS_NUMERATOR as f64 * FPS_DENOMINATOR as f64,
+        "最初のフレームの提示時刻は 1 フレームぶん未満であること: {seconds:?}"
+    );
 
     Ok(())
 }
@@ -983,7 +1255,7 @@ fn encode_pixel_buffer_rejects_pixel_format_mismatch() -> Result<(), Error> {
     Ok(())
 }
 
-/// H.264 のキーフレーム出力が `keyframe: true` かつ SPS / PPS 1 組ずつを持ち、
+/// H.264 のキーフレーム出力がピクチャータイプ `I` かつ SPS / PPS 1 組ずつを持ち、
 /// 2 枚目の非キーフレームにはパラメータセットが付かないことを検証する
 #[test]
 fn h264_keyframe_carries_parameter_sets() -> Result<(), Error> {
@@ -1033,7 +1305,7 @@ fn h264_keyframe_carries_parameter_sets() -> Result<(), Error> {
         .find(|f| f.user_data == 1)
         .expect("1 枚目のエンコード結果が届いていない");
     assert!(
-        keyframe.keyframe,
+        keyframe.picture_type == PictureType::I,
         "force_key_frame の結果がキーフレームになっていない"
     );
     assert_eq!(keyframe.sps_list.len(), 1, "キーフレームには SPS が付く");
@@ -1046,7 +1318,10 @@ fn h264_keyframe_carries_parameter_sets() -> Result<(), Error> {
         .iter()
         .find(|f| f.user_data == 2)
         .expect("2 枚目のエンコード結果が届いていない");
-    assert!(!delta.keyframe, "2 枚目はキーフレームでないこと");
+    assert!(
+        delta.picture_type != PictureType::I,
+        "2 枚目はキーフレームでないこと"
+    );
     assert!(delta.sps_list.is_empty(), "非キーフレームに SPS は付かない");
     assert!(delta.pps_list.is_empty(), "非キーフレームに PPS は付かない");
     assert!(delta.vps_list.is_empty(), "非キーフレームに VPS は付かない");
@@ -1102,7 +1377,7 @@ fn h265_keyframe_carries_parameter_sets() -> Result<(), Error> {
         .find(|f| f.user_data == 1)
         .expect("1 枚目のエンコード結果が届いていない");
     assert!(
-        keyframe.keyframe,
+        keyframe.picture_type == PictureType::I,
         "force_key_frame の結果がキーフレームになっていない"
     );
     assert_eq!(keyframe.vps_list.len(), 1, "キーフレームには VPS が付く");
@@ -1116,7 +1391,10 @@ fn h265_keyframe_carries_parameter_sets() -> Result<(), Error> {
         .iter()
         .find(|f| f.user_data == 2)
         .expect("2 枚目のエンコード結果が届いていない");
-    assert!(!delta.keyframe, "2 枚目はキーフレームでないこと");
+    assert!(
+        delta.picture_type != PictureType::I,
+        "2 枚目はキーフレームでないこと"
+    );
     assert!(delta.vps_list.is_empty(), "非キーフレームに VPS は付かない");
     assert!(delta.sps_list.is_empty(), "非キーフレームに SPS は付かない");
     assert!(delta.pps_list.is_empty(), "非キーフレームに PPS は付かない");

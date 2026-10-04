@@ -11,6 +11,23 @@
 
 ## develop
 
+- [CHANGE] `EncodedFrame::keyframe` を `picture_type` に置き換える
+  - `keyframe` はキーフレームかどうかだけを表すフィールドで、`picture_type` が `I` かどうかと
+    同じ意味になる。同じ情報を 2 通りに持つと両者がずれる余地があるため、`picture_type` に統合する
+  - `EncodedFrame` から `keyframe` フィールドを削除する。キーフレームかどうかは
+    `picture_type == PictureType::I` で判定する
+  - @melpon
+- [ADD] `EncodedFrame` に `timestamp` と `picture_type` を追加する
+  - `timestamp` は `EncodeHandler::on_encoded` に渡されるフレームの提示時刻で、
+    エンコーダーが入力フレームに使ったタイムスケール (`EncoderConfig::fps_numerator`) を
+    分母とする有理数 `Timestamp` として取得できる。`Encoder::reconfigure` で
+    フレームレートを変更すると、変更前後でタイムスケールが変わる
+  - `timestamp` は `Option<Timestamp>` とし、Video Toolbox が有効な提示時刻を通知しない場合は
+    `None` になる (0 を返すと先頭フレームと区別できないため)
+  - `picture_type` は `PictureType` (`I` / `P` / `B` / `Unknown`) で、Video Toolbox は
+    I フレームと IDR フレームを区別しないため `PictureType::I` には IDR フレームも含まれる
+  - `examples/raden_to_mp4.rs` が固定値ではなく取得した提示時刻からサンプルの尺を求めるようにする
+  - @melpon
 - [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
   - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
   - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える

@@ -13,7 +13,7 @@ pub use config::{
     CodecConfig, DataRateLimit, EncodeOptions, EncoderConfig, H264EncoderConfig, H264EntropyMode,
     H264Profile, HevcEncoderConfig, HevcProfile, ReconfigureParams,
 };
-pub use frame::{EncodedFrame, FrameData};
+pub use frame::{EncodedFrame, FrameData, PictureType, Timestamp};
 pub use handler::{EncodeHandler, FnEncodeHandler};
 pub use stats::EncoderStats;
 

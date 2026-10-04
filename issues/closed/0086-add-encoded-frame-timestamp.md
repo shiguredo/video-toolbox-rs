@@ -1,7 +1,7 @@
 # EncodedFrame にタイムスタンプとピクチャータイプを追加する
 
 - Created: 2026-09-30
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-10-04
 - Branch: feature/add-encoded-frame-timestamp
 - Polished: {YYYY-MM-DD}
 
@@ -61,4 +61,45 @@
 
 ## 解決方法
 
-未着手。
+出力サンプルの添付情報と提示時刻を実出力で観測し、観測できた情報だけで判定する形で実装した。
+
+### 時刻
+
+- `Timestamp` (`value` / `timescale`) を追加し、`EncodedFrame::timestamp` を
+  `Option<Timestamp>` として公開した。`value / timescale` 秒の有理数であり、`timescale` には
+  エンコーダーが入力フレームのタイムスタンプに使った値 (`EncoderConfig::fps_numerator`) が入る
+- `presentation_timestamp` で `CMSampleBufferGetPresentationTimeStamp` を読み、
+  `kCMTimeFlags_Valid` が立っていない場合と不定・無限を表すフラグが立っている場合は `None` を返す。
+  0 を返すと先頭フレームと区別できなくなるため `Option` で表現し、契約は rustdoc に明記した
+- `Encoder::reconfigure` でフレームレートを変更すると `timescale` が変わるため、
+  複数の `timescale` を跨ぐ比較用に `Timestamp::seconds` を用意した
+
+### ピクチャータイプ
+
+- `PictureType` を `P` / `B` / `I` / `Unknown` の 4 バリアントで追加した。
+  Video Toolbox は I フレームと IDR フレームを区別しないため、`PictureType::I` に統合し、
+  その旨を rustdoc に明記した
+- 判定は `SampleAttachments` にまとめた添付辞書の読み取りで行う。`NotSync` が無ければ `I`、
+  非同期サンプルで `DependsOnOthers` が `false` の矛盾した情報は `Unknown`、
+  `IsDependedOnByOthers` が `false` のサンプルを `B`、それ以外を `P` とする。
+  実出力の観測で、再順序付けを有効にしたときにだけ `IsDependedOnByOthers` が
+  `false` になるフレームが現れることを確認している
+- 添付辞書の取得と型チェックは `SampleAttachments::from_sample_buffer` に 1 か所へまとめ、
+  添付が CFDictionary でない場合の防御は維持した
+- `keyframe: bool` は `picture_type` が `I` かどうかと同じ意味になるため `EncodedFrame` から削除し、
+  `picture_type == PictureType::I` で判定する形に統合した
+
+### テスト
+
+- `encode_timestamp_is_monotonic_across_reconfigure` で、`Encoder::reconfigure` による
+  フレームレート変更を跨いでも提示時刻が単調増加することを検証した
+- H.264 / H.265 それぞれについて、`allow_frame_reordering` の有効・無効で
+  ピクチャータイプと提示時刻の順序が妥当になることを検証した
+- 時刻が無効な場合は `None` になること、キーを持たない添付を同期サンプルとして扱うことを
+  `src/encoder/callback.rs` の単体テストで検証した
+
+### その他
+
+- `examples/raden_to_mp4.rs` は `Mp4Writer` を追加し、固定値ではなく提示時刻の差から
+  サンプルの尺を求めるようにした
+- README の `EncodedFrame` の記述を更新し、CHANGES.md に `[ADD]` と `[CHANGE]` を追加した

@@ -35,6 +35,7 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
   - デコーダー: `Decoder::update_format()` でフォーマットを更新 (解像度変更を含む)
 - `Encoder::encode_pixel_buffer()` による CVPixelBuffer のゼロコピーエンコード
 - 圧縮映像フレーム単位の非同期入出力
+- エンコード結果からフレームの提示時刻 (`EncodedFrame::timestamp`) とピクチャータイプ (`EncodedFrame::picture_type`) を取得
 
 ## 動作要件
 
@@ -238,6 +239,57 @@ decoder.finish()?;
 |---|---|---|
 | `FrameData::I420` | `y`, `u`, `v` | I420 形式 (3 プレーン) |
 | `FrameData::Nv12` | `y`, `uv` | NV12 形式 (2 プレーン) |
+
+### `EncodedFrame`
+
+エンコード結果です。`EncodeHandler::on_encoded` に `Result<EncodedFrame<T>, Error>` として渡されます。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `timestamp` | `Option<Timestamp>` | フレームの提示時刻。有効な時刻が得られなかった場合は `None` |
+| `picture_type` | `PictureType` | ピクチャータイプ |
+| `sps_list` | `Vec<Vec<u8>>` | SPS (キーフレームのときのみ) |
+| `pps_list` | `Vec<Vec<u8>>` | PPS (キーフレームのときのみ) |
+| `vps_list` | `Vec<Vec<u8>>` | VPS (H.265 のキーフレームのときのみ) |
+| `data` | `Vec<u8>` | 圧縮データ (AVCC 形式) |
+| `user_data` | `T` | `encode` / `encode_pixel_buffer` 呼び出し時に指定したユーザーデータ |
+
+`timestamp` は `value / timescale` 秒を表す有理数です。`timescale` には、その時刻を生成したときに
+エンコーダーが入力フレームのタイムスタンプに使っていた値 (`EncoderConfig::fps_numerator`) が入ります。
+`Encoder::reconfigure` でフレームレートを変更すると、変更前のフレームと変更後のフレームで
+`timescale` が異なるため、複数の `timescale` をまたいで時刻を比較する場合は `Timestamp::seconds()`
+で秒に直してください。1 回のエンコードで投入したフレームのうち、フレームレートの変更をまたがない
+ものは `timescale` が同じになるため、`value` の差分をそのまま表示順の間隔として使えます。
+
+`picture_type` は Video Toolbox が返すフレーム種別の情報から判定できる範囲だけを表します。
+Video Toolbox は I フレームと IDR フレームを区別しないため、`PictureType::I` には
+IDR フレームも含まれます。`PictureType::B` は `allow_frame_reordering` が `true` の場合にだけ現れます。
+キーフレームかどうかは `PictureType::I` かどうかで判定します。
+
+```rust
+use shiguredo_video_toolbox::{EncodedFrame, Error, PictureType};
+
+// エンコードコールバックの中
+let encoded: EncodedFrame<u64> = match result {
+    Ok(encoded) => encoded,
+    Err(e) => {
+        eprintln!("encode callback error: {e}");
+        return;
+    }
+};
+
+// 提示時刻 (秒) と、その時刻の目盛り
+if let Some(timestamp) = encoded.timestamp {
+    println!("pts: {} (timescale={})", timestamp.seconds(), timestamp.timescale);
+}
+match encoded.picture_type {
+    // キーフレームかどうかは PictureType::I かどうかで判定します
+    PictureType::I => println!("keyframe"),
+    PictureType::B => println!("b frame"),
+    PictureType::P => println!("p frame"),
+    PictureType::Unknown => println!("unknown picture type"),
+}
+```
 
 ## コーデック情報の取得
 
