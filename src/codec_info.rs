@@ -152,15 +152,15 @@ pub enum HevcEncodingProfile {
     Main42210,
 }
 
-/// 指定した解像度でエンコードするときの情報
+/// `query_encoding_capabilities()` が返す結果
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodingCapabilities {
-    /// この解像度で選ばれるエンコーダー
+    /// 照会で選ばれたエンコーダー
     ///
     /// [`CodecInfo::encoders`] のいずれかの要素である。ハードウェアエンコーダーが使える
-    /// 解像度ではハードウェアのエントリになる。
+    /// 解像度ではハードウェアのエントリ、使えない解像度ではソフトウェアのエントリになる。
     pub encoder: EncodingInfo,
-    /// この解像度で選ばれるエンコーダーが扱うプロファイルの一覧
+    /// 選ばれたエンコーダーが扱うプロファイルの一覧
     ///
     /// Video Toolbox がプロファイルレベルに指定できる値のうち、本クレートが
     /// [`H264EncodingProfile`] / [`HevcEncodingProfile`] として表現できるものを格納する。
@@ -213,9 +213,6 @@ fn probe_decoding(codec: VideoCodecType) -> DecodingInfo {
 /// - コーデックにエンコーダーが無い場合（VP9 / AV1）
 /// - `width` または `height` が 0 の場合と、`i32` に収まらない場合
 /// - 照会に失敗した場合と、選ばれたエンコーダーを一覧から特定できなかった場合
-///
-/// この関数は圧縮セッションを生成しないため、実際にその解像度でエンコードできるかは、
-/// セッションを生成するまで分からない。
 #[cfg(target_os = "macos")]
 pub fn query_encoding_capabilities(
     codec: VideoCodecType,

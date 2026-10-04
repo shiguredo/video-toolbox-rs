@@ -92,7 +92,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 | `CodecInfo` | `codec`, `decoding: DecodingInfo`, `encoders: Vec<EncodingInfo>` (`encoders` が空ならエンコード非対応) |
 | `DecodingInfo` | `hardware_accelerated` (`VTIsHardwareDecodeSupported` ベース) |
 | `EncodingInfo` | エンコーダー 1 件の情報。`encoder_id`, `encoder_name`, `codec_name`, `hardware_accelerated`, `supports_frame_reordering`, `supports_multi_pass`, `performance_rating`, `quality_rating`, `has_instance_limit` |
-| `EncodingCapabilities` | `encoder: EncodingInfo` (この解像度で選ばれる 1 件), `profiles: Option<EncodingProfiles>` (このクレートが表現できるプロファイルのみ) |
+| `EncodingCapabilities` | `encoder: EncodingInfo` (`query_encoding_capabilities()` の照会で選ばれた 1 件), `profiles: Option<EncodingProfiles>` (このクレートが表現できるプロファイルのみ) |
 | `EncodingProfiles` | `H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)` |
 | `H264EncodingProfile` | `Baseline`, `ConstrainedBaseline`, `Main`, `High`, `ConstrainedHigh` |
 | `HevcEncodingProfile` | `Main`, `Main10`, `Main42210` |
