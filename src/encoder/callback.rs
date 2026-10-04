@@ -3,7 +3,11 @@
 use std::ffi::c_void;
 
 use crate::{
-    encoder::{EncodeCallbackContext, Encoder, frame::EncodedFrame, handler::EncodeHandler},
+    encoder::{
+        EncodeCallbackContext, Encoder,
+        frame::{EncodedFrame, PictureType, Timestamp},
+        handler::EncodeHandler,
+    },
     error::Error,
     sys,
 };
@@ -193,8 +197,11 @@ impl<H: EncodeHandler> Encoder<H> {
             }
 
             let description = sys::CMSampleBufferGetFormatDescription(sample_buffer);
-            let keyframe = is_keyframe(sample_buffer);
+            let timestamp = presentation_timestamp(sample_buffer);
+            let picture_type = SampleAttachments::from_sample_buffer(sample_buffer).picture_type();
+            let keyframe = picture_type == PictureType::I;
 
+            // パラメータセットはキーフレームにだけ付くため、内部でもピクチャータイプで判定する
             let (vps_list, sps_list, pps_list) = if keyframe {
                 if description.is_null() {
                     let e = Error::LimitExceeded {
@@ -216,7 +223,8 @@ impl<H: EncodeHandler> Encoder<H> {
             };
 
             let frame = EncodedFrame {
-                keyframe,
+                timestamp,
+                picture_type,
                 sps_list,
                 pps_list,
                 vps_list,
@@ -387,30 +395,209 @@ fn vec_u8_from_raw_parts_safe(
     Ok(unsafe { std::slice::from_raw_parts(ptr, len).to_vec() })
 }
 
-fn is_keyframe(sample_buffer: sys::CMSampleBufferRef) -> bool {
+/// 出力サンプルの先頭に添付されたフレーム種別の辞書
+///
+/// 保持しているのはサンプルバッファが所有する添付辞書への参照であり、サンプルバッファを
+/// 解放すると無効になる。参照するのは [`Encoder::process_encoded_output`] が
+/// サンプルバッファを扱っている間だけに限る。添付が無い場合、または添付が辞書でない場合は、
+/// キーを解釈できないため各キーを読むメソッドはすべて既定値を返す。
+#[derive(Clone, Copy)]
+struct SampleAttachments {
+    dictionary: sys::CFDictionaryRef,
+}
+
+impl SampleAttachments {
+    /// 出力サンプルの先頭の添付辞書から [`SampleAttachments`] を作る
+    ///
+    /// 添付が無い場合・添付が CFDictionary でない場合は、キーを解釈できないため
+    /// NULL を保持したまま返す。
+    unsafe fn from_sample_buffer(sample_buffer: sys::CMSampleBufferRef) -> Self {
+        // SAFETY: 添付配列と添付辞書はサンプルバッファが所有しており、参照するのは
+        // `process_encoded_output` がサンプルバッファを扱っている間だけである。
+        unsafe {
+            let attachments = sys::CMSampleBufferGetSampleAttachmentsArray(sample_buffer, 1);
+            if attachments.is_null() || sys::CFArrayGetCount(attachments) == 0 {
+                return Self {
+                    dictionary: std::ptr::null(),
+                };
+            }
+
+            let attachment = sys::CFArrayGetValueAtIndex(attachments, 0);
+            if attachment.is_null()
+                || sys::CFGetTypeID(attachment as sys::CFTypeRef) != sys::CFDictionaryGetTypeID()
+            {
+                return Self {
+                    dictionary: std::ptr::null(),
+                };
+            }
+
+            Self {
+                dictionary: attachment as sys::CFDictionaryRef,
+            }
+        }
+    }
+
+    /// `key` に対応する CFBoolean の値を返す
+    ///
+    /// キーが無い場合、値が CFBoolean でない場合、または添付辞書を取得できていない場合は
+    /// `default` を返す。
+    unsafe fn bool_value(&self, key: sys::CFStringRef, default: bool) -> bool {
+        if self.dictionary.is_null() {
+            return default;
+        }
+        unsafe {
+            let value = sys::CFDictionaryGetValue(self.dictionary, key as *const c_void);
+            if value.is_null()
+                || sys::CFGetTypeID(value as sys::CFTypeRef) != sys::CFBooleanGetTypeID()
+            {
+                return default;
+            }
+            sys::CFBooleanGetValue(value as sys::CFBooleanRef) != 0
+        }
+    }
+
+    /// 他のフレームを参照しない同期サンプル (キーフレーム) かどうかを返す
+    ///
+    /// 添付の `NotSync` キーが `true` の場合に非同期サンプルと判定し、キーが無い場合は
+    /// 同期サンプルと判定する。
+    fn is_sync_sample(&self) -> bool {
+        !unsafe { self.bool_value(sys::kCMSampleAttachmentKey_NotSync, false) }
+    }
+
+    /// ピクチャータイプを判定する
+    ///
+    /// 添付から同期サンプルかどうかを判定し、同期サンプルを [`PictureType::I`] とする。
+    /// 同期サンプル以外の判定の根拠は [`PictureType`] の各バリアントの説明を参照すること。
+    fn picture_type(&self) -> PictureType {
+        // 同期サンプルは他のフレームを参照しないため、IDR フレームと区別できない
+        if self.is_sync_sample() {
+            return PictureType::I;
+        }
+        if self.dictionary.is_null() {
+            // キーフレームでも辞書でもないサンプルはフレーム種別を判定できない
+            return PictureType::Unknown;
+        }
+        if !unsafe { self.bool_value(sys::kCMSampleAttachmentKey_DependsOnOthers, true) } {
+            // 非同期サンプルなのに他のフレームを参照しないサンプルは、I フレームの
+            // 定義 (他のフレームを参照しない) に反するため解釈しない
+            return PictureType::Unknown;
+        }
+        // 他のフレームから参照されないサンプルは提示順序を入れ替えても他のフレームに
+        // 影響しないため、B フレームと判定する
+        if !unsafe { self.bool_value(sys::kCMSampleAttachmentKey_IsDependedOnByOthers, true) } {
+            return PictureType::B;
+        }
+        PictureType::P
+    }
+}
+
+/// 出力サンプルの提示時刻を返す
+///
+/// 提示時刻を時刻として解釈できない場合、つまり `CMTime` の `flags` に
+/// `kCMTimeFlags_Valid` が立っていない場合、または不定・無限を表すフラグが立っている場合は
+/// `None` を返す。0 を返すと先頭フレームと区別できなくなるため、`Some` にはしない。
+fn presentation_timestamp(sample_buffer: sys::CMSampleBufferRef) -> Option<Timestamp> {
     unsafe {
-        let attachments = sys::CMSampleBufferGetSampleAttachmentsArray(sample_buffer, 1);
-        if attachments.is_null() {
-            return false;
+        let time = sys::CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+        // CMTime は packed のため、フィールドは一度ローカルへコピーしてから参照する
+        let (value, timescale, flags) = (time.value, time.timescale, time.flags);
+        if flags & sys::kCMTimeFlags_Valid == 0
+            || flags & sys::kCMTimeFlags_ImpliedValueFlagsMask != 0
+        {
+            return None;
         }
+        Some(Timestamp { value, timescale })
+    }
+}
 
-        if sys::CFArrayGetCount(attachments) == 0 {
-            return false;
-        }
+#[cfg(test)]
+mod tests {
+    //! 出力サンプルから時刻を取り出す処理のうち、Video Toolbox の実出力では再現できない
+    //! ケース (CMTime が有効でない場合) を直接確認するためのテスト。
 
-        let attachment = sys::CFArrayGetValueAtIndex(attachments, 0);
-        if attachment.is_null() {
-            return false;
-        }
-        // 添付が CFDictionary でない場合は NotSync キーを解釈できない
-        if sys::CFGetTypeID(attachment as sys::CFTypeRef) != sys::CFDictionaryGetTypeID() {
-            return false;
-        }
+    use super::*;
+    use crate::types::CfPtrMut;
 
-        let not_sync = sys::CFDictionaryGetValue(
-            attachment as *mut _,
-            sys::kCMSampleAttachmentKey_NotSync as *const c_void,
+    /// 提示時刻が有効でない出力サンプルを組み立てる
+    ///
+    /// `CMSampleBufferCreateReady` は `kCMTimeInvalid` (flags = 0) の提示時刻も受け付けるため、
+    /// Video Toolbox がフレームのドロップなどで無効な時刻を通知する場合を再現できる。
+    fn sample_buffer_with_invalid_pts() -> CfPtrMut<sys::opaqueCMSampleBuffer> {
+        // データを持たない CMBlockBuffer は生成できないため、長さ 1 の静的領域を指す
+        // CMBlockBuffer を生成する (CoreMedia はデコード時のみ参照する)
+        static DATA: [u8; 1] = [0];
+        unsafe {
+            let mut block_buffer_ref = std::ptr::null_mut();
+            let status = sys::CMBlockBufferCreateWithMemoryBlock(
+                std::ptr::null_mut(),
+                DATA.as_ptr().cast_mut().cast(),
+                DATA.len(),
+                sys::kCFAllocatorNull,
+                std::ptr::null(),
+                0,
+                DATA.len(),
+                0,
+                &mut block_buffer_ref,
+            );
+            Error::check(status, "CMBlockBufferCreateWithMemoryBlock")
+                .expect("データを持つ CMBlockBuffer を生成できること");
+            let block_buffer = CfPtrMut(block_buffer_ref);
+
+            let mut sample_buffer_ref = std::ptr::null_mut();
+            let mut timing = sys::CMSampleTimingInfo {
+                duration: sys::kCMTimeInvalid,
+                presentationTimeStamp: sys::kCMTimeInvalid,
+                decodeTimeStamp: sys::kCMTimeInvalid,
+            };
+            let status = sys::CMSampleBufferCreateReady(
+                std::ptr::null_mut(),
+                block_buffer.0,
+                std::ptr::null(),
+                1,
+                1,
+                (&mut timing) as *mut sys::CMSampleTimingInfo,
+                0,
+                std::ptr::null(),
+                &mut sample_buffer_ref,
+            );
+            Error::check(status, "CMSampleBufferCreateReady")
+                .expect("無効な提示時刻のサンプルバッファを生成できること");
+            CfPtrMut(sample_buffer_ref)
+        }
+    }
+
+    /// 提示時刻が有効でない場合に `None` が返ることを検証する
+    ///
+    /// 0 を返すと先頭フレーム (提示時刻 0) と区別できなくなるため、`Option` で
+    /// 無効であることを表す契約になっている。
+    #[test]
+    fn presentation_timestamp_is_none_when_time_is_invalid() {
+        let sample_buffer = sample_buffer_with_invalid_pts();
+        let timestamp = presentation_timestamp(sample_buffer.0);
+        assert!(
+            timestamp.is_none(),
+            "有効でない提示時刻からは時刻を返さないこと: {timestamp:?}"
         );
-        not_sync != sys::kCFBooleanTrue as *const c_void
+    }
+
+    /// フレーム種別のキーを持たないサンプルを同期サンプルとして扱うことを検証する
+    ///
+    /// Video Toolbox は出力サンプルにフレーム種別の添付辞書を付けるため、この経路は
+    /// 実出力では通らない。キーが無い添付辞書を「非同期サンプル」と解釈すると、
+    /// キーフレームでないことだけを根拠に P フレームと誤判定してしまうため、
+    /// キーが無い場合は同期サンプル (キーフレーム) として扱う契約を確認する。
+    #[test]
+    fn attachments_without_keys_are_treated_as_sync_sample() {
+        let sample_buffer = sample_buffer_with_invalid_pts();
+        let attachments = unsafe { SampleAttachments::from_sample_buffer(sample_buffer.0) };
+        assert!(
+            attachments.is_sync_sample(),
+            "NotSync キーが無いサンプルは同期サンプルとして扱うこと"
+        );
+        assert_eq!(
+            attachments.picture_type(),
+            PictureType::I,
+            "同期サンプルのピクチャータイプは I になること"
+        );
     }
 }

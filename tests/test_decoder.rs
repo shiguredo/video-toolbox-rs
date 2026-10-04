@@ -13,7 +13,7 @@ use std::{
 
 use shiguredo_video_toolbox::{
     DecodeHandler, DecodedFrame, Decoder, DecoderCodec, DecoderConfig, EncodedFrame, Error,
-    FnDecodeHandler, FrameData, PixelFormat, VideoCodecType, supported_codecs,
+    FnDecodeHandler, FrameData, PictureType, PixelFormat, VideoCodecType, supported_codecs,
 };
 
 const WIDTH: u32 = 640;
@@ -1491,7 +1491,7 @@ fn encode_test_frame(
         .pop()
         .expect("エンコード結果が届いていない")
         .expect("エンコードが失敗している");
-    if !frame.keyframe {
+    if frame.picture_type != PictureType::I {
         return Err(HelperError::Assertion(
             "force_key_frame でエンコードしたフレームはキーフレームであること".to_string(),
         ));
@@ -1670,8 +1670,14 @@ fn encode_frame_pair_with_reference() -> EncodedFramePair {
 
     let key_frame = key_frame.expect("キーフレームのエンコード結果が届いていない");
     let p_frame = p_frame.expect("P フレームのエンコード結果が届いていない");
-    assert!(key_frame.keyframe, "1 フレーム目はキーフレームであること");
-    assert!(!p_frame.keyframe, "2 フレーム目はキーフレームでないこと");
+    assert!(
+        key_frame.picture_type == PictureType::I,
+        "1 フレーム目はキーフレームであること"
+    );
+    assert!(
+        p_frame.picture_type != PictureType::I,
+        "2 フレーム目はキーフレームでないこと"
+    );
     assert_eq!(key_frame.sps_list.len(), 1, "SPS は 1 組得られること");
     assert_eq!(key_frame.pps_list.len(), 1, "PPS は 1 組得られること");
 

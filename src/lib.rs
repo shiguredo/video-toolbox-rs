@@ -29,7 +29,7 @@ pub use decoder::{
 pub use encoder::{
     CodecConfig, DataRateLimit, EncodeHandler, EncodeOptions, EncodedFrame, Encoder, EncoderConfig,
     EncoderStats, FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile,
-    HevcEncoderConfig, HevcProfile, ReconfigureParams,
+    HevcEncoderConfig, HevcProfile, PictureType, ReconfigureParams, Timestamp,
 };
 pub use error::Error;
 pub use stats::{Counter, Gauge};
