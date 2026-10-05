@@ -249,6 +249,12 @@
     `nalu_len_bytes` 1 / 2 の受理、全プロファイル・エントロピー符号化モードでのセッション構築、
     ユーザー定義の `EncodeHandler` / `DecodeHandler`、`supported_codecs` のプロファイル照会も検証する
   - @melpon
+- [UPDATE] 圧縮セッション専用の所有権ガードを追加してエラーパスでも invalidate する
+  - `CompressionSessionGuard` が `Drop` でセッションを無効化してから解放し、
+    プロパティ設定に失敗したエラーパスと `Encoder::drop` の解放手順を揃える
+  - 成功パスは `into_raw` で所有権を `Encoder` に移し、無効化せずに引き渡す
+  - 圧縮セッションの所有権移転が専用ガードに移り、使われなくなった `CfPtrMut::into_raw` を削除する
+  - @melpon
 
 ## 2026.1.1
 

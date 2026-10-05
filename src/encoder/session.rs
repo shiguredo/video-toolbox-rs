@@ -13,9 +13,7 @@ use crate::{
     },
     error::Error,
     sys::{self, VTCompressionSessionCreate},
-    types::{
-        CfPtr, CfPtrMut, cf_array, cf_dictionary, cf_number_f64, cf_number_i32, cf_number_i64,
-    },
+    types::{CfPtr, cf_array, cf_dictionary, cf_number_f64, cf_number_i32, cf_number_i64},
 };
 
 /// `data_rate_limits` を CFArray に変換して properties に追加する
@@ -87,6 +85,39 @@ pub(super) fn push_expected_frame_rate_property(
     Ok(())
 }
 
+/// `VTCompressionSessionRef` の所有権を保持するガード
+///
+/// 保持するセッションは非 null であることを前提とする。`Drop` はセッションを無効化してから
+/// 解放する。所有権を呼び出し元に移す場合は [`CompressionSessionGuard::into_raw`] を使うこと。
+struct CompressionSessionGuard(sys::VTCompressionSessionRef);
+
+impl CompressionSessionGuard {
+    /// 保持しているセッションの所有権を呼び出し元に移し、生ポインタを返す
+    ///
+    /// `Drop` による破棄を行わないため、返り値のセッションは呼び出し元が無効化と解放を行う
+    /// 責務を負う。
+    fn into_raw(self) -> sys::VTCompressionSessionRef {
+        let session = self.0;
+        std::mem::forget(self);
+        session
+    }
+}
+
+impl Drop for CompressionSessionGuard {
+    fn drop(&mut self) {
+        // セッションを使い終えたら無効化してから解放する (Apple Developer Documentation
+        // "VTCompressionSessionInvalidate(_:)" の Discussion: "call
+        // VTCompressionSessionInvalidate to tear it down, and then call CFRelease to release
+        // its memory")。同 Note にあるとおり、無効化によりセッションが決定的に破棄される。
+        // https://developer.apple.com/documentation/videotoolbox/vtcompressionsessioninvalidate(_:)
+        // この仕様は将来の OS / SDK の更新で変わりうるため、SDK を更新した際は再確認すること。
+        unsafe {
+            sys::VTCompressionSessionInvalidate(self.0);
+            sys::CFRelease(self.0.cast());
+        }
+    }
+}
+
 impl<H: EncodeHandler> Encoder<H> {
     /// EncoderConfig と完了コールバックから VTCompressionSession を作成する
     ///
@@ -147,29 +178,8 @@ impl<H: EncodeHandler> Encoder<H> {
             Error::check(status, "VTCompressionSessionCreate")?;
 
             // 生成したセッションをガードし、以降のプロパティ設定が失敗して早期リターンしても
-            // `session_guard` の `Drop` で `CFRelease` する。エラーパスは実機で誘発困難なため
-            // 単体テストの対象外とし、このガードによる構造的な解放とコードレビューで担保する。
-            //
-            // `Encoder::drop` は `VTCompressionSessionInvalidate` + `CFRelease` を行うため
-            // エラーパスの解放方法とは非対称だが、ここで解放するセッションは一度も
-            // エンコードしていない未使用のセッションであり、invalidate なしの `CFRelease`
-            // のみで解放してよい。これは推論ではなく Apple の一次資料に明記された仕様である。
-            // - Apple Developer Documentation "VTCompressionSessionInvalidate(_:)" の Note:
-            //   "A compression session is automatically invalidated when its retain count
-            //   reaches zero, but because sessions may be retained by multiple parties,
-            //   it's hard to predict when this will happen."
-            //   https://developer.apple.com/documentation/videotoolbox/vtcompressionsessioninvalidate(_:)
-            // - macOS SDK の VideoToolbox.framework/Headers/VTCompressionSession.h にある
-            //   同関数の @discussion にも同旨の記述がある
-            //
-            // 生成したセッションはこの関数の外に公開しておらず、参照を保持しているのは
-            // この関数だけである (retain count は 1)。`VTCompressionSessionCreate` の
-            // `compressionSessionOut` (`CM_RETURNS_RETAINED_PARAMETER` 指定) で得た参照を
-            // `CFRelease` すると retain count が 0 に到達し、上記の仕様により自動的に
-            // invalidate される。
-            // この保証は将来の OS / SDK の更新で変わりうるため、SDK を更新した際は
-            // ヘッダーの @discussion を再確認すること。
-            let session_guard = CfPtrMut(session);
+            // `session_guard` の `Drop` が無効化と解放を行う。
+            let session_guard = CompressionSessionGuard(session);
 
             // 共通のプロパティ設定
             let mut properties = Vec::new();
@@ -196,12 +206,6 @@ impl<H: EncodeHandler> Encoder<H> {
             let status = sys::VTSessionSetProperties(session.cast(), properties_dict.0.cast());
             Error::check(status, "VTSessionSetProperties")?;
 
-            // 成功パスでは `into_raw` でガードの所有権を放棄して、`Encoder::drop` に解放を委ねる。
-            // ガードを生かしたまま返すと `Drop` が `CFRelease` し、`Encoder::drop` の
-            // `VTCompressionSessionInvalidate` + `CFRelease` と合わせて二重解放や
-            // use-after-free になるため、成功パスでは必ず `into_raw` する。
-            // 所有権を手放した後で `Err` を返すコードを追加するとリークするため、
-            // この後にエラーパスを追加しないこと。
             let session = session_guard.into_raw();
             Ok(session)
         }
@@ -344,5 +348,117 @@ impl<H: EncodeHandler> Encoder<H> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `CompressionSessionGuard` が保持するセッションを、`Drop` と `into_raw` の
+    //! それぞれでどう扱うかを実 FFI で直接確認するためのテスト。
+    //! セッションの生成と無効化の観測には Video Toolbox の API を直接呼ぶ必要があり、
+    //! `tests/` から公開 API 経由では到達できないため、ここに置く。
+
+    use super::*;
+
+    /// `VTCompressionSessionCreate` に渡すためだけの出力コールバック
+    ///
+    /// 本テストはフレームを 1 枚も送らないため、このコールバックは呼び出されない。
+    unsafe extern "C" fn noop_output_callback(
+        _output_callback_ref_con: *mut c_void,
+        _source_frame_ref_con: *mut c_void,
+        _status: sys::OSStatus,
+        _info_flags: sys::VTEncodeInfoFlags,
+        _sample_buffer: sys::CMSampleBufferRef,
+    ) {
+    }
+
+    /// テスト用の H.264 セッションを生成する
+    ///
+    /// 生成に失敗した場合はテストの前提が崩れているため panic する。
+    /// 返り値のセッションの retain count は 1 で、呼び出し元が所有権を持つ。
+    fn create_test_session() -> sys::VTCompressionSessionRef {
+        unsafe {
+            let mut session = std::ptr::null_mut();
+            let status = sys::VTCompressionSessionCreate(
+                std::ptr::null_mut(),
+                320,
+                240,
+                u32::from_be_bytes(*b"avc1"),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Some(noop_output_callback),
+                std::ptr::null_mut(),
+                &mut session,
+            );
+            Error::check(status, "VTCompressionSessionCreate")
+                .expect("テスト用の圧縮セッションを生成できなかった");
+            assert!(
+                !session.is_null(),
+                "VTCompressionSessionCreate が NULL を返した"
+            );
+            session
+        }
+    }
+
+    /// セッションにプロパティを設定し、その戻り値を返す
+    ///
+    /// 無効化済みのセッションでは `kVTInvalidSessionErr` が返るため、
+    /// この戻り値でセッションが無効化されているかどうかを観測できる。
+    fn set_property_status(session: sys::VTCompressionSessionRef) -> sys::OSStatus {
+        unsafe {
+            sys::VTSessionSetProperty(
+                session.cast(),
+                sys::kVTCompressionPropertyKey_RealTime,
+                sys::kCFBooleanTrue.cast(),
+            )
+        }
+    }
+
+    /// ガードの `Drop` がセッションを無効化すること
+    #[test]
+    fn compression_session_guard_invalidates_session_on_drop() {
+        let session = create_test_session();
+
+        // ガードの `Drop` がセッションを解放してもオブジェクトを観測できるよう、
+        // テスト側で参照を 1 つ余分に保持する。
+        unsafe { sys::CFRetain(session.cast()) };
+
+        // ガードの `Drop` でセッションが無効化され、解放される
+        drop(CompressionSessionGuard(session));
+
+        assert_eq!(
+            set_property_status(session),
+            sys::kVTInvalidSessionErr,
+            "Drop したガードが保持していたセッションは無効化されていること"
+        );
+
+        // テスト側で保持していた参照を解放する
+        unsafe { sys::CFRelease(session.cast()) };
+    }
+
+    /// `into_raw` がセッションを無効化せずに所有権を移すこと
+    #[test]
+    fn compression_session_guard_into_raw_keeps_session_valid() {
+        let session = create_test_session();
+
+        let guard = CompressionSessionGuard(session);
+        let transferred = guard.into_raw();
+        assert_eq!(
+            transferred, session,
+            "into_raw は保持していたセッションをそのまま返すこと"
+        );
+
+        assert_eq!(
+            set_property_status(session),
+            0,
+            "into_raw はセッションを無効化してはならない"
+        );
+
+        // 所有権は呼び出し元に移っているため、テスト側でセッションを破棄する
+        unsafe {
+            sys::VTCompressionSessionInvalidate(session);
+            sys::CFRelease(session.cast());
+        }
     }
 }
