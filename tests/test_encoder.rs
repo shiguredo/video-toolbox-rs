@@ -100,18 +100,18 @@ fn minimal_encoder_config() -> EncoderConfig {
         width: 640,
         height: 480,
         codec: CodecConfig::H264(H264EncoderConfig {
-            profile: H264Profile::Main,
-            entropy_mode: H264EntropyMode::Cabac,
+            profile: Some(H264Profile::Main),
+            entropy_mode: Some(H264EntropyMode::Cabac),
         }),
         pixel_format: PixelFormat::I420,
         average_bitrate: None,
         fps_numerator: 1,
         fps_denominator: 1,
-        prioritize_encoding_speed_over_quality: false,
-        real_time: false,
-        maximize_power_efficiency: false,
-        allow_frame_reordering: false,
-        allow_temporal_compression: true,
+        prioritize_encoding_speed_over_quality: Some(false),
+        real_time: Some(false),
+        maximize_power_efficiency: Some(false),
+        allow_frame_reordering: Some(false),
+        allow_temporal_compression: Some(true),
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
@@ -128,13 +128,13 @@ fn minimal_nv12_encoder_config() -> EncoderConfig {
 fn encoder_config(is_h265: bool) -> EncoderConfig {
     let codec = if is_h265 {
         CodecConfig::Hevc(HevcEncoderConfig {
-            profile: HevcProfile::Main,
-            allow_open_gop: true,
+            profile: Some(HevcProfile::Main),
+            allow_open_gop: Some(true),
         })
     } else {
         CodecConfig::H264(H264EncoderConfig {
-            profile: H264Profile::Main,
-            entropy_mode: H264EntropyMode::Cabac,
+            profile: Some(H264Profile::Main),
+            entropy_mode: Some(H264EntropyMode::Cabac),
         })
     };
     EncoderConfig {
@@ -145,11 +145,11 @@ fn encoder_config(is_h265: bool) -> EncoderConfig {
         average_bitrate: Some(100_000),
         fps_numerator: 1,
         fps_denominator: 1,
-        prioritize_encoding_speed_over_quality: false,
-        real_time: false,
-        maximize_power_efficiency: false,
-        allow_frame_reordering: false,
-        allow_temporal_compression: true,
+        prioritize_encoding_speed_over_quality: Some(false),
+        real_time: Some(false),
+        maximize_power_efficiency: Some(false),
+        allow_frame_reordering: Some(false),
+        allow_temporal_compression: Some(true),
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
@@ -409,7 +409,7 @@ fn encode_h265_black() -> Result<(), Error> {
 }
 
 /// 2 フレームを連続でエンコードし、各フレームに渡した user_data (10 / 20) が
-/// そのままコールバックに届くことを検証する。allow_frame_reordering: false のため
+/// そのままコールバックに届くことを検証する。allow_frame_reordering: Some(false) のため
 /// 投入順でコールバックされるが (Video Toolbox の保証ではない)、防衛的に取得後に
 /// ソートして比較する
 #[test]
@@ -478,9 +478,13 @@ const MIN_B_FRAMES_WITH_REORDERING: usize = 2;
 /// - 有効な時刻がすべての出力で取得でき、時刻を秒に直して昇順に並べると狭義単調増加する
 ///   (提示時刻そのものはフレーム再順序付けを有効にすると出力順に並ばないため並べ替えて検証する)
 /// - 最初の出力のピクチャータイプが `I` である
-/// - フレーム再順序付けが無効な場合は `B` が現れず、有効な場合は
-///   [`MIN_B_FRAMES_WITH_REORDERING`] 枚以上の `B` が現れる
-fn assert_picture_type_and_timestamp(is_h265: bool, reorder: bool) -> Result<(), Error> {
+/// - フレーム再順序付けが無効 (`Some(false)`) な場合は `B` が現れず、有効 (`Some(true)`) な
+///   場合と未指定 (`None`) の場合は [`MIN_B_FRAMES_WITH_REORDERING`] 枚以上の `B` が現れる
+///
+/// `None` は `EncoderConfig::allow_frame_reordering` を設定しないことを意味するため、
+/// Video Toolbox の既定 (フレーム再順序付け有効) で `B` フレームが生成されることも
+/// ここで検証する。
+fn assert_picture_type_and_timestamp(is_h265: bool, reorder: Option<bool>) -> Result<(), Error> {
     const FRAMES: u64 = 12;
     const FPS: u32 = 30;
 
@@ -588,16 +592,19 @@ fn assert_picture_type_and_timestamp(is_h265: bool, reorder: bool) -> Result<(),
         .iter()
         .filter(|frame| frame.picture_type == PictureType::B)
         .count();
-    if reorder {
-        assert!(
+    match reorder {
+        Some(true) => assert!(
             b_frames >= MIN_B_FRAMES_WITH_REORDERING,
             "フレーム再順序付けを有効にすると B フレームが {MIN_B_FRAMES_WITH_REORDERING} 枚以上現れること (実際は {b_frames} 枚)"
-        );
-    } else {
-        assert_eq!(
+        ),
+        Some(false) => assert_eq!(
             b_frames, 0,
             "フレーム再順序付けを無効にすると B フレームは現れないこと"
-        );
+        ),
+        None => assert!(
+            b_frames >= MIN_B_FRAMES_WITH_REORDERING,
+            "フレーム再順序付けを未指定にすると Video Toolbox の既定で B フレームが {MIN_B_FRAMES_WITH_REORDERING} 枚以上現れること (実際は {b_frames} 枚)"
+        ),
     }
     assert_eq!(
         frames
@@ -615,28 +622,41 @@ fn assert_picture_type_and_timestamp(is_h265: bool, reorder: bool) -> Result<(),
 /// ピクチャータイプが I / P だけになることを検証する
 #[test]
 fn encode_h264_reports_picture_type_without_reordering() -> Result<(), Error> {
-    assert_picture_type_and_timestamp(false, false)
+    assert_picture_type_and_timestamp(false, Some(false))
 }
 
 /// H.264 でフレーム再順序付けを有効にしたときに、提示時刻が出力順に並ばず
 /// B フレームが現れることを検証する
 #[test]
 fn encode_h264_reports_picture_type_with_reordering() -> Result<(), Error> {
-    assert_picture_type_and_timestamp(false, true)
+    assert_picture_type_and_timestamp(false, Some(true))
+}
+
+/// H.264 でフレーム再順序付けを未指定にしたときに、Video Toolbox の既定で
+/// B フレームが現れることを検証する
+///
+/// `EncoderConfig::allow_frame_reordering` に `None` を指定した場合は
+/// `kVTCompressionPropertyKey_AllowFrameReordering` を設定しない。Video Toolbox の既定は
+/// フレーム再順序付け有効であり、B フレームが生成される。
+/// このテストが失敗するようになった場合は、未指定のプロパティに Video Toolbox の既定が
+/// 使われなくなった (crate が独自の既定を押し付けている) ことを意味する。
+#[test]
+fn encode_h264_reports_b_frames_when_frame_reordering_unspecified() -> Result<(), Error> {
+    assert_picture_type_and_timestamp(false, None)
 }
 
 /// H.265 でフレーム再順序付けを無効にしたときに、時刻の目盛りが設定と一致し
 /// ピクチャータイプが I / P だけになることを検証する
 #[test]
 fn encode_h265_reports_picture_type_without_reordering() -> Result<(), Error> {
-    assert_picture_type_and_timestamp(true, false)
+    assert_picture_type_and_timestamp(true, Some(false))
 }
 
 /// H.265 でフレーム再順序付けを有効にしたときに、提示時刻が出力順に並ばず
 /// B フレームが現れることを検証する
 #[test]
 fn encode_h265_reports_picture_type_with_reordering() -> Result<(), Error> {
-    assert_picture_type_and_timestamp(true, true)
+    assert_picture_type_and_timestamp(true, Some(true))
 }
 
 /// エンコード結果の提示時刻が、`Encoder::reconfigure` でフレームレートを変更した後も
@@ -644,7 +664,7 @@ fn encode_h265_reports_picture_type_with_reordering() -> Result<(), Error> {
 ///
 /// 30000/1001 (約 29.97 fps) で 2 フレーム投入してから 60 fps へ変更し、さらに 2 フレーム
 /// 投入する。提示時刻は投入したフレームのものなので、変更をまたいでも投入順に並ぶ
-/// (`allow_frame_reordering: false`)。
+/// (`allow_frame_reordering: Some(false)`)。
 #[test]
 fn encode_timestamp_is_monotonic_across_reconfigure() -> Result<(), Error> {
     const FPS_NUMERATOR: u32 = 30_000;
@@ -1408,8 +1428,8 @@ fn encoder_accepts_all_h264_profiles_and_entropy_modes() {
         for entropy_mode in [H264EntropyMode::Cavlc, H264EntropyMode::Cabac] {
             let mut config = minimal_encoder_config();
             config.codec = CodecConfig::H264(H264EncoderConfig {
-                profile,
-                entropy_mode,
+                profile: Some(profile),
+                entropy_mode: Some(entropy_mode),
             });
             let encoder = Encoder::new(config, noop_encode_handler())
                 .unwrap_or_else(|e| panic!("{profile:?} / {entropy_mode:?} の構築に失敗した: {e}"));
@@ -1423,8 +1443,8 @@ fn encoder_accepts_all_hevc_profiles() {
     for profile in [HevcProfile::Main, HevcProfile::Main10] {
         let mut config = minimal_encoder_config();
         config.codec = CodecConfig::Hevc(HevcEncoderConfig {
-            profile,
-            allow_open_gop: false,
+            profile: Some(profile),
+            allow_open_gop: Some(false),
         });
         let encoder = Encoder::new(config, noop_encode_handler())
             .unwrap_or_else(|e| panic!("{profile:?} のセッション構築に失敗した: {e}"));
@@ -1488,11 +1508,11 @@ fn encode_rejects_insufficient_nv12_y_plane() -> Result<(), Error> {
 fn encoder_accepts_disabled_open_gop_and_temporal_compression() -> Result<(), Error> {
     let results: SharedEncodeResults<u64> = Arc::new(Mutex::new(Vec::new()));
     let mut config = encoder_config(true);
-    config.allow_temporal_compression = false;
+    config.allow_temporal_compression = Some(false);
     config.max_key_frame_interval = std::num::NonZeroU32::new(30);
     config.codec = CodecConfig::Hevc(HevcEncoderConfig {
-        profile: HevcProfile::Main,
-        allow_open_gop: false,
+        profile: Some(HevcProfile::Main),
+        allow_open_gop: Some(false),
     });
     let mut encoder = Encoder::new(
         config,
@@ -1558,16 +1578,16 @@ fn encoder_accepts_two_data_rate_limits() -> Result<(), Error> {
 fn encoder_config_returns_hevc_and_nv12_values() -> Result<(), Error> {
     let mut config = minimal_nv12_encoder_config();
     config.codec = CodecConfig::Hevc(HevcEncoderConfig {
-        profile: HevcProfile::Main10,
-        allow_open_gop: true,
+        profile: Some(HevcProfile::Main10),
+        allow_open_gop: Some(true),
     });
     let encoder = Encoder::new(config, noop_encode_handler())?;
 
     assert_eq!(encoder.config().pixel_format, PixelFormat::Nv12);
     match &encoder.config().codec {
         CodecConfig::Hevc(hevc) => {
-            assert_eq!(hevc.profile, HevcProfile::Main10);
-            assert!(hevc.allow_open_gop);
+            assert_eq!(hevc.profile, Some(HevcProfile::Main10));
+            assert_eq!(hevc.allow_open_gop, Some(true));
         }
         other => panic!("Hevc バリアントが保持されていない: {other:?}"),
     }
@@ -1994,19 +2014,64 @@ fn new_accepts_empty_data_rate_limits() -> Result<(), Error> {
     Ok(())
 }
 
+/// 未対応のプロパティを指定した `Encoder::new` が、原因のプロパティ名を含むエラーを返すことを検証する
+///
+/// Apple Silicon の Apple エンコーダーは `kVTCompressionPropertyKey_MaxFrameDelayCount` を
+/// 読み取り専用として扱い、設定すると `kVTParameterErr` (-12900) を返す
+/// (macOS 26.5 / Apple M1 の実測)。未指定 (`None`) の場合はこのプロパティを設定しないため
+/// 構築に成功する。このテストが失敗するようになった場合は、既定の選択で使われるエンコーダーが
+/// このプロパティを受け付けるようになったことを意味するため、他の未対応プロパティを探すか
+/// `max_frame_delay_count` の扱いを見直すこと。
+#[test]
+fn encoder_reports_property_rejected_by_video_toolbox() -> Result<(), Error> {
+    // 未指定ならプロパティを設定しないため、読み取り専用のプロパティでも構築できる
+    let mut config = minimal_encoder_config();
+    config.max_frame_delay_count = None;
+    Encoder::new(config, noop_encode_handler())?;
+
+    // 明示指定すると Video Toolbox が受け付けず、どのプロパティが原因かがエラーから分かる
+    let mut config = minimal_encoder_config();
+    config.max_frame_delay_count = NonZeroU32::new(2);
+    let err = Encoder::new(config, noop_encode_handler())
+        .map(|_| ())
+        .expect_err("未対応のプロパティを指定した構築は失敗すること");
+    match err {
+        Error::VideoToolbox {
+            status,
+            function,
+            property,
+        } => {
+            assert_eq!(
+                function, "VTSessionSetProperty",
+                "失敗した関数は VTSessionSetProperty であること"
+            );
+            assert_eq!(
+                property.as_deref(),
+                Some("kVTCompressionPropertyKey_MaxFrameDelayCount"),
+                "受け付けられなかったプロパティ名が入ること"
+            );
+            assert_ne!(status, 0, "失敗したステータスコード ({status}) が入ること");
+        }
+        other => panic!("VideoToolbox エラーを期待したが、実際は: {other}"),
+    }
+    Ok(())
+}
+
 /// Encoder::new 直後の config() が入力した全フィールドを変更なしで返すことを検証する。
 /// 既定値と区別できる値を使うことで、ハードコードされた既定値を返す回帰を検出する
 #[test]
 fn encoder_config_returns_initial_value() -> Result<(), Error> {
     let mut config = encoder_config(false);
     config.fps_numerator = 30;
-    config.real_time = true;
-    config.prioritize_encoding_speed_over_quality = true;
-    config.maximize_power_efficiency = true;
-    config.allow_frame_reordering = true;
+    config.real_time = Some(true);
+    config.prioritize_encoding_speed_over_quality = Some(true);
+    config.maximize_power_efficiency = Some(true);
+    config.allow_frame_reordering = Some(true);
     config.max_key_frame_interval = std::num::NonZeroU32::new(60);
     config.max_key_frame_interval_duration = Some(Duration::from_secs(2));
-    config.max_frame_delay_count = std::num::NonZeroU32::new(2);
+    // max_frame_delay_count は Apple Silicon の Apple エンコーダーが受け付けないため指定せず、
+    // 未指定のまま保持されることを確認する (`encoder_reports_property_rejected_by_video_toolbox` を参照)
+    config.max_frame_delay_count = None;
     config.data_rate_limits = vec![DataRateLimit {
         bytes: 93_750,
         window: Duration::from_secs(1),
@@ -2038,7 +2103,10 @@ fn encoder_config_returns_initial_value() -> Result<(), Error> {
         got.max_key_frame_interval_duration,
         config.max_key_frame_interval_duration
     );
-    assert_eq!(got.max_frame_delay_count, config.max_frame_delay_count);
+    assert_eq!(
+        got.max_frame_delay_count, None,
+        "未指定の max_frame_delay_count は None のまま保持されること"
+    );
     assert_eq!(got.data_rate_limits, config.data_rate_limits);
     // codec はバリアントと中身を確認する
     match (&got.codec, &config.codec) {
@@ -2093,8 +2161,8 @@ fn data_rate_limits_cap_windowed_output(is_h265: bool) -> Result<(), Error> {
     config.average_bitrate = Some(2_000_000);
     config.fps_numerator = FPS as u32;
     config.fps_denominator = 1;
-    config.real_time = true;
-    config.prioritize_encoding_speed_over_quality = true;
+    config.real_time = Some(true);
+    config.prioritize_encoding_speed_over_quality = Some(true);
     config.data_rate_limits = vec![DataRateLimit {
         bytes: LIMIT_BYTES_PER_SEC,
         window: Duration::from_secs(1),

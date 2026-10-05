@@ -76,18 +76,19 @@ let config = EncoderConfig {
     width: 1920,
     height: 1080,
     codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
+        // None にするとプロファイルレベルを設定せず Video Toolbox の既定に任せます
+        profile: Some(H264Profile::Main),
+        entropy_mode: Some(H264EntropyMode::Cabac),
     }),
     pixel_format: PixelFormat::I420,
     average_bitrate: Some(5_000_000),
     fps_numerator: 30,
     fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
+    prioritize_encoding_speed_over_quality: Some(false),
+    real_time: Some(false),
+    maximize_power_efficiency: Some(false),
+    allow_frame_reordering: Some(false),
+    allow_temporal_compression: Some(true),
     max_key_frame_interval: None,
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
@@ -192,15 +193,55 @@ decoder.finish()?;
 | `average_bitrate` | `Option<u64>` | 平均ビットレート (bps)、`None` でバックエンド依存 |
 | `fps_numerator` | `u32` | フレームレートの分子 |
 | `fps_denominator` | `u32` | フレームレートの分母 |
-| `prioritize_encoding_speed_over_quality` | `bool` | 品質より速度を優先 |
-| `real_time` | `bool` | リアルタイムエンコード |
-| `maximize_power_efficiency` | `bool` | 電力効率最大化 |
-| `allow_frame_reordering` | `bool` | フレーム再順序付け許可 |
-| `allow_temporal_compression` | `bool` | 時間的圧縮許可 |
+| `prioritize_encoding_speed_over_quality` | `Option<bool>` | 品質より速度を優先 |
+| `real_time` | `Option<bool>` | リアルタイムエンコード |
+| `maximize_power_efficiency` | `Option<bool>` | 電力効率最大化 |
+| `allow_frame_reordering` | `Option<bool>` | フレーム再順序付け許可 |
+| `allow_temporal_compression` | `Option<bool>` | 時間的圧縮許可 |
 | `max_key_frame_interval` | `Option<NonZeroU32>` | 最大キーフレーム間隔 (フレーム数) |
 | `max_key_frame_interval_duration` | `Option<Duration>` | 最大キーフレーム間隔 (秒数) |
 | `max_frame_delay_count` | `Option<NonZeroU32>` | フレーム遅延制限 |
 | `data_rate_limits` | `Vec<DataRateLimit>` | 短期ウィンドウごとのデータレート上限 |
+
+`Option` のフィールドは、`None` が「そのプロパティを設定しない (Video Toolbox の既定に任せる)」を
+意味します。`None` のときに使われる値は Video Toolbox の既定であり、このクレートが決めた値では
+ありません。`allow_frame_reordering` など、未指定時の値によってビットストリームが変わるものがあります。
+
+`Encoder::new()` は指定されたプロパティを 1 個ずつ設定し、選択されたエンコーダーが受け付けなかった
+プロパティがある場合は `Error::VideoToolbox` を返します。このエラーの `property` から、どの
+プロパティが受け付けられなかったかを確認できます。値そのものが Video Toolbox に受理された範囲へ
+丸められることはありますが、指定したプロパティが反映されたかどうかは `Encoder::new()` の結果で
+判定できます。
+
+```rust
+use shiguredo_video_toolbox::{Encoder, Error};
+
+// handler は EncodeHandler を実装したハンドラー
+match Encoder::new(config, handler) {
+    Ok(encoder) => { /* エンコード処理 */ }
+    Err(Error::VideoToolbox {
+        status,
+        function,
+        property,
+    }) => {
+        // 受け付けられなかったプロパティが分かる (プロパティ以外の失敗では property は None)
+        eprintln!("{function}: status={status}, property={property:?}");
+    }
+    Err(e) => return Err(e),
+}
+```
+
+### `H264EncoderConfig` / `HevcEncoderConfig`
+
+`CodecConfig` が持つコーデック固有の設定です。プロパティに対応するフィールドは `Option` で、
+`None` の場合はそのプロパティを設定せず Video Toolbox の既定に任せます。
+
+| 型 | フィールド | 型 | 説明 |
+|---|---|---|---|
+| `H264EncoderConfig` | `profile` | `Option<H264Profile>` | H.264 プロファイル (`Baseline` / `Main` / `High`) |
+| `H264EncoderConfig` | `entropy_mode` | `Option<H264EntropyMode>` | エントロピー符号化モード (`Cavlc` / `Cabac`) |
+| `HevcEncoderConfig` | `profile` | `Option<HevcProfile>` | HEVC プロファイル (`Main` / `Main10`) |
+| `HevcEncoderConfig` | `allow_open_gop` | `Option<bool>` | Open GOP 許可 |
 
 ### `DataRateLimit`
 
@@ -213,7 +254,7 @@ decoder.finish()?;
 | `window` | `Duration` | ウィンドウの長さ |
 
 指定できるリミットは最大 2 個です。`bytes` と `window` には 0 を指定できず、`bytes` は `i64::MAX` 以下である必要があります。
-`EncoderConfig::data_rate_limits` は空の `Vec` が上限なし (未設定) を意味します。
+`EncoderConfig::data_rate_limits` が空の `Vec` のときは `kVTCompressionPropertyKey_DataRateLimits` を設定せず、Video Toolbox の既定に任せます。既定値はエンコーダーによって異なるため、上限なしになることを保証するものではありません。
 
 ### `DecoderConfig`
 
@@ -263,7 +304,9 @@ decoder.finish()?;
 
 `picture_type` は Video Toolbox が返すフレーム種別の情報から判定できる範囲だけを表します。
 Video Toolbox は I フレームと IDR フレームを区別しないため、`PictureType::I` には
-IDR フレームも含まれます。`PictureType::B` は `allow_frame_reordering` が `true` の場合にだけ現れます。
+IDR フレームも含まれます。`PictureType::B` は `allow_frame_reordering` が `Some(true)` のときと、
+このプロパティを設定しない `None` のとき (Video Toolbox の既定がフレーム再順序付け有効のため) に
+現れます。`Some(false)` のときは現れません。
 キーフレームかどうかは `PictureType::I` かどうかで判定します。
 
 ```rust

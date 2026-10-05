@@ -28,9 +28,13 @@ pub enum H264EntropyMode {
 #[derive(Debug, Clone)]
 pub struct H264EncoderConfig {
     /// kVTCompressionPropertyKey_ProfileLevel
-    pub profile: H264Profile,
+    ///
+    /// `None` の場合はプロファイルレベルを設定せず、Video Toolbox の既定に任せる。
+    pub profile: Option<H264Profile>,
     /// kVTCompressionPropertyKey_H264EntropyMode
-    pub entropy_mode: H264EntropyMode,
+    ///
+    /// `None` の場合はエントロピー符号化モードを設定せず、Video Toolbox の既定に任せる。
+    pub entropy_mode: Option<H264EntropyMode>,
 }
 
 /// HEVC プロファイル
@@ -46,9 +50,13 @@ pub enum HevcProfile {
 #[derive(Debug, Clone)]
 pub struct HevcEncoderConfig {
     /// kVTCompressionPropertyKey_ProfileLevel
-    pub profile: HevcProfile,
+    ///
+    /// `None` の場合はプロファイルレベルを設定せず、Video Toolbox の既定に任せる。
+    pub profile: Option<HevcProfile>,
     /// kVTCompressionPropertyKey_AllowOpenGOP
-    pub allow_open_gop: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    pub allow_open_gop: Option<bool>,
 }
 
 /// コーデック固有の設定
@@ -61,6 +69,11 @@ pub enum CodecConfig {
 }
 
 /// エンコーダーに指定する設定
+///
+/// Video Toolbox のプロパティに対応するフィールドのうち `Option` のものは、`None` が
+/// 「そのプロパティを設定しない (Video Toolbox の既定に任せる)」を意味する。
+/// 指定したプロパティが受け付けられなかった場合の扱いを含む詳細は
+/// [`crate::encoder::Encoder::new`] の rustdoc を参照。
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     /// VTCompressionSessionCreate の width 引数
@@ -91,19 +104,31 @@ pub struct EncoderConfig {
     pub fps_denominator: u32,
 
     /// kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality
-    pub prioritize_encoding_speed_over_quality: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    pub prioritize_encoding_speed_over_quality: Option<bool>,
 
     /// kVTCompressionPropertyKey_RealTime
-    pub real_time: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    pub real_time: Option<bool>,
 
     /// kVTCompressionPropertyKey_MaximizePowerEfficiency
-    pub maximize_power_efficiency: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    pub maximize_power_efficiency: Option<bool>,
 
     /// kVTCompressionPropertyKey_AllowFrameReordering
-    pub allow_frame_reordering: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    /// 未指定時の挙動はバックエンド依存であり、B フレームが生成されて
+    /// 出力順が入力順と一致しなくなる場合がある。
+    pub allow_frame_reordering: Option<bool>,
 
     /// kVTCompressionPropertyKey_AllowTemporalCompression
-    pub allow_temporal_compression: bool,
+    ///
+    /// `None` の場合は設定せず、Video Toolbox の既定に任せる。
+    pub allow_temporal_compression: Option<bool>,
 
     /// kVTCompressionPropertyKey_MaxKeyFrameInterval
     pub max_key_frame_interval: Option<NonZeroU32>,
@@ -116,8 +141,9 @@ pub struct EncoderConfig {
 
     /// kVTCompressionPropertyKey_DataRateLimits
     ///
-    /// 空 `Vec` は上限なし (未設定) を意味する。指定できるリミットは Video Toolbox の仕様上
-    /// 0〜2 個で、詳細は [`DataRateLimit`] を参照。
+    /// 空 `Vec` は本プロパティを設定しない (Video Toolbox の既定に任せる) を意味する。
+    /// 既定値はエンコーダーによって異なるため、上限なしになることを保証するものではない。
+    /// 指定できるリミットは Video Toolbox の仕様上 0〜2 個で、詳細は [`DataRateLimit`] を参照。
     pub data_rate_limits: Vec<DataRateLimit>,
 }
 

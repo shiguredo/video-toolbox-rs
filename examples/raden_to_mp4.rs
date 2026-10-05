@@ -398,12 +398,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // エンコーダーの初期化
     let codec_config = match codec {
         Codec::H264 => CodecConfig::H264(H264EncoderConfig {
-            profile: H264Profile::Main,
-            entropy_mode: H264EntropyMode::Cabac,
+            profile: Some(H264Profile::Main),
+            entropy_mode: Some(H264EntropyMode::Cabac),
         }),
         Codec::H265 => CodecConfig::Hevc(HevcEncoderConfig {
-            profile: HevcProfile::Main,
-            allow_open_gop: true,
+            profile: Some(HevcProfile::Main),
+            allow_open_gop: Some(true),
         }),
     };
     let config = EncoderConfig {
@@ -414,11 +414,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         average_bitrate: Some(2_000_000),
         fps_numerator: fps,
         fps_denominator: 1,
-        prioritize_encoding_speed_over_quality: false,
-        real_time: false,
-        maximize_power_efficiency: false,
-        allow_frame_reordering: false,
-        allow_temporal_compression: true,
+        prioritize_encoding_speed_over_quality: Some(false),
+        real_time: Some(false),
+        maximize_power_efficiency: Some(false),
+        allow_frame_reordering: Some(false),
+        allow_temporal_compression: Some(true),
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
