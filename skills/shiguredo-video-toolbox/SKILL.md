@@ -1,6 +1,6 @@
 ---
 name: shiguredo-video-toolbox
-description: 時雨堂の Apple Video Toolbox バインディング shiguredo_video_toolbox の機能・API リファレンス。H.264 / H.265 ハードウェアエンコード、H.264 / H.265 / VP9 / AV1 ハードウェアデコード、AVCC 形式の入出力、I420 / NV12 ピクセルフォーマット、コールバックベースの非同期 API、動的解像度変更、ゼロコピー入力に関する質問時に使用。
+description: 時雨堂の Apple Video Toolbox バインディング shiguredo_video_toolbox の機能・API リファレンス。H.264 / H.265 ハードウェアエンコード、H.264 / H.265 / VP9 / AV1 ハードウェアデコード、AVCC 形式の入出力、I420 / NV12、コールバックベースの非同期 API、動的設定更新、提示時刻とピクチャータイプ、データレート上限、統計値、コーデック情報照会、ゼロコピー入力に関する質問時に使用。
 ---
 
 # shiguredo_video_toolbox
@@ -15,16 +15,20 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 - **コーデック固有設定の型安全な分離**: エンコード側は `CodecConfig` enum、デコード側は `DecoderCodec` enum
 - **ピクセルフォーマット**: `PixelFormat::I420` / `PixelFormat::Nv12`
 - **コールバックベースの非同期 API**: `EncodeHandler` / `DecodeHandler` トレイト
-- **動的解像度変更**:
-  - エンコーダー: `Encoder::reconfigure()` (常にセッション破棄 + 再作成)
+- **動的設定更新**:
+  - エンコーダー: `Encoder::reconfigure()` (`ReconfigureParams` で `VTSessionSetProperties` を 1 回呼び、セッションは再作成しない)
   - デコーダー: `Decoder::update_format()` (受け入れ可否判定 → 必要時のみ再作成)
 - **ゼロコピー入力**: `Encoder::encode_pixel_buffer()` で `CVPixelBuffer` を直接受け取る
 - **AVCC 形式の入出力**: NAL ユニット長プレフィックス付き
+- **エンコード結果のメタデータ**: 提示時刻 `Timestamp` とピクチャータイプ `PictureType`
+- **データレートのハードリミット**: `DataRateLimit` (`kVTCompressionPropertyKey_DataRateLimits`)
+- **統計値**: `Encoder::stats()` / `Decoder::stats()` で `EncoderStats` / `DecoderStats` (`Counter` / `Gauge`) を取得
+- **コーデック情報照会**: `supported_codecs()` / `query_encoding_capabilities()`
 
 ## バージョン情報
 
 - crate 名: `shiguredo_video_toolbox`
-- バージョン: 2026.1.1
+- バージョン: 2026.2.0-canary.3
 - Rust Edition: 2024
 - 最小 Rust バージョン: 1.93
 - ライセンス: Apache-2.0
@@ -44,62 +48,131 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 | `PixelFormat` | ピクセルフォーマット | `I420` (kCVPixelFormatType_420YpCbCr8Planar, 3 プレーン), `Nv12` (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, 2 プレーン) |
 | `VideoCodecType` | コーデック種別 | `H264`, `Hevc`, `Vp9`, `Av1` |
 
+### エンコード結果の型
+
+| 型 | 説明 | 主要メソッド / 値 |
+|----|------|------------------|
+| `Timestamp` | 提示時刻 (`value / timescale` 秒の有理数) | `value: i64`, `timescale: i32`, `seconds() -> f64` |
+| `PictureType` | ピクチャータイプ | `P`, `B`, `I` (IDR を含む), `Unknown` |
+
+`Timestamp::seconds()` は `value / timescale` の `f64` 除算で、`timescale` が 0 の場合は `value` の符号に応じて無限大または `NaN` になる (CoreMedia の `CMTimeGetSeconds` と同じ挙動)。`timescale` には、その時刻を生成したときにエンコーダーが入力フレームのタイムスタンプに使っていた値 (`EncoderConfig::fps_numerator`) が入る。`Encoder::reconfigure()` でフレームレートを変更すると、変更前後のフレームで `timescale` が変わる。
+
+`PictureType` は Video Toolbox が出力サンプルに付けるフレーム種別の情報から判定できる範囲だけを表す。Video Toolbox は I フレームと IDR フレームを区別しないため `I` には IDR フレームも含まれる。`B` は `allow_frame_reordering` が未指定 (既定で再順序付け有効) または `Some(true)` のときに現れる。キーフレームかどうかは `PictureType::I` かどうかで判定する。
+
+### 統計値型
+
+| 型 | 説明 | 主要メソッド |
+|----|------|-------------|
+| `Counter` | 単調増加の通算値 (`AtomicU64` のラッパー) | `get()`, `new()`, `Clone` (現在値のコピー) |
+| `Gauge` | 増減する時点値 (`AtomicU64` のラッパー) | `get()`, `new()`, `Clone` (現在値のコピー) |
+
+増減 (`inc()` / `dec()`) はクレート内部専用で、利用側は `get()` で読み出すだけになる。`Gauge::dec()` は 0 を下回らず 0 で飽和する。
+
 ### エンコード用
 
 | 型 | 説明 | 主要メソッド / 値 |
 |----|------|------------------|
-| `Encoder<H: EncodeHandler>` | H.264 / H.265 エンコーダー | `new(config, handler)`, `encode(frame, options, user_data)`, `encode_pixel_buffer(ptr, options, user_data)` (unsafe), `reconfigure(config)`, `finish()` |
+| `Encoder<H: EncodeHandler>` | H.264 / H.265 エンコーダー (Send) | `new(config, handler)`, `stats() -> &EncoderStats`, `config() -> &EncoderConfig`, `encode(frame, options, user_data)`, `encode_pixel_buffer(ptr, options, user_data)` (unsafe), `reconfigure(params)`, `finish()` |
 | `EncoderConfig` | エンコーダー設定 | `width`, `height`, `codec`, `pixel_format`, `average_bitrate`, `fps_numerator`, `fps_denominator`, `prioritize_encoding_speed_over_quality`, `real_time`, `maximize_power_efficiency`, `allow_frame_reordering`, `allow_temporal_compression`, `max_key_frame_interval`, `max_key_frame_interval_duration`, `max_frame_delay_count`, `data_rate_limits` |
+| `DataRateLimit` | 短期ウィンドウのデータレート上限 1 個分 | `bytes: u64`, `window: Duration` |
 | `CodecConfig` | コーデック種別 + 固有設定 | `H264(H264EncoderConfig)`, `Hevc(HevcEncoderConfig)` |
 | `H264EncoderConfig` | H.264 固有設定 | `profile: Option<H264Profile>`, `entropy_mode: Option<H264EntropyMode>` |
 | `H264Profile` | H.264 プロファイル | `Baseline`, `Main`, `High` |
 | `H264EntropyMode` | H.264 エントロピー符号化 | `Cavlc` (高速), `Cabac` (高品質) |
 | `HevcEncoderConfig` | H.265 固有設定 | `profile: Option<HevcProfile>`, `allow_open_gop: Option<bool>` |
 | `HevcProfile` | H.265 プロファイル | `Main`, `Main10` |
-| `EncodeOptions` | フレーム単位のエンコードオプション | `force_key_frame: bool` (`Default` あり) |
+| `ReconfigureParams` | `reconfigure()` で動的に更新する項目 (`Default` あり) | `average_bitrate: Option<u64>`, `expected_frame_rate: Option<u32>` |
+| `EncodeOptions` | フレーム単位のエンコードオプション (`Default` あり) | `force_key_frame: bool` |
 | `FrameData<'a>` | 入力フレームデータ (借用) | `I420 { y, u, v }`, `Nv12 { y, uv }` |
 | `EncodedFrame<T>` | エンコード結果 (AVCC 形式) | `timestamp: Option<Timestamp>`, `picture_type: PictureType`, `sps_list: Vec<Vec<u8>>`, `pps_list: Vec<Vec<u8>>`, `vps_list: Vec<Vec<u8>>` (H.265 のみ), `data: Vec<u8>`, `user_data: T` |
-| `EncodeHandler` | エンコード結果通知トレイト | `type UserData`, `type Error: From<crate::Error>`, `on_encoded(result: Result<EncodedFrame<UserData>, Error>)` |
-| `FnEncodeHandler<T, E>` | `FnMut(Result<EncodedFrame<T>, E>)` ラッパー | `new(f)` |
+| `EncodeHandler` | エンコード結果通知トレイト | `type UserData: Send + 'static`, `type Error: From<crate::Error> + Send + 'static`, `on_encoded(&mut self, result: Result<EncodedFrame<UserData>, Error>)` |
+| `FnEncodeHandler<T, E = Error>` | `FnMut(Result<EncodedFrame<T>, E>)` ラッパー | `new(f)` |
+| `EncoderStats` | エンコーダーの統計値 (`Clone` あり) | `total_encode_count`, `total_output_frame_count`, `total_error_count`, `total_reconfigure_count` (`Counter`), `in_flight_frames` (`Gauge`) |
 
-`EncoderConfig` には `Default` 実装がない (全フィールド明示が必須)。
+`EncoderConfig` のフィールド型:
 
-`Option` のフィールドは `None` が「そのプロパティを設定せず Video Toolbox の既定に任せる」を意味する。`Encoder::new()` は指定されたプロパティを 1 個ずつ設定し、選択されたエンコーダーが受け付けなかったプロパティがある場合は `Error::VideoToolbox` を返す。このエラーの `property` に、受け付けられなかったプロパティ名が入る。
+- `width` / `height` / `fps_numerator` / `fps_denominator`: `u32`
+- `average_bitrate`: `Option<u64>`
+- `prioritize_encoding_speed_over_quality` / `real_time` / `maximize_power_efficiency` / `allow_frame_reordering` / `allow_temporal_compression`: `Option<bool>`
+- `max_key_frame_interval` / `max_frame_delay_count`: `Option<NonZeroU32>`
+- `max_key_frame_interval_duration`: `Option<Duration>`
+- `data_rate_limits`: `Vec<DataRateLimit>`
+
+`EncoderConfig` には `Default` 実装がない (全フィールド明示が必須)。`Option` のフィールドは `None` が「そのプロパティを設定せず Video Toolbox の既定に任せる」を意味する。`Encoder::new()` は指定されたプロパティを 1 個ずつ `VTSessionSetProperty` で設定し、選択されたエンコーダーが受け付けなかったプロパティがある場合は `Error::VideoToolbox` を返す。このエラーの `property` に、受け付けられなかったプロパティ名が入る。`fps_numerator` / `fps_denominator` は PTS 計算にも使うため `Option` ではなく、`kVTCompressionPropertyKey_ExpectedFrameRate` は `fps_numerator.div_ceil(fps_denominator)` で常に設定する。
+
+`data_rate_limits` は空 `Vec` が「`kVTCompressionPropertyKey_DataRateLimits` を設定しない」を意味する。既定値はエンコーダーによって異なるため、空 `Vec` が上限なしを保証するものではない。Video Toolbox はエンコード開始後の `DataRateLimits` の変更を無視するため、`Encoder::reconfigure()` の対象には含めない (`Encoder` を作り直せば変更・解除できる)。
 
 ### デコード用
 
 | 型 | 説明 | 主要メソッド / 値 |
 |----|------|------------------|
-| `Decoder<H: DecodeHandler>` | H.264 / H.265 / VP9 / AV1 デコーダー | `new(config, handler)`, `decode(data, user_data)`, `update_format(codec)`, `finish()` |
+| `Decoder<H: DecodeHandler>` | H.264 / H.265 / VP9 / AV1 デコーダー (Send) | `new(config, handler)`, `stats() -> &DecoderStats`, `decode(data, user_data)`, `update_format(codec)`, `finish()` |
 | `DecoderConfig<'a>` | デコーダー設定 | `codec: DecoderCodec<'a>`, `pixel_format: PixelFormat` |
-| `DecoderCodec<'a>` | コーデック + 初期化パラメータ | `H264 { sps, pps, nalu_len_bytes }`, `Hevc { vps, sps, pps, nalu_len_bytes }`, `Vp9 { width, height }`, `Av1 { width, height }` |
+| `DecoderCodec<'a>` | コーデック + 初期化パラメータ | `H264 { sps, pps, nalu_len_bytes: u32 }`, `Hevc { vps, sps, pps, nalu_len_bytes: u32 }`, `Vp9 { width: u32, height: u32 }`, `Av1 { width: u32, height: u32 }` |
 | `DecodedFrame<T>` | デコード結果 | `I420 { frame: I420Frame, user_data: T }`, `Nv12 { frame: Nv12Frame, user_data: T }` |
 | `I420Frame` | I420 形式の出力フレーム | `y_plane()`, `u_plane()`, `v_plane()`, `y_stride()`, `u_stride()`, `v_stride()`, `width()`, `height()` |
 | `Nv12Frame` | NV12 形式の出力フレーム | `y_plane()`, `uv_plane()`, `y_stride()`, `uv_stride()`, `width()`, `height()` |
-| `DecodeHandler` | デコード結果通知トレイト | `type UserData`, `type Error: From<crate::Error>`, `on_decoded(result: Result<DecodedFrame<UserData>, Error>)` |
-| `FnDecodeHandler<T, E>` | `FnMut(Result<DecodedFrame<T>, E>)` ラッパー | `new(f)` |
+| `DecodeHandler` | デコード結果通知トレイト | `type UserData: Send + 'static`, `type Error: From<crate::Error> + Send + 'static`, `on_decoded(&mut self, result: Result<DecodedFrame<UserData>, Error>)` |
+| `FnDecodeHandler<T, E = Error>` | `FnMut(Result<DecodedFrame<T>, E>)` ラッパー | `new(f)` |
+| `DecoderStats` | デコーダーの統計値 (`Clone` あり) | `total_decode_count`, `total_output_frame_count`, `total_error_count`, `total_create_session_count`, `total_update_format_count`, `total_recreate_session_count` (`Counter`), `in_flight_frames` (`Gauge`) |
 
-`Decoder::decode` に渡す圧縮データは AVCC 形式 (NAL ユニットの先頭に `nalu_len_bytes` バイトの長さフィールドが付く形式)。Annex B 形式は別途変換が必要。
+`Decoder::decode` に渡す圧縮データは AVCC 形式 (NAL ユニットの先頭に `nalu_len_bytes` バイトの長さフィールドが付く形式)。Annex B 形式は別途変換が必要。データは内部で `Vec` にコピーしてから `CMBlockBuffer` に渡す。
 
-### コールバックの実行スレッド
+`DecoderCodec::H264` / `Hevc` の `nalu_len_bytes` は 1 / 2 / 4 のいずれかでなければならず、パラメータセットは空であってはならない。違反時は `Error::InvalidConfig`。
+
+### コールバックの実行スレッドと panic
 
 `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は **Video Toolbox のコールバックスレッド**から呼び出される。`encode()` / `decode()` を呼んだスレッドではない。完了通知をメインスレッドで処理したい場合は `std::sync::mpsc` などでメッセージを受け流すこと (サンプル `examples/raden_to_mp4.rs` を参照)。
+
+ハンドラは `Send + 'static` で、ヒープに `Box` として保持される。`on_encoded` / `on_decoded` 内で panic してもプロセスは abort せず、panic は捕捉されてエラーログ (コールバック名 + panic メッセージ) が出力され、セッションは継続する。ただし、ホストアプリが abort するカスタム panic hook をインストールしている場合や `panic=abort` ビルドでは捕捉されず abort する。
+
+### 統計値の意味
+
+- `total_encode_count` / `total_decode_count`: フレームが `VTCompressionSessionEncodeFrame` / `VTDecompressionSessionDecodeFrame` に受理された通算回数。送信前の検証エラーや FFI 自体の失敗は計上しない。
+- `total_output_frame_count`: 出力コールバックに `Ok` を渡した通算回数。
+- `total_error_count`: 出力コールバックに `Err` を渡した通算回数。フレームドロップなどで出力データ / 画像が得られなかった場合はこちらが増える (受理されたフレームには必ず 1 回コールバックが来る)。
+- `total_reconfigure_count`: `reconfigure()` が `VTSessionSetProperties` に成功した通算回数 (no-op と失敗は計上しない)。
+- `total_create_session_count`: `VTDecompressionSessionCreate` に成功した通算回数 (`Decoder::new()` の初回作成を含む)。
+- `total_update_format_count`: `update_format()` が既存セッションを流用した通算回数。
+- `total_recreate_session_count`: `update_format()` がセッションを再作成した通算回数。
+- `in_flight_frames`: 送信済みでまだ出力コールバックがユーザーデータを回収していないフレーム数の現在値。送信の直前に増え、コールバックがユーザーデータを回収した時点 (ユーザーハンドラーの実行前) に減る。Video Toolbox が満杯を起こさない上限値は公開していないため、上限は利用側で決めて `finish()` を挟む間隔の判断に使う。
+
+統計値はエンコーダー / デコーダーと共有されている値への参照であり、操作スレッドと Video Toolbox のコールバックスレッドの両方が更新する。複数のフィールドを読む間に値が変化し得るため、保存する場合は `clone()` する (`clone()` はフィールド間の一貫性を保証しない)。
 
 ### コーデック情報取得
 
 | 型 / 関数 | 説明 |
 |-----------|------|
-| `supported_codecs() -> Vec<CodecInfo>` | 解像度に依存しないコーデック情報の一覧を返す (macOS のみ) |
+| `supported_codecs() -> Vec<CodecInfo>` | 解像度に依存しないコーデック情報の一覧を返す (macOS のみ、`H264` / `Hevc` / `Vp9` / `Av1` の順) |
 | `query_encoding_capabilities(codec, width, height) -> Option<EncodingCapabilities>` | 指定した解像度でエンコードするときの情報を返す (macOS のみ) |
 | `CodecInfo` | `codec`, `decoding: DecodingInfo`, `encoders: Vec<EncodingInfo>` (`encoders` が空ならエンコード非対応) |
 | `DecodingInfo` | `hardware_accelerated` (`VTIsHardwareDecodeSupported` ベース) |
-| `EncodingInfo` | エンコーダー 1 件の情報。`encoder_id`, `encoder_name`, `codec_name`, `hardware_accelerated`, `supports_frame_reordering`, `supports_multi_pass`, `performance_rating`, `quality_rating`, `has_instance_limit` |
-| `EncodingCapabilities` | `encoder: EncodingInfo` (`query_encoding_capabilities()` の照会で選ばれた 1 件), `profiles: Option<EncodingProfiles>` (このクレートが表現できるプロファイルのみ) |
+| `EncodingInfo` | エンコーダー 1 件の情報 |
+| `EncodingCapabilities` | `encoder: EncodingInfo` (照会で選ばれた 1 件), `profiles: Option<EncodingProfiles>` |
 | `EncodingProfiles` | `H264(Vec<H264EncodingProfile>)`, `Hevc(Vec<HevcEncodingProfile>)` |
 | `H264EncodingProfile` | `Baseline`, `ConstrainedBaseline`, `Main`, `High`, `ConstrainedHigh` |
 | `HevcEncodingProfile` | `Main`, `Main10`, `Main42210` |
 
-コーデック単位の判定には `VTCopyVideoEncoderList` を使用する。エンコーダーの一覧と各エントリの属性は解像度に依存しないため `supported_codecs()` で取得できる。解像度に依存する情報 (どのエンコーダーが選ばれるか、選ばれるエンコーダーが扱うプロファイル、その解像度でハードウェアエンコーダーが使えるか) は `supported_codecs()` には含まれず、`query_encoding_capabilities()` で照会する。この関数は `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使うため、`VTCompressionSessionCreate` と同じ既定の選択 (解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ) の結果が返る。この解像度でハードウェアエンコーダーが使えるかは、返る `EncodingInfo::hardware_accelerated` で判定する (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と一致する)。`profiles` に入るのは、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが `H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけであり、含まれないことが「そのプロファイルが使えない」ことを意味するとは限らない。
+`EncodingInfo` のフィールド:
+
+- `encoder_id: String` (`kVTVideoEncoderList_EncoderID`、逆 DNS 形式。機械的な判定にはこれを使う)
+- `encoder_name: Option<String>` (`kVTVideoEncoderList_EncoderName`、表示用)
+- `codec_name: Option<String>` (`kVTVideoEncoderList_CodecName`、表示用)
+- `hardware_accelerated: bool` (キーが無い場合は false)
+- `supports_frame_reordering: bool` (キーが無い場合は true と見なす仕様)
+- `supports_multi_pass: bool` (キーが無い場合は false。macOS では常に false)
+- `performance_rating: Option<f64>` / `quality_rating: Option<f64>` (同じ環境で得た値同士の大小比較にのみ使う)
+- `has_instance_limit: Option<bool>` (`Some(true)` は同時生成数の上限あり。キーが無い場合は `None` で、上限なしを意味しない)
+
+コーデック単位の判定には `VTCopyVideoEncoderList` を使用する。エンコーダーの一覧と各エントリの属性は解像度に依存しないため `supported_codecs()` で取得できる。解像度に依存する情報 (どのエンコーダーが選ばれるか、選ばれるエンコーダーが扱うプロファイル、その解像度でハードウェアエンコーダーが使えるか) は `supported_codecs()` には含まれず、`query_encoding_capabilities()` で照会する。この関数は `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使うため、`VTCompressionSessionCreate` と同じ既定の選択 (解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェアエンコーダーを選ぶ) の結果が返る。この解像度でハードウェアエンコーダーが使えるかは、返る `EncodingInfo::hardware_accelerated` で判定する (`kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と一致する)。
+
+`query_encoding_capabilities()` が `None` を返すのは次の場合。
+
+- コーデックにエンコーダーが無い (VP9 / AV1)
+- `width` または `height` が 0、もしくは `i32` に収まらない
+- 照会に失敗した、または選ばれたエンコーダーを一覧から特定できなかった
+
+`profiles` に入るのは、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが `H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけであり、含まれないことが「そのプロファイルが使えない」ことを意味するとは限らない。Video Toolbox がプロファイル一覧を返さなかった場合は `None` (`None` はエンコード非対応を意味しない)。
 
 ## エラー型
 
@@ -111,11 +184,12 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 | `PixelFormatMismatch { expected, actual }` | エンコーダーの `pixel_format` と入力 `FrameData` のフォーマット不一致 |
 | `InsufficientFrameData { plane, expected, actual }` | フレームデータのサイズ不足 (プレーン名と必要バイト数) |
 | `UnsupportedCodec { codec }` | VP9 / AV1 が環境で利用できない場合など |
-| `InvalidConfig { field, reason }` | `width` / `height` / `fps_numerator` / `fps_denominator` / `average_bitrate` 等の不正値 |
-| `LimitExceeded { reason }` | PTS 加算オーバーフロー、プレーンコピー算術オーバーフロー、CMBlockBuffer 長が防御的上限超過など |
-| `CfObjectCreationFailed { function }` | `CFDictionaryCreate` / `CFNumberCreate` 等が NULL を返した |
+| `InvalidConfig { field, reason }` | `width` / `height` / `fps_numerator` / `fps_denominator` / `average_bitrate` / `data_rate_limits` / `max_key_frame_interval` / `max_frame_delay_count` / `nalu_len_bytes` / `parameter_sets` 等の不正値 |
+| `LimitExceeded { reason }` | PTS 加算 / 再スケールのオーバーフロー、プレーンコピー算術オーバーフロー、CMBlockBuffer 長が防御的上限超過、コールバックの NULL バッファなど |
+| `CfObjectCreationFailed { function }` | `CFDictionaryCreate` / `CFNumberCreate` / `CFArrayCreate` 等が NULL を返した |
+| `UnknownPixelFormat { expected, fourcc }` | `encode_pixel_buffer()` に I420 / Nv12 のいずれでもない FourCC が渡された |
 
-`Error` は `std::error::Error` と `std::fmt::Display` を実装している。
+`Error` は `std::error::Error` と `std::fmt::Display` を実装している。`VideoToolbox` の表示は `[shiguredo_video_toolbox] {function}({property}) failed: status={status}` の形式。
 
 ## コード例
 
@@ -160,6 +234,7 @@ let mut encoder = Encoder::new(
                     encoded.picture_type,
                     encoded.user_data
                 );
+                // キーフレームかどうかは picture_type == PictureType::I で判定する
                 // encoded.sps_list / pps_list はキーフレーム時のみ非空
             }
             Err(e) => eprintln!("encode callback error: {e}"),
@@ -176,6 +251,27 @@ encoder.encode(&frame, &EncodeOptions { force_key_frame: true }, 1)?;
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
+```
+
+### エンコード結果の提示時刻とピクチャータイプ
+
+```rust
+use shiguredo_video_toolbox::{EncodedFrame, PictureType};
+
+// エンコードコールバックの中
+let encoded: EncodedFrame<u64> = result?;
+
+if let Some(timestamp) = encoded.timestamp {
+    // timescale は Encoder::reconfigure() でフレームレートを変えると変わるため、
+    // 複数の timescale をまたいで比較する場合は seconds() を使う
+    println!("pts: {} (timescale={})", timestamp.seconds(), timestamp.timescale);
+}
+match encoded.picture_type {
+    PictureType::I => println!("keyframe"), // IDR フレームも含む
+    PictureType::B => println!("b frame"),
+    PictureType::P => println!("p frame"),
+    PictureType::Unknown => println!("unknown picture type"),
+}
 ```
 
 ### デコード
@@ -243,6 +339,25 @@ for result in rx.try_iter() {
 }
 ```
 
+### 統計値
+
+```rust
+// 送信済みで処理中のフレーム数を確認し、閾値に達したらフラッシュする
+let in_flight = encoder.stats().in_flight_frames.get();
+if in_flight >= 4 {
+    encoder.finish()?;
+}
+
+// 通算値のコピーを取得する (フィールド間の一貫性は保証されない)
+let stats = encoder.stats().clone();
+println!(
+    "encoded={} output={} error={}",
+    stats.total_encode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get()
+);
+```
+
 ### VP9 / AV1 デコードの環境依存
 
 `Vp9 { width, height }` / `Av1 { width, height }` での初期化失敗には 2 種類ある。
@@ -285,25 +400,34 @@ let vp9_hardware_decode = supported_codecs()
     .unwrap_or(false);
 ```
 
-### 動的解像度変更
+### 動的設定更新
 
 #### エンコーダー
 
-`reconfigure()` は **常にセッションを破棄して再作成**する。未出力フレームは内部で `finish()` 経由でフラッシュされ、エンコード完了コールバックで通知される。
+`reconfigure()` は `ReconfigureParams` を受け取り、`VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映する。**セッション再作成は行わず、未出力フレームの自動フラッシュも行わない**。フラッシュが必要なら呼び出し側で先に `finish()` を明示する。
+
+- 動的に更新できるのは `average_bitrate` / `expected_frame_rate` の 2 項目のみ。解像度・コーデック・ピクセルフォーマットは `Encoder` を作り直す
+- 全項目 `None` の場合は no-op として `Ok(())`
+- `VTSessionSetProperties` が失敗した場合は `config()` を変更せず、セッションも生かしたままエラーを返す
+- `expected_frame_rate` を更新すると `fps_numerator` / `fps_denominator` は `expected_frame_rate / 1` に正規化される (分数 fps は保持されない)。内部の `next_input_pts` は新しい timescale に切り上げ (`div_ceil`) で再スケールされる。切り上げのため 1 回の更新につき最大 `1 / expected_frame_rate` 秒だけ PTS が前倒しされ、頻繁に更新すると累積し得る。再スケール結果が `i64` を超える場合は `Error::LimitExceeded`
 
 ```rust
-let new_config = EncoderConfig {
-    width: 1280,
-    height: 720,
-    // ... 既存と同じフィールドを埋める (Default なし)
-    ..
-};
-encoder.reconfigure(new_config)?;
+use shiguredo_video_toolbox::ReconfigureParams;
+
+// None の項目は現在値を維持する
+encoder.reconfigure(ReconfigureParams {
+    average_bitrate: Some(2_000_000),
+    expected_frame_rate: Some(60),
+    ..Default::default()
+})?;
+
+// Encoder::config() は初期化時の設定に直近の動的更新を反映した値を返す
+// (Video Toolbox が内部で丸めた実効値ではない)
 ```
 
 #### デコーダー
 
-`update_format()` は `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しい `CMVideoFormatDescription` を受け入れ可能か判定し、**可能な場合はセッションを流用、不可能な場合のみ再作成**する。
+`update_format()` は先に `finish()` を呼び、`VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しい `CMVideoFormatDescription` を受け入れ可能か判定し、**可能な場合はセッションを流用、不可能な場合のみ再作成**する。
 
 ```rust
 // H.264: SPS/PPS が更新された場合
@@ -313,15 +437,45 @@ decoder.update_format(DecoderCodec::H264 {
     nalu_len_bytes: 4,
 })?;
 
-// VP9: 解像度が変更された場合
+// H.265: VPS/SPS/PPS が更新された場合
+decoder.update_format(DecoderCodec::Hevc {
+    vps: &new_vps,
+    sps: &new_sps,
+    pps: &new_pps,
+    nalu_len_bytes: 4,
+})?;
+
+// VP9 / AV1: 解像度が変更された場合
 decoder.update_format(DecoderCodec::Vp9 { width: 1280, height: 720 })?;
 ```
 
 | | エンコーダー | デコーダー |
 |---|---|---|
-| メソッド | `reconfigure(EncoderConfig)` | `update_format(DecoderCodec)` |
-| 仕組み | 常にセッション破棄 + 再作成 | 受け入れ可否判定 → 必要時のみ再作成 |
-| 引数 | 全エンコーダー設定 | コーデック + パラメータセットのみ |
+| メソッド | `reconfigure(ReconfigureParams)` | `update_format(DecoderCodec)` |
+| 仕組み | `VTSessionSetProperties` で動的更新 (セッション再作成なし) | 受け入れ可否判定 → 必要時のみ再作成 |
+| 引数 | 動的更新可能な項目のみ | コーデック + パラメータセットのみ |
+| 対応外項目 | 解像度・コーデック・ピクセルフォーマット → `Encoder` を作り直す | `DecoderCodec` バリアントが対応するもの以外 |
+
+### データレートのハードリミット
+
+`DataRateLimit` は `window` 秒間の任意の連続区間で圧縮データの総量が `bytes` を超えないことを要求する。`AverageBitRate` だけでは短期ウィンドウで大きくオーバーシュートするため、併設して使う。
+
+```rust
+use std::time::Duration;
+use shiguredo_video_toolbox::{DataRateLimit, EncoderConfig};
+
+let config = EncoderConfig {
+    // ...
+    average_bitrate: Some(2_000_000),
+    data_rate_limits: vec![DataRateLimit {
+        bytes: 93_750, // 1 秒あたり 750 kbps
+        window: Duration::from_secs(1),
+    }],
+    // ...
+};
+```
+
+指定できるリミットは Video Toolbox の仕様上 0〜2 個。`bytes` / `window` に 0 は指定できず、`bytes` は `i64::MAX` 以下である必要がある。エンコード開始後の変更は Video Toolbox が無視するため構築時専用。
 
 ### ゼロコピーで `CVPixelBuffer` を直接エンコード
 
@@ -343,14 +497,15 @@ unsafe {
 - `EncoderConfig` の `width` / `height` / `pixel_format` と整合していること (寸法不一致は即クラッシュしないがエンコード結果が不正になりうる)
 - 呼び出し前に `CVPixelBufferLockBaseAddress` を解除しておくこと (本関数はロック / アンロックを行わない)
 
-内部で `CFRetain` するため、呼び出し元はこの関数の後にポインタ元を drop して構わない。ピクセルフォーマット (`y420` / `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`) のみは検証され、不一致時は `Error::PixelFormatMismatch`。
+内部で `CFRetain` するため、呼び出し元はこの関数の後にポインタ元を drop して構わない。ピクセルフォーマットは検証され、`y420` / `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange` 以外の FourCC は `Error::UnknownPixelFormat`、I420 / Nv12 のいずれかだが設定と一致しない場合は `Error::PixelFormatMismatch`。
 
 ## 重要な実装メモ
 
 ### コールバック受信スレッド
 
 - `EncodeHandler::on_encoded` / `DecodeHandler::on_decoded` は Video Toolbox 内部スレッドから呼ばれる
-- ハンドラは `Send + 'static` で、ヒープに `Box<H>` として保持される (生存期間中アドレス不変)
+- ハンドラは `Send + 'static` で、ヒープに `Box` として保持される (生存期間中アドレス不変)
+- ユーザーハンドラの panic は `extern "C"` 境界を越える前に捕捉され、エラーログを出力してセッションを継続する
 - `Encoder` / `Decoder` 自体も `Send` (Video Toolbox セッションはスレッドセーフ)
 
 ### キーフレーム時のパラメータセット
@@ -358,7 +513,12 @@ unsafe {
 `EncodedFrame::sps_list` / `pps_list` / `vps_list` は **キーフレーム時のみ非空**になる。
 非キーフレームでは 3 つとも空 `Vec` が返る。MP4 ヘッダー (avcC / hvcC) の構築はキーフレーム到達時に行うこと。
 
-NAL ユニット長プレフィックスは **4 バイト固定**でエンコードされる (`nalu_header_length != 4` は内部でログ + 破棄)。
+NAL ユニット長プレフィックスは **4 バイト固定**でエンコードされる (`nalu_header_length != 4` はエラーとしてコールバックに通知される)。
+
+### `finish()` と `Drop`
+
+- `Encoder::finish()` は `VTCompressionSessionCompleteFrames` で残りのフレームをフラッシュする。`Encoder` の `Drop` はフラッシュせずセッションを無効化して解放するだけなので、残りの出力が必要なら明示的に `finish()` を呼ぶ
+- `Decoder::finish()` は `VTDecompressionSessionFinishDelayedFrames` と `VTDecompressionSessionWaitForAsynchronousFrames` で遅延フレームを排出し、非同期コールバックの完了まで待つ。`Decoder` の `Drop` も `finish()` を呼ぶ (失敗時はエラーログ)
 
 ### ストライド対応
 
@@ -389,28 +549,35 @@ for row in 0..frame.height() {
 - `y.len() >= width * height`
 - `uv.len() >= width * ceil(height/2)`
 
-不足時は `Error::InsufficientFrameData { plane, expected, actual }`。`y` のストライドは入力幅と等しい前提 (CVPixelBuffer 内部ストライドが大きい場合は行ごとにコピーされる)。
+不足時は `Error::InsufficientFrameData { plane, expected, actual }`。`y` のストライドは入力幅と等しい前提 (行ごとにコピーされる)。
+
+`FrameData` のバリアントが `EncoderConfig::pixel_format` と一致しない場合は送信前に `Error::PixelFormatMismatch`。
 
 ### 検証される設定値
 
-`EncoderConfig` の `validate_config` で以下を拒否する:
+`Encoder::new` の `validate_config` で以下を拒否する (`Error::InvalidConfig`):
 
 - `width == 0` / `height == 0` / `width > i32::MAX` / `height > i32::MAX`
-- `fps_numerator == 0` / `fps_denominator == 0` / `fps_numerator > i32::MAX`
-- `average_bitrate > i64::MAX as u64`
+- `fps_numerator == 0` / `fps_numerator > i32::MAX` (CMTime の timescale 用)
+- `fps_denominator == 0` (i32 上限チェックは無し)
+- `average_bitrate == 0` / `average_bitrate > i64::MAX as u64`
+- `data_rate_limits.len() > 2` / 各 `bytes == 0` / `bytes > i64::MAX as u64` / `window` が 0
+- `max_key_frame_interval > i32::MAX` / `max_frame_delay_count > i32::MAX`
 
-`DecoderCodec::Vp9` / `Av1` は `width` / `height` の同じ範囲チェックを通る。
+`Encoder::reconfigure` の `validate_reconfigure_params` でも `expected_frame_rate` (0 / `i32::MAX` 超) と `average_bitrate` を同じ規則で検証する (フレームレートの検証が先)。
+
+`DecoderCodec::H264` / `Hevc` は `nalu_len_bytes` が 1 / 2 / 4 以外、またはパラメータセットが空の場合に `Error::InvalidConfig`。`DecoderCodec::Vp9` / `Av1` は `width` / `height` の同じ範囲チェックを通る。
 
 ### 防御的上限
 
 - パラメータセット 1 個あたり: 65535 バイト (`u16::MAX`、ISO/IEC 14496-15 の `unsigned int(16)` 由来)
 - エンコード出力 1 フレーム: 256 MB (`CMBlockBufferGetDataLength` 異常時の OOM 防止)
 
-超過時はログを出力してフレームを破棄する。クランプはしない (ビットストリームを壊すため)。
+超過時は `Error::LimitExceeded` をコールバックで通知し、フレームを破棄する。クランプはしない (ビットストリームを壊すため)。
 
 ### PTS
 
-`Encoder` の内部入力 PTS は `next_input_pts` で `checked_add(fps_denominator as i64)` で更新する。オーバーフロー時は `Error::LimitExceeded`。
+`Encoder` の内部入力 PTS は `next_input_pts` を `checked_add(fps_denominator as i64)` で進める。送信前にオーバーフローを検査し、オーバーフロー時はフレームを送信せず `Error::LimitExceeded` を返して `next_input_pts` を変更しない。`reconfigure()` の `expected_frame_rate` 更新時は新しい timescale へ切り上げで再スケールする (オーバーフロー時は `Error::LimitExceeded`)。
 
 ## サポート対応表
 
@@ -434,11 +601,11 @@ VP9 / AV1 はハードウェアサポートに依存するため、環境によ�
 
 ## 依存
 
-ランタイム依存は `log` のみ。ビルド時に `bindgen` で Apple SDK のヘッダーから FFI を生成する。
+ランタイム依存は `tracing` のみ。ビルド時に `bindgen` で Apple SDK のヘッダーから FFI を生成する。
 
 ```toml
 [dependencies]
-log = "0.4"
+tracing = "0.1"
 
 [build-dependencies]
 bindgen = "0.72"
@@ -446,6 +613,9 @@ bindgen = "0.72"
 
 ## テストとサンプル
 
-- `examples/raden_to_mp4.rs`: raden で描画したアニメーションを H.264 / H.265 でエンコードし MP4 に書き出す (mpsc でコールバック結果を main スレッドに受け流すパターンの参考)
-- `tests/test_encoder.rs` / `tests/test_decoder.rs`: 単体テスト (セルフホストランナーで実行、Intel Mac や古い macOS では失敗しうる)
+- `examples/raden_to_mp4.rs`: raden で描画したアニメーションを H.264 / H.265 でエンコードし MP4 に書き出す。mpsc でコールバック結果を main スレッドに受け流すパターンと、取得した `Timestamp` からサンプルの尺を求める例の参考
+- `tests/test_encoder.rs` / `tests/test_decoder.rs`: 実 FFI を使う結合テスト (セルフホストランナーの macOS / ARM64 を前提とし、Intel Mac や古い macOS では失敗しうる)
 - `tests/test_codec_info.rs`: `supported_codecs()` と `query_encoding_capabilities()` のテスト
+- `tests/test_error.rs`: `Error` の `Display` と `std::error::Error` 実装のテスト
+- `tests/helpers.rs`: テスト間で共有するヘルパー (tracing のログ収集)
+- `pbt/tests/prop_encoder.rs`: proptest による `Encoder::new` / `Encoder::reconfigure` の拒否域の検証 (`make pbt` / `make pbt-with-cover`)
