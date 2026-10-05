@@ -1,7 +1,7 @@
 # VTCompressionSession 専用の所有権ガードを追加してエラーパスでも invalidate する
 
 - Created: 2026-10-01
-- Completed: {YYYY-MM-DD}
+- Completed: 2026-10-05
 - Branch: feature/refactor-compression-session-guard
 - Polished: {YYYY-MM-DD}
 
@@ -49,3 +49,34 @@
 - issue 0079: 未使用セッションを invalidate なしの `CFRelease` のみで解放してよい根拠を Apple の一次資料で確認した。本 issue はその仕様に依存しない解放方法へ変更するもので、0079 の結論 (現状のコードは正しい) は覆さない
 - issue 0078: `CfPtrMut::into_raw` を追加した。本 issue のガードも同じ目的で `into_raw` を持つ
 - issue 0058: エラーパスでのセッションリークを `CfPtrMut` ガードで修正した。本 issue はそのガードをセッション専用のものに置き換える
+
+## 解決方法
+
+`VTCompressionSessionRef` 専用の所有権ガードを追加し、エラーパスでも無効化してから解放するようにした。
+
+### ガード
+
+- `CompressionSessionGuard` を追加した。保持するセッションは非 null であることを前提とし、`Drop` は
+  `VTCompressionSessionInvalidate` で無効化してから `CFRelease` で解放する
+- `into_raw` を持ち、`create_compression_session` の成功パスはこれで所有権を `Encoder` に移して
+  `Encoder::drop` に破棄を委ねる。ガードを生かしたまま返すと use-after-free と二重解放になること、
+  `into_raw` の後に `Err` を返すとリークすることはコードコメントに制約として明記した
+- 無効化してから解放する手順は Apple Developer Documentation の
+  `VTCompressionSessionInvalidate(_:)` の Discussion と Note を根拠としてコードコメントに引用した
+- これにより「未使用セッションは invalidate なしの `CFRelease` で解放してよい」という根拠コメント
+  (Apple の一次資料の引用を含む) が不要になったため削除した
+
+### テスト
+
+- `src/encoder/session.rs` の `#[cfg(test)]` に、セッションを `CFRetain` で 1 参照だけ余分に保持して
+  からガードを drop し、残った参照への `VTSessionSetProperty` が `kVTInvalidSessionErr` を返すことで
+  無効化を観測するテストを追加した
+- `into_raw` が無効化しないことは、所有権を移した後に `VTSessionSetProperty` が成功する
+  (`noErr`) ことで検証した
+- `Drop` から `VTCompressionSessionInvalidate` を外すと無効化のテストが失敗することを実機で確認し、
+  観測方法が機能することを確かめた
+
+### その他
+
+- `CfPtrMut::into_raw` は圧縮セッション以外に利用箇所が無くなり、未使用のため削除した
+- CHANGES.md の `## develop` の `### misc` に `[UPDATE]` エントリを追加した
