@@ -11,6 +11,27 @@
 
 ## develop
 
+- [CHANGE] `EncoderConfig` / `H264EncoderConfig` / `HevcEncoderConfig` のプロパティ指定を `Option` にし、
+  未指定なら設定せず未対応なら `Encoder::new` がエラーを返すようにする
+  - `Encoder::new` はプロパティを 1 個ずつ `VTSessionSetProperty` で設定して戻り値を確認する。
+    `VTSessionSetProperties` は辞書にまとめた未対応のプロパティでも `noErr` を返すため、
+    エンコーダーに反映されなかった指定を検出できなかった
+  - `EncoderConfig` の `prioritize_encoding_speed_over_quality` / `real_time` / `maximize_power_efficiency` /
+    `allow_frame_reordering` / `allow_temporal_compression`、`H264EncoderConfig` の `profile` /
+    `entropy_mode`、`HevcEncoderConfig` の `profile` / `allow_open_gop` を `Option` にし、`None` は
+    「そのプロパティを設定せず Video Toolbox の既定に任せる」とする
+  - 未指定時に Video Toolbox の既定に切り替わることでビットストリームが変わる項目がある。
+    `allow_frame_reordering` の既定はフレーム再順序付け有効であり、`None` にすると B フレームが生成される。
+    `HevcEncoderConfig::allow_open_gop` の既定も有効である
+  - `max_frame_delay_count` は Apple Silicon の Apple エンコーダーが受け付けないため、指定するとエラーになる
+  - `#[non_exhaustive]` ではない公開構造体のフィールドの型変更のため、構造体リテラルで構築している
+    コードは `Some(...)` の追記が必要になる
+  - @melpon
+- [CHANGE] `Error::VideoToolbox` に `property` フィールドを追加する
+  - プロパティを 1 個設定する `VTSessionSetProperty` が失敗した場合に、受け付けられなかった
+    プロパティ名を持たせる。プロパティを指定しない失敗では `None` になる
+  - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合はフィールドの追加が必要になる
+  - @melpon
 - [CHANGE] `EncodedFrame::keyframe` を `picture_type` に置き換える
   - `keyframe` はキーフレームかどうかだけを表すフィールドで、`picture_type` が `I` かどうかと
     同じ意味になる。同じ情報を 2 通りに持つと両者がずれる余地があるため、`picture_type` に統合する
@@ -254,6 +275,11 @@
     プロパティ設定に失敗したエラーパスと `Encoder::drop` の解放手順を揃える
   - 成功パスは `into_raw` で所有権を `Encoder` に移し、無効化せずに引き渡す
   - 圧縮セッションの所有権移転が専用ガードに移り、使われなくなった `CfPtrMut::into_raw` を削除する
+  - @melpon
+- [UPDATE] 未指定のプロパティが設定されないことと、未対応のプロパティを指定したときのエラーを検証するテストを追加する
+  - `max_frame_delay_count` を指定すると Apple Silicon の Apple エンコーダーが受け付けず、
+    `Error::VideoToolbox` の `property` から原因のプロパティ名が分かることを確認する
+  - `allow_frame_reordering` を未指定にすると、Video Toolbox の既定で B フレームが生成されることを確認する
   - @melpon
 
 ## 2026.1.1

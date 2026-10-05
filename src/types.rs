@@ -194,6 +194,20 @@ pub(crate) fn cf_array(values: &[*const c_void]) -> Result<CfPtr<c_void>, Error>
     Ok(CfPtr(ptr.cast()))
 }
 
+/// `bool` に対応する CFBoolean を、プロパティの値として渡せる生ポインタにする
+///
+/// `kCFBooleanTrue` / `kCFBooleanFalse` は Core Foundation が所有する定数であるため、
+/// 返り値を解放してはならない。
+pub(crate) fn cf_boolean(value: bool) -> *const c_void {
+    unsafe {
+        if value {
+            sys::kCFBooleanTrue.cast()
+        } else {
+            sys::kCFBooleanFalse.cast()
+        }
+    }
+}
+
 pub(crate) fn cf_number_i32(n: i32) -> Result<CfPtr<c_void>, Error> {
     let ptr = unsafe {
         sys::CFNumberCreate(

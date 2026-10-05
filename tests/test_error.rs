@@ -35,11 +35,14 @@ fn error_display_unknown_pixel_format() {
 }
 
 /// Error::VideoToolbox の Display 出力が、関数名とステータスコードを含む英語メッセージになることを検証する
+///
+/// プロパティを指定しない呼び出し (`property: None`) では、関数名の後ろに空の `()` が付く。
 #[test]
 fn error_display_video_toolbox() {
     let e = Error::VideoToolbox {
         status: -12_345,
         function: "VTCompressionSessionCreate".into(),
+        property: None,
     };
     let s = e.to_string();
     assert!(
@@ -51,6 +54,25 @@ fn error_display_video_toolbox() {
         s.contains(env!("CARGO_PKG_NAME")),
         "クレート名が含まれること: {s}"
     );
+}
+
+/// Error::VideoToolbox の Display 出力が、受け付けられなかったプロパティ名を含むことを検証する
+///
+/// Video Toolbox がプロパティの設定を受け付けなかった場合に、どのプロパティが原因かを
+/// メッセージから特定できる必要がある。
+#[test]
+fn error_display_video_toolbox_property() {
+    let e = Error::VideoToolbox {
+        status: -12_900,
+        function: "VTSessionSetProperty".into(),
+        property: Some("kVTCompressionPropertyKey_MaxFrameDelayCount".into()),
+    };
+    let s = e.to_string();
+    assert!(
+        s.contains("VTSessionSetProperty(kVTCompressionPropertyKey_MaxFrameDelayCount)"),
+        "実際の出力: {s}"
+    );
+    assert!(s.contains("status=-12900"), "実際の出力: {s}");
 }
 
 /// Error::PixelFormatMismatch の Display 出力が、期待フォーマットと実際のフォーマットを含む

@@ -54,6 +54,11 @@ pub struct Encoder<H: EncodeHandler> {
 
 impl<H: EncodeHandler> Encoder<H> {
     /// エンコーダーのインスタンスを生成する
+    ///
+    /// `config` で指定したプロパティを Video Toolbox に設定する。選択されたエンコーダーが
+    /// 受け付けなかったプロパティがある場合や、値が Video Toolbox の検証を通らなかった
+    /// 場合は [`Error::VideoToolbox`] を返す。このエラーの `property` から、
+    /// 受け付けられなかったプロパティを確認できる。
     pub fn new(config: EncoderConfig, handler: H) -> Result<Self, Error> {
         Self::validate_config(&config)?;
         let context = Box::new(EncodeCallbackContext {
@@ -293,18 +298,18 @@ mod tests {
             width: 960,
             height: 480,
             codec: CodecConfig::H264(H264EncoderConfig {
-                profile: H264Profile::Main,
-                entropy_mode: H264EntropyMode::Cabac,
+                profile: Some(H264Profile::Main),
+                entropy_mode: Some(H264EntropyMode::Cabac),
             }),
             pixel_format: PixelFormat::I420,
             average_bitrate: None,
             fps_numerator: 1,
             fps_denominator: 1,
-            prioritize_encoding_speed_over_quality: false,
-            real_time: false,
-            maximize_power_efficiency: false,
-            allow_frame_reordering: false,
-            allow_temporal_compression: true,
+            prioritize_encoding_speed_over_quality: Some(false),
+            real_time: Some(false),
+            maximize_power_efficiency: Some(false),
+            allow_frame_reordering: Some(false),
+            allow_temporal_compression: Some(true),
             max_key_frame_interval: None,
             max_key_frame_interval_duration: None,
             max_frame_delay_count: None,
@@ -368,8 +373,8 @@ mod tests {
         config.average_bitrate = Some(2_000_000);
         config.fps_numerator = TEST_WINDOW_FRAMES as u32;
         config.fps_denominator = 1;
-        config.real_time = true;
-        config.prioritize_encoding_speed_over_quality = true;
+        config.real_time = Some(true);
+        config.prioritize_encoding_speed_over_quality = Some(true);
         config.data_rate_limits = if set_at_construction {
             vec![DataRateLimit {
                 bytes: LIMIT_BYTES_PER_SEC,

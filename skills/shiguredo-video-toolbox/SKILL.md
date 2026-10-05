@@ -49,20 +49,22 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 | 型 | 説明 | 主要メソッド / 値 |
 |----|------|------------------|
 | `Encoder<H: EncodeHandler>` | H.264 / H.265 エンコーダー | `new(config, handler)`, `encode(frame, options, user_data)`, `encode_pixel_buffer(ptr, options, user_data)` (unsafe), `reconfigure(config)`, `finish()` |
-| `EncoderConfig` | エンコーダー設定 | `width`, `height`, `codec`, `pixel_format`, `average_bitrate`, `fps_numerator`, `fps_denominator`, `prioritize_encoding_speed_over_quality`, `real_time`, `maximize_power_efficiency`, `allow_frame_reordering`, `allow_temporal_compression`, `max_key_frame_interval`, `max_key_frame_interval_duration`, `max_frame_delay_count` |
+| `EncoderConfig` | エンコーダー設定 | `width`, `height`, `codec`, `pixel_format`, `average_bitrate`, `fps_numerator`, `fps_denominator`, `prioritize_encoding_speed_over_quality`, `real_time`, `maximize_power_efficiency`, `allow_frame_reordering`, `allow_temporal_compression`, `max_key_frame_interval`, `max_key_frame_interval_duration`, `max_frame_delay_count`, `data_rate_limits` |
 | `CodecConfig` | コーデック種別 + 固有設定 | `H264(H264EncoderConfig)`, `Hevc(HevcEncoderConfig)` |
-| `H264EncoderConfig` | H.264 固有設定 | `profile: H264Profile`, `entropy_mode: H264EntropyMode` |
+| `H264EncoderConfig` | H.264 固有設定 | `profile: Option<H264Profile>`, `entropy_mode: Option<H264EntropyMode>` |
 | `H264Profile` | H.264 プロファイル | `Baseline`, `Main`, `High` |
 | `H264EntropyMode` | H.264 エントロピー符号化 | `Cavlc` (高速), `Cabac` (高品質) |
-| `HevcEncoderConfig` | H.265 固有設定 | `profile: HevcProfile`, `allow_open_gop: bool` |
+| `HevcEncoderConfig` | H.265 固有設定 | `profile: Option<HevcProfile>`, `allow_open_gop: Option<bool>` |
 | `HevcProfile` | H.265 プロファイル | `Main`, `Main10` |
 | `EncodeOptions` | フレーム単位のエンコードオプション | `force_key_frame: bool` (`Default` あり) |
 | `FrameData<'a>` | 入力フレームデータ (借用) | `I420 { y, u, v }`, `Nv12 { y, uv }` |
-| `EncodedFrame<T>` | エンコード結果 (AVCC 形式) | `keyframe: bool`, `sps_list: Vec<Vec<u8>>`, `pps_list: Vec<Vec<u8>>`, `vps_list: Vec<Vec<u8>>` (H.265 のみ), `data: Vec<u8>`, `user_data: T` |
+| `EncodedFrame<T>` | エンコード結果 (AVCC 形式) | `timestamp: Option<Timestamp>`, `picture_type: PictureType`, `sps_list: Vec<Vec<u8>>`, `pps_list: Vec<Vec<u8>>`, `vps_list: Vec<Vec<u8>>` (H.265 のみ), `data: Vec<u8>`, `user_data: T` |
 | `EncodeHandler` | エンコード結果通知トレイト | `type UserData`, `type Error: From<crate::Error>`, `on_encoded(result: Result<EncodedFrame<UserData>, Error>)` |
 | `FnEncodeHandler<T, E>` | `FnMut(Result<EncodedFrame<T>, E>)` ラッパー | `new(f)` |
 
 `EncoderConfig` には `Default` 実装がない (全フィールド明示が必須)。
+
+`Option` のフィールドは `None` が「そのプロパティを設定せず Video Toolbox の既定に任せる」を意味する。`Encoder::new()` は指定されたプロパティを 1 個ずつ設定し、選択されたエンコーダーが受け付けなかったプロパティがある場合は `Error::VideoToolbox` を返す。このエラーの `property` に、受け付けられなかったプロパティ名が入る。
 
 ### デコード用
 
@@ -105,7 +107,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 
 | バリアント | 説明 |
 |-----------|------|
-| `VideoToolbox { status, function }` | Video Toolbox API のエラー (関数名と status コード) |
+| `VideoToolbox { status, function, property }` | Video Toolbox API のエラー (関数名と status コード)。`property` は受け付けられなかったプロパティ名で、プロパティを指定しない失敗では `None` |
 | `PixelFormatMismatch { expected, actual }` | エンコーダーの `pixel_format` と入力 `FrameData` のフォーマット不一致 |
 | `InsufficientFrameData { plane, expected, actual }` | フレームデータのサイズ不足 (プレーン名と必要バイト数) |
 | `UnsupportedCodec { codec }` | VP9 / AV1 が環境で利用できない場合など |
@@ -129,21 +131,22 @@ let config = EncoderConfig {
     width: 1920,
     height: 1080,
     codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
+        profile: Some(H264Profile::Main),
+        entropy_mode: Some(H264EntropyMode::Cabac),
     }),
     pixel_format: PixelFormat::I420,
     average_bitrate: Some(5_000_000),
     fps_numerator: 30,
     fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
+    prioritize_encoding_speed_over_quality: Some(false),
+    real_time: Some(false),
+    maximize_power_efficiency: Some(false),
+    allow_frame_reordering: Some(false),
+    allow_temporal_compression: Some(true),
     max_key_frame_interval: None,
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
+    data_rate_limits: Vec::new(),
 };
 
 let mut encoder = Encoder::new(
@@ -152,9 +155,9 @@ let mut encoder = Encoder::new(
         match result {
             Ok(encoded) => {
                 println!(
-                    "encoded bytes: {} keyframe={} user_data={}",
+                    "encoded bytes: {} picture_type={:?} user_data={}",
                     encoded.data.len(),
-                    encoded.keyframe,
+                    encoded.picture_type,
                     encoded.user_data
                 );
                 // encoded.sps_list / pps_list はキーフレーム時のみ非空

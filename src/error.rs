@@ -9,6 +9,11 @@ pub enum Error {
         status: i32,
         /// 関数名
         function: String,
+        /// 受け付けられなかったプロパティの名前
+        ///
+        /// Video Toolbox がプロパティの設定を受け付けなかった場合は、そのプロパティの
+        /// 名前が入る。プロパティを指定しない処理の失敗では `None` になる。
+        property: Option<String>,
     },
     /// ピクセルフォーマットの不一致
     PixelFormatMismatch {
@@ -65,6 +70,22 @@ impl Error {
         Err(Self::VideoToolbox {
             status,
             function: function.into(),
+            property: None,
+        })
+    }
+
+    /// `VTSessionSetProperty` の戻り値を確認する
+    ///
+    /// 失敗した場合は、受け付けられなかったプロパティの名前を `property` に含めた
+    /// [`Error::VideoToolbox`] を返す。
+    pub(crate) fn check_property(status: i32, property: impl Into<String>) -> Result<(), Self> {
+        if status == 0 {
+            return Ok(());
+        }
+        Err(Self::VideoToolbox {
+            status,
+            function: "VTSessionSetProperty".into(),
+            property: Some(property.into()),
         })
     }
 }
@@ -72,14 +93,17 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VideoToolbox { status, function } => {
-                write!(
-                    f,
-                    "[{}] {}() failed: status={}",
-                    env!("CARGO_PKG_NAME"),
-                    function,
-                    status
-                )
+            Self::VideoToolbox {
+                status,
+                function,
+                property,
+            } => {
+                write!(f, "[{}] {}", env!("CARGO_PKG_NAME"), function)?;
+                match property {
+                    Some(property) => write!(f, "({property})")?,
+                    None => write!(f, "()")?,
+                }
+                write!(f, " failed: status={status}")
             }
             Self::PixelFormatMismatch { expected, actual } => {
                 write!(
