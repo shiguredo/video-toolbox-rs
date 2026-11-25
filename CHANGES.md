@@ -16,6 +16,28 @@
     1.95.0 で安定化された `AtomicU64::try_update` に置き換える
   - 開発と CI のツールチェーンも 1.95 に固定する。1.93 / 1.94 のツールチェーンではビルドできない
   - @melpon
+- [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
+  - `EncodeHandler` トレイトと `FnEncodeHandler` ラッパー、`DecodeHandler` トレイトと
+    `FnDecodeHandler` ラッパーを追加し、`Encoder::new` / `Decoder::new` にハンドラーを渡すようにする
+  - `Encoder` を `Encoder<H: EncodeHandler>` に、`Decoder` を `Decoder<H: DecodeHandler>` に変更する
+  - `Encoder::next_frame` を削除する。エンコード結果は `EncodeHandler::on_encoded` で受け取る
+  - `Decoder::decode` の戻り値を `Result<(), Error>` に変更する。デコード結果は
+    `DecodeHandler::on_decoded` で受け取る
+  - `Encoder::encode` / `Encoder::encode_pixel_buffer` / `Decoder::decode` にユーザーデータを渡す
+    引数を追加し、`EncodedFrame<T>` / `DecodedFrame<T>` の `user_data` として返す
+  - `DecodedFrame` の `I420(I420Frame)` / `Nv12(Nv12Frame)` を
+    `I420 { frame, user_data }` / `Nv12 { frame, user_data }` に変更し、`I420Frame` / `Nv12Frame`
+    からライフタイムを削除する。デコード済みフレームはコールバックに所有権ごと渡される
+  - `Decoder::finish` を追加する。遅延フレームを排出し、非同期コールバックの完了まで待つ
+  - `Decoder::update_format` は呼び出しの先頭で `finish` を呼び、遅延フレームを排出してから
+    フォーマットを更新する
+  - `Decoder` の `Drop` は `finish` を呼んでからセッションを解放する
+  - コールバックは Video Toolbox のコールバックスレッドから呼ばれる
+  - ユーザーハンドラの panic は `extern "C"` 境界を越える前に `catch_unwind` で捕捉し、
+    エラーログ（コールバック名 + panic メッセージ）を出力してセッションを継続する。
+    `panic=abort` ビルドや abort する panic hook を設定している場合は捕捉できない
+  - panic の捕捉は `catch_user_panic` に集約し、`invoke_callback` がコールバック名を渡す
+  - @melpon
 - [CHANGE] `EncoderConfig` / `H264EncoderConfig` / `HevcEncoderConfig` のプロパティ指定を `Option` にし、
   未指定なら設定せず未対応なら `Encoder::new` がエラーを返すようにする
   - `Encoder::new` はプロパティを 1 個ずつ `VTSessionSetProperty` で設定して戻り値を確認する。
@@ -32,60 +54,43 @@
   - `#[non_exhaustive]` ではない公開構造体のフィールドの型変更のため、構造体リテラルで構築している
     コードは `Some(...)` の追記が必要になる
   - @melpon
-- [CHANGE] `Error::VideoToolbox` に `property` フィールドを追加する
-  - プロパティを 1 個設定する `VTSessionSetProperty` が失敗した場合に、受け付けられなかった
-    プロパティ名を持たせる。プロパティを指定しない失敗では `None` になる
-  - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合はフィールドの追加が必要になる
-  - @melpon
-- [CHANGE] `EncodedFrame::keyframe` を `picture_type` に置き換える
-  - `keyframe` はキーフレームかどうかだけを表すフィールドで、`picture_type` が `I` かどうかと
-    同じ意味になる。同じ情報を 2 通りに持つと両者がずれる余地があるため、`picture_type` に統合する
-  - `EncodedFrame` から `keyframe` フィールドを削除する。キーフレームかどうかは
-    `picture_type == PictureType::I` で判定する
-  - @melpon
-- [ADD] `EncodedFrame` に `timestamp` と `picture_type` を追加する
-  - `timestamp` は `EncodeHandler::on_encoded` に渡されるフレームの提示時刻で、
-    エンコーダーが入力フレームに使ったタイムスケール (`EncoderConfig::fps_numerator`) を
-    分母とする有理数 `Timestamp` として取得できる。`Encoder::reconfigure` で
-    フレームレートを変更すると、変更前後でタイムスケールが変わる
-  - `timestamp` は `Option<Timestamp>` とし、Video Toolbox が有効な提示時刻を通知しない場合は
-    `None` になる (0 を返すと先頭フレームと区別できないため)
-  - `picture_type` は `PictureType` (`I` / `P` / `B` / `Unknown`) で、Video Toolbox は
-    I フレームと IDR フレームを区別しないため `PictureType::I` には IDR フレームも含まれる
-  - `examples/raden_to_mp4.rs` が固定値ではなく取得した提示時刻からサンプルの尺を求めるようにする
-  - @melpon
-- [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
-  - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
-  - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える
+- [CHANGE] `EncoderConfig` に `data_rate_limits: Vec<DataRateLimit>` フィールドを追加する
+  - `#[non_exhaustive]` を付けていない公開構造体へのフィールド追加のため、
+    構造体リテラルで構築しているコードは `data_rate_limits: Vec::new()` の追記が必要になる
   - @voluntas
-- [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型と
-  `EncoderConfig::data_rate_limits` を追加する
-  - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
-    ウィンドウあたりの総バイト数のハード上限を併設できるようにする
-  - 指定できるリミットは Video Toolbox の仕様上 0〜2 個
-  - Video Toolbox はエンコード開始後のこのプロパティの変更を無視するため、
-    上限はセッション作成時にのみ設定できる (`Encoder` を作り直せば変更・解除できる)
-  - @voluntas
-- [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
-  - @voluntas
-- [CHANGE] `Encoder` と `Decoder` をコールバックベースの非同期 API に変更する
-  - @melpon
 - [CHANGE] `Encoder::reconfigure` を `ReconfigureParams` ベースの動的更新専用 API に変更する
   - 旧 API は `EncoderConfig` を所有権で受け取りセッションを再作成していたが、
     `VTSessionSetProperties` 1 回で完結する動的更新型に置き換える
   - 動的に変更可能な項目は `average_bitrate` / `expected_frame_rate` の
     2 項目で、解像度・コーデック・ピクセルフォーマットの変更は `Encoder` を作り直す運用に統一する
+  - セッションを再作成しないため未出力フレームの自動フラッシュも行わない。フラッシュが必要なら
+    先に `Encoder::finish` を呼ぶ。全項目が `None` の場合は no-op として `Ok(())` を返す
+  - `VTSessionSetProperties` が失敗した場合は `Encoder::config` の値を変更せず、セッションも生かしたままエラーを返す
   - `expected_frame_rate` 更新時は内部 PTS を切り上げで再スケールし、
     オーバーフロー時には `Error::LimitExceeded` を返す
-  - @voluntas
-- [CHANGE] `EncoderConfig` に `data_rate_limits` フィールドを追加する
-  - `#[non_exhaustive]` を付けていない公開構造体へのフィールド追加のため、
-    構造体リテラルで構築しているコードは `data_rate_limits: Vec::new()` の追記が必要になる
   - @voluntas
 - [CHANGE] `Encoder::new` が `average_bitrate` に 0 を指定された場合に `Error::InvalidConfig` を返すようにする
   - 従来は 0 がそのまま Video Toolbox に渡っていたが、`Encoder::reconfigure` と検証を共通化して
     構築時点で拒否する
   - @voluntas
+- [CHANGE] `Encoder::new` が `max_key_frame_interval` / `max_frame_delay_count` に
+  `i32::MAX` を超える値を指定された場合に `Error::InvalidConfig` を返すようにする
+  - `NonZeroU32` を `i32` にキャストする際に負値へ切り詰まるのを防ぐ
+  - @voluntas
+- [CHANGE] `EncodedFrame::keyframe` を `picture_type` に置き換える
+  - `keyframe` はキーフレームかどうかだけを表すフィールドで、`PictureType::I` かどうかと
+    同じ意味になる。同じ情報を 2 通りに持つと両者がずれる余地があるため、`picture_type` に統合する
+  - `EncodedFrame` から `keyframe` フィールドを削除する。キーフレームかどうかは
+    `picture_type == PictureType::I` で判定する
+  - `PictureType` (`I` / `P` / `B` / `Unknown`) を追加する。Video Toolbox は I フレームと
+    IDR フレームを区別しないため、`PictureType::I` には IDR フレームも含まれる
+  - `PictureType::B` は `allow_frame_reordering` が `Some(true)` のときと、未指定 (`None`) のときに現れる
+  - @melpon
+- [CHANGE] `Error::VideoToolbox` に `property` フィールドを追加する
+  - プロパティを 1 個設定する `VTSessionSetProperty` が失敗した場合に、受け付けられなかった
+    プロパティ名を持たせる。プロパティを指定しない失敗では `None` になる
+  - `Error` は `#[non_exhaustive]` ではないため、網羅 `match` している場合はフィールドの追加が必要になる
+  - @melpon
 - [CHANGE] `Error` に `UnknownPixelFormat` バリアントを追加する
   - `Encoder::encode_pixel_buffer` に I420 / Nv12 のいずれでもない FourCC が渡された場合に、
     `PixelFormatMismatch` と区別して実際の FourCC を診断情報として返す
@@ -94,42 +99,6 @@
 - [CHANGE] `Error` 型の全 `&'static str` フィールドを `String` に変更し、エラーメッセージに動的な値を含められるようにする
   - `Option` を返していた内部関数を `Result<_, Error>` に変更し、エラー情報をコールバック経由でユーザーに伝搬する
   - 不要になった `tracing::error!()` を削除する
-  - @melpon
-- [FIX] 圧縮セッションのプロパティ設定が失敗したときにセッションがリークする問題を修正する
-  - `VTCompressionSessionCreate` 成功後のセッションを `CfPtrMut` でガードし、エラーパスでは `Drop` が
-    `CFRelease` で解放する
-  - 成功パスでは `into_raw` でガードの所有権を放棄し、`Encoder::drop` の解放処理との二重解放を防ぐ
-  - @voluntas
-- [FIX] `extern "C"` コールバック内のユーザーハンドラ panic でプロセスが abort する問題を修正する
-  - `on_encoded` / `on_decoded` の呼び出しを `std::panic::catch_unwind` で保護し、panic を捕捉して
-    エラーログ（コールバック名 + panic メッセージ）を出力した上でセッションを継続する
-  - encoder / decoder で重複していた panic 捕捉を `catch_user_panic` として `src/types.rs` に統合し、
-    `invoke_callback` に `callback_name` 引数を追加して捕捉ログにコールバック名を含める
-  - `CODEBASE.md` に shiguredo-rust 規約の「`catch_unwind` を使わないこと」の例外を根拠付きで追記する
-  - @voluntas
-- [FIX] PTS オーバーフロー検査がフレーム送信後に行われる問題を修正する
-  - `encode` / `encode_pixel_buffer` の `checked_add` を `VTCompressionSessionEncodeFrame` 呼び出し前に移動し、
-    オーバーフロー時はフレームを送信せずに `Error::LimitExceeded` を返す
-  - オーバーフロー時は `next_input_pts` を変更しないため、以後の呼び出しも同じエラーを返す
-  - @voluntas
-- [FIX] `Encoder::encode` の NV12 入力が UV プレーンのコピーで `Error::LimitExceeded` になり必ず失敗する問題を修正する
-  - プレーンのコピー幅の検査が、1 行あたりのバイト数を `CVPixelBufferGetWidthOfPlane` の戻り値と
-    比較していた。バイプラナー形式のクロマプレーンではこの関数はクロマサンプル対の数を返すため、
-    1 行あたり `width` バイトある UV プレーンが常に寸法超過と判定されていた
-  - プレーンの寸法検査を行数 (`CVPixelBufferGetHeightOfPlane`) のみに限定し、1 行あたりのバイト数は
-    コピー先のストライド (`CVPixelBufferGetBytesPerRowOfPlane`) との比較で検証するようにして、
-    `pixel_format: PixelFormat::Nv12` の `Encoder` で `FrameData::Nv12` をエンコードできるようにする
-  - コピー元の 1 行あたりのバイト数 `src_width` と行の間隔 `src_stride` を別の引数に分け、
-    1 行あたりのバイト数とストライドを混同しないようにする。
-    あわせてコピー元のデータがコピー範囲を満たすことも検証する
-  - @melpon
-- [ADD] エンコーダー / デコーダーの統計値 API (`Counter` / `Gauge` / `EncoderStats` / `DecoderStats`) を追加する
-  - `Encoder::stats()` / `Decoder::stats()` で `total_encode_count` / `total_output_frame_count` /
-    `total_error_count` / `in_flight_frames` などの通算値と現在値を取得できるようにする
-  - `in_flight_frames` で Video Toolbox が処理中のフレーム数を観測でき、利用側が
-    `finish()` を挟む間隔を判断できるようにする
-  - デコーダーでは `update_format()` のセッション流用と再作成の回数を
-    `total_update_format_count` / `total_recreate_session_count` で確認できるようにする
   - @melpon
 - [CHANGE] `CodecInfo::encoding` をエンコーダー 1 件ずつの一覧 `CodecInfo::encoders` に変更し、`EncodingInfo` を 1 つのエンコーダーの情報にする
   - `EncodingInfo` の `supported` を削除する。これは対象コーデックのエンコーダーが存在するかを
@@ -153,15 +122,76 @@
   - ソフトウェアデコードを含めたデコード可否は Video Toolbox から事前に取得できない。
     `VTRegisterSupplementalVideoDecoderIfAvailable` でデコーダーを登録すると結果が変わりうる
   - @melpon
+- [CHANGE] `Decoder` の入力検証とエラー種別を整理する
+  - `DecoderCodec::H264` / `Hevc` の `nalu_len_bytes` が 1 / 2 / 4 以外、またはパラメータセットが
+    空の場合は、`Decoder::new` / `Decoder::update_format` が `Error::InvalidConfig` を返す
+    (空スライスの `as_ptr()` が dangling pointer になるため)
+  - VP9 / AV1 の `update_format` の Video Toolbox の失敗を、`Decoder::new` と同じく
+    `Error::UnsupportedCodec` に変換する
+  - @voluntas
+- [ADD] `EncodedFrame` に `timestamp` と `Timestamp` 型を追加する
+  - `timestamp` は `EncodeHandler::on_encoded` に渡されるフレームの提示時刻で、
+    エンコーダーが入力フレームに使ったタイムスケール (`EncoderConfig::fps_numerator`) を
+    分母とする有理数 `Timestamp` として取得できる。`Encoder::reconfigure` で
+    フレームレートを変更すると、変更前後でタイムスケールが変わる
+  - `timestamp` は `Option<Timestamp>` とし、Video Toolbox が有効な提示時刻を通知しない場合は
+    `None` になる (0 を返すと先頭フレームと区別できないため)
+  - `examples/raden_to_mp4.rs` が固定値ではなく取得した提示時刻からサンプルの尺を求めるようにする
+  - @melpon
+- [ADD] `kVTCompressionPropertyKey_DataRateLimits` に対応する `DataRateLimit` 型を追加する
+  - `AverageBitRate` 指定だけでは短期ウィンドウで大きくオーバーシュートするため、
+    ウィンドウあたりの総バイト数のハード上限を併設できるようにする
+  - 指定できるリミットは Video Toolbox の仕様上 0〜2 個
+  - Video Toolbox はエンコード開始後のこのプロパティの変更を無視するため、
+    上限はセッション作成時にのみ設定できる (`Encoder` を作り直せば変更・解除できる)
+  - @voluntas
+- [ADD] `Encoder::config` で現在保持している `EncoderConfig` を参照する getter を追加する
+  - @voluntas
+- [ADD] エンコーダー / デコーダーの統計値 API (`Counter` / `Gauge` / `EncoderStats` / `DecoderStats`) を追加する
+  - `Encoder::stats()` / `Decoder::stats()` で送信数・出力数・エラー数・処理中フレーム数
+    (`total_encode_count` / `total_decode_count` / `total_output_frame_count` /
+    `total_error_count` / `in_flight_frames`) などの通算値と現在値を取得できるようにする
+  - `in_flight_frames` で Video Toolbox が処理中のフレーム数を観測でき、利用側が
+    `finish()` を挟む間隔を判断できるようにする
+  - デコーダーでは `update_format()` のセッション流用と再作成の回数を
+    `total_update_format_count` / `total_recreate_session_count` で確認できるようにする
+  - @melpon
 - [ADD] `query_encoding_capabilities()` と `EncodingCapabilities` を追加する
   - `query_encoding_capabilities(codec, width, height)` で「指定した解像度でエンコードできるか」と、
     その解像度で選ばれるエンコーダー・利用できるプロファイルを事前に判定できるようにする
-  - エンコーダーを特定できない場合は `None` を返す。この解像度でハードウェアエンコーダーが
+  - コーデックにエンコーダーが無い場合 (VP9 / AV1)、解像度が不正な場合、照会で
+    エンコーダーを特定できない場合は `None` を返す。この解像度でハードウェアエンコーダーが
     使えるかは、返る `EncodingCapabilities::encoder` の `hardware_accelerated` で判定する
   - `encoderSpecification` に NULL を渡した `VTCopySupportedPropertyDictionaryForEncoder` を使う。
     これは `VTCompressionSessionCreate` と同じ既定の選択であり、
     `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder` を付けた照会の成否と、
     選ばれるエンコーダーの `hardware_accelerated` が一致することを確認している
+  - @melpon
+- [UPDATE] ログ出力のクレートを `log` から `tracing` に切り替える
+  - shiguredo-rust 規約の「ログは tracing を使うこと」に合わせる
+  - `log::error!` を `tracing::error!` に置換し、`Cargo.toml` の依存を `tracing = "0.1"` に差し替える
+  - @voluntas
+- [FIX] 圧縮セッションのプロパティ設定が失敗したときにセッションがリークする問題を修正する
+  - `VTCompressionSessionCreate` 成功後のセッションを `CompressionSessionGuard` で保持し、
+    プロパティ設定に失敗したエラーパスでは `Drop` がセッションを無効化してから解放する
+  - 成功パスでは `into_raw` でガードの所有権を放棄し、`Encoder::drop` の解放処理との二重解放を防ぐ
+  - エラーパスの解放手順が `Encoder::drop` と揃う
+  - @voluntas
+- [FIX] PTS オーバーフロー検査がフレーム送信後に行われる問題を修正する
+  - `encode` / `encode_pixel_buffer` の `checked_add` を `VTCompressionSessionEncodeFrame` 呼び出し前に移動し、
+    オーバーフロー時はフレームを送信せずに `Error::LimitExceeded` を返す
+  - オーバーフロー時は `next_input_pts` を変更しないため、以後の呼び出しも同じエラーを返す
+  - @voluntas
+- [FIX] `Encoder::encode` の NV12 入力が UV プレーンのコピーで `Error::LimitExceeded` になり必ず失敗する問題を修正する
+  - プレーンのコピー幅の検査が、1 行あたりのバイト数を `CVPixelBufferGetWidthOfPlane` の戻り値と
+    比較していた。バイプラナー形式のクロマプレーンではこの関数はクロマサンプル対の数を返すため、
+    1 行あたり `width` バイトある UV プレーンが常に寸法超過と判定されていた
+  - プレーンの寸法検査を行数 (`CVPixelBufferGetHeightOfPlane`) のみに限定し、1 行あたりのバイト数は
+    コピー先のストライド (`CVPixelBufferGetBytesPerRowOfPlane`) との比較で検証するようにして、
+    `pixel_format: PixelFormat::Nv12` の `Encoder` で `FrameData::Nv12` をエンコードできるようにする
+  - コピー元の 1 行あたりのバイト数 `src_width` と行の間隔 `src_stride` を別の引数に分け、
+    1 行あたりのバイト数とストライドを混同しないようにする。
+    あわせてコピー元のデータがコピー範囲を満たすことも検証する
   - @melpon
 - [FIX] エンコーダー情報の `supports_frame_reordering` が常に `false` になる問題を修正する
   - `kVTVideoEncoderList_SupportsFrameReordering` は、キーが無い場合に true と見なす仕様だが、
@@ -172,18 +202,9 @@
 
 ### misc
 
-- [UPDATE] `rust-toolchain.toml` のツールチェーンを MSRV と同じ 1.93 に揃える
-  - ローカルと CI で常に MSRV (1.93) の `cargo` / `rustc` / `clippy` が使われるようになり、
-    MSRV より新しい API や言語機能の使用を検出できる
-  - @voluntas
 - [UPDATE] `Encoder::reconfigure` の検証順序を `Encoder::new` と揃える
   - フレームレートの検証を bitrate の検証より先に実行し、両方を同時に不正にした場合に
     構築と再設定のどちらでもフレームレートのエラーが先に返るようにする
-  - @melpon
-- [UPDATE] 未使用の圧縮セッションを invalidate なしの `CFRelease` で解放してよい根拠をコメントに追記する
-  - Apple Developer Documentation の `VTCompressionSessionInvalidate(_:)` と macOS SDK の
-    `VTCompressionSession.h` に「retain count が 0 になった時点でセッションは自動的に
-    invalidate される」と明記されていることを、エラーパスの解放処理の根拠として引用する
   - @melpon
 - [UPDATE] CI / Makefile / prek.toml のコマンドフラグを統一する
   - clippy を `cargo clippy --workspace --all-targets -- -D warnings` に統一し、テストコードの
@@ -191,7 +212,6 @@
   - test を `cargo test --workspace -- --test-threads=1` に統一する
     （ハードウェアリソース競合回避のため直列実行）
   - fmt を `cargo fmt --all -- --check` に統一し、書き換えなしの検出のみにする
-  - 既存 open issue の完了条件に記載のコマンドも統一後の形式に追従させる
   - @voluntas
 - [UPDATE] テスト関数に doc コメントを追加する
   - `tests/test_encoder.rs` / `tests/test_decoder.rs` / `tests/test_error.rs` の全 `#[test]`
@@ -212,8 +232,9 @@
   - `cf_array` / `cf_number_*` と同じく drop 時に `CFRelease` されるガードを返すようにし、呼び出し側での手動ラップを不要にする
   - @voluntas
 - [UPDATE] `src/encoder.rs` をディレクトリモジュール `src/encoder/` に分割する
-  - `config` / `handler` / `frame` / `validation` / `session` / `pixel_buffer` / `callback` の 7 サブモジュールに責務を分離する
-  - 公開 API のパスは変更しない (re-export の許可理由は `CODEBASE.md` に追記)
+  - `config` / `handler` / `frame` / `validation` / `session` / `pixel_buffer` / `callback` /
+    `stats` の 8 サブモジュールに責務を分離する
+  - 公開 API のパスは変更しない
   - @voluntas
 - [UPDATE] `encoder_rejects_*` と `reconfigure_is_noop_when_all_none` のテストアサーションを強化する
   - `encoder_rejects_*` 系が `Error::InvalidConfig` の `reason` 文字列まで検証するようにする
@@ -225,15 +246,13 @@
 - [UPDATE] `Encoder::config` getter の単体テストを追加する
   - `Encoder::new` 直後の `config()` が入力した全フィールドを変更なしで返すことを検証する
   - @voluntas
-- [UPDATE] `average_bitrate` / `expected_frame_rate` の CFNumber 構築と push をヘルパー関数に共通化する
-  - `push_bitrate_property` / `push_expected_frame_rate_property` を追加し、
-    `add_common_properties` と `reconfigure` の 2 箇所の重複を解消する
-  - `push_data_rate_limits_property` と同じ構成のモジュールレベルフリー関数とし、
-    `unsafe` はヘルパー内部のキー参照に閉じ込める
+- [UPDATE] `Encoder::reconfigure` のプロパティ構築をヘルパー関数 `push_bitrate_property` / `push_expected_frame_rate_property` に切り出す
+  - `average_bitrate` / `expected_frame_rate` の CFNumber 構築とプロパティ辞書への push を
+    モジュールレベルフリー関数にまとめ、`unsafe` はヘルパー内部のキー参照に閉じ込める
   - 挙動は変わらない
   - @voluntas
 - [UPDATE] `fps_numerator` と `expected_frame_rate` の検証ロジックを共通関数 `validate_positive_i32_field` に統合する
-  - ゼロ拒否と `i32::MAX` 上限拒否が 2 関数に重複していたため、`field` / `reason_overflow` を引数化して 1 本に集約する
+  - ゼロ拒否と `i32::MAX` 上限拒否を `field` / `reason_overflow` を引数に取る 1 本の関数に集約する
   - エラーメッセージは従来と同一で、挙動は変わらない
   - @voluntas
 - [UPDATE] `Encoder::reconfigure` 関連の rustdoc を整理して説明の重複を解消する
@@ -259,10 +278,6 @@
   - エンコード開始後の `data_rate_limits` 変更が反映されないことを FFI を直接呼んで検出する
     (構築時に設定した上限が効くことを陽性対照として同時に確認する)
   - @melpon
-- [UPDATE] `CfPtrMut` に所有権を取り出す `into_raw` を追加する
-  - 圧縮セッション生成の成功パスで `std::mem::forget` を直接呼んでいた箇所を `into_raw` に置き換え、
-    所有権の移転をコード上で明示する
-  - @melpon
 - [UPDATE] 未カバーだった公開 API のテストを追加する
   - `Decoder::update_format` の description 差し替えパスとセッション再作成パス、
     および空のパラメータセット・不正な `nalu_len_bytes` の拒否を検証する
@@ -271,20 +286,27 @@
     `I420Frame` の U / V プレーン関連メソッドを PSNR で検証する
   - `Error` の Display の未テスト 5 バリアントと `std::error::Error` の実装を検証する
   - `FrameData::Nv12` のエンコード（UV プレーンの内容をデコード結果と比較して検証する）、
-    キーフレームの `keyframe` / パラメータセット、
+    キーフレームのパラメータセット、
     `nalu_len_bytes` 1 / 2 の受理、全プロファイル・エントロピー符号化モードでのセッション構築、
     ユーザー定義の `EncodeHandler` / `DecodeHandler`、`supported_codecs` のプロファイル照会も検証する
-  - @melpon
-- [UPDATE] 圧縮セッション専用の所有権ガードを追加してエラーパスでも invalidate する
-  - `CompressionSessionGuard` が `Drop` でセッションを無効化してから解放し、
-    プロパティ設定に失敗したエラーパスと `Encoder::drop` の解放手順を揃える
-  - 成功パスは `into_raw` で所有権を `Encoder` に移し、無効化せずに引き渡す
-  - 圧縮セッションの所有権移転が専用ガードに移り、使われなくなった `CfPtrMut::into_raw` を削除する
   - @melpon
 - [UPDATE] 未指定のプロパティが設定されないことと、未対応のプロパティを指定したときのエラーを検証するテストを追加する
   - `max_frame_delay_count` を指定すると Apple Silicon の Apple エンコーダーが受け付けず、
     `Error::VideoToolbox` の `property` から原因のプロパティ名が分かることを確認する
   - `allow_frame_reordering` を未指定にすると、Video Toolbox の既定で B フレームが生成されることを確認する
+  - @melpon
+- [UPDATE] GitHub Actions の外部アクション参照をコミット SHA に固定する
+  - @voluntas
+- [UPDATE] `prek.toml` を shiguredo-rust 規約に合わせて整備する
+  - prek 組み込みフックと tombi の lint / format を追加する
+  - `cargo test` を pre-commit から pre-push に移し、コミットを遅くしないようにする
+  - @voluntas
+- [UPDATE] `bindgen` に `-fno-builtin` を渡し、Clang の builtin 差し替えで `size_t` が `c_ulong` として生成されるのを防ぐ
+  - Rust 1.98 以降の lint でビルドが失敗するのを避けるため
+  - @voluntas
+- [FIX] docs.rs 向けのダミーバインディングを実際のバインディングと同じ形に揃え、ドキュメント生成が失敗する問題を修正する
+  - 空の構造体で代用していた型を、実際のバインディングと同じポインタ型・型エイリアス・列挙値にする
+  - `DOCS_RS` の変更で build.rs が再実行されるように `cargo::rerun-if-env-changed=DOCS_RS` を追加する
   - @melpon
 
 ## 2026.1.1

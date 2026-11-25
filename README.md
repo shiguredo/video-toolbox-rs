@@ -40,6 +40,7 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 ## 動作要件
 
 - macOS (arm64)
+- Rust 1.95 以降
 - Xcode Command Line Tools (ビルド時に Video Toolbox のヘッダーファイルが必要)
 
 ## テスト
@@ -144,7 +145,7 @@ unsafe {
 ### デコード
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, FnDecodeHandler, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, PixelFormat};
 
 // H.264 デコーダー (SPS / PPS が必要)
 let mut decoder = Decoder::new(DecoderConfig {
@@ -154,7 +155,7 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, _>| {
+}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, Error>| {
     match result {
         Ok(DecodedFrame::I420 { frame, user_data }) => {
             let y = frame.y_plane();
@@ -430,12 +431,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, PixelFormat};
 
-match Decoder::<()>::new(DecoderConfig {
+match Decoder::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}, FnDecodeHandler::new(|_| {})) {
+}, FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {})) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
@@ -481,6 +482,7 @@ encoder.reconfigure(ReconfigureParams {
 ### デコーダー
 
 `update_format()` で新しいパラメータセットや解像度を渡してフォーマットを更新できます。H.264 / H.265 / VP9 / AV1 すべてのコーデックに対応しています。
+呼び出しの先頭で `finish()` を実行し、遅延フレームを排出してからフォーマットを更新します。
 
 Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合はセッションを流用、不可能な場合のみセッションを再作成します。
 

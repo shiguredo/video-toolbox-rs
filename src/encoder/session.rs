@@ -80,8 +80,7 @@ pub(super) fn push_bitrate_property(
 /// properties に積んだ生ポインタが辞書生成まで有効でいるためには、生成した CFNumber の
 /// 所有を `cf_objects` に移して保持し続ける必要がある。`cf_objects` への push を忘れると
 /// use-after-free になる (呼び出し側スコープ末尾の drop で CFRelease する)。
-/// `fps` は呼び出し側で `i32::MAX` 以下に検証済み (`validate_positive_i32_field`。
-/// `add_common_properties` 側は検証済みの `fps_numerator` を `div_ceil` で丸めた値) のため、
+/// `fps` は呼び出し側で `i32::MAX` 以下に検証済み (`validate_positive_i32_field`) のため、
 /// `as i32` の切り詰めは発生しない。
 pub(super) fn push_expected_frame_rate_property(
     properties: &mut Vec<(sys::CFStringRef, *const c_void)>,

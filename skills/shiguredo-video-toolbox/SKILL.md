@@ -9,7 +9,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 
 ## 特徴
 
-- **macOS 専用**: ビルド時に Xcode の SDK ヘッダーを参照して bindgen でバインディングを自動生成 (`target_os = "macos"` 以外では `compile_error!`)
+- **macOS 専用**: ビルド時に Xcode の SDK ヘッダーを参照して bindgen でバインディングを自動生成 (`target_os = "macos"` 以外では `compile_error!`。rustdoc 実行時の `cfg(doc)` は除外)
 - **ハードウェアエンコード**: H.264 / H.265
 - **ハードウェアデコード**: H.264 / H.265 / VP9 / AV1 (環境依存)
 - **コーデック固有設定の型安全な分離**: エンコード側は `CodecConfig` enum、デコード側は `DecoderCodec` enum
@@ -28,7 +28,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 ## バージョン情報
 
 - crate 名: `shiguredo_video_toolbox`
-- バージョン: 2026.2.0-canary.3
+- バージョン: 2026.2.0-canary.4
 - Rust Edition: 2024
 - 最小 Rust バージョン: 1.95
 - ライセンス: Apache-2.0
@@ -98,7 +98,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 - `max_key_frame_interval_duration`: `Option<Duration>`
 - `data_rate_limits`: `Vec<DataRateLimit>`
 
-`EncoderConfig` には `Default` 実装がない (全フィールド明示が必須)。`Option` のフィールドは `None` が「そのプロパティを設定せず Video Toolbox の既定に任せる」を意味する。`Encoder::new()` は指定されたプロパティを 1 個ずつ `VTSessionSetProperty` で設定し、選択されたエンコーダーが受け付けなかったプロパティがある場合は `Error::VideoToolbox` を返す。このエラーの `property` に、受け付けられなかったプロパティ名が入る。`fps_numerator` / `fps_denominator` は PTS 計算にも使うため `Option` ではなく、`kVTCompressionPropertyKey_ExpectedFrameRate` は `fps_numerator.div_ceil(fps_denominator)` で常に設定する。
+`EncoderConfig` には `Default` 実装がない (全フィールド明示が必須)。`Option` のフィールドは `None` が「そのプロパティを設定せず Video Toolbox の既定に任せる」を意味する。`Encoder::new()` は指定されたプロパティを 1 個ずつ `VTSessionSetProperty` で設定し、選択されたエンコーダーが受け付けなかったプロパティがある場合は `Error::VideoToolbox` を返す。このエラーの `property` に、受け付けられなかったプロパティ名が入る。例えば、Apple Silicon の Apple エンコーダーは `max_frame_delay_count` を受け付けない。`fps_numerator` / `fps_denominator` は PTS 計算にも使うため `Option` ではなく、`kVTCompressionPropertyKey_ExpectedFrameRate` は `fps_numerator.div_ceil(fps_denominator)` で常に設定する。
 
 `data_rate_limits` は空 `Vec` が「`kVTCompressionPropertyKey_DataRateLimits` を設定しない」を意味する。既定値はエンコーダーによって異なるため、空 `Vec` が上限なしを保証するものではない。Video Toolbox はエンコード開始後の `DataRateLimits` の変更を無視するため、`Encoder::reconfigure()` の対象には含めない (`Encoder` を作り直せば変更・解除できる)。
 
@@ -367,15 +367,15 @@ println!(
 
 ```rust
 use shiguredo_video_toolbox::{
-    Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat,
+    DecodedFrame, Decoder, DecoderCodec, DecoderConfig, Error, FnDecodeHandler, PixelFormat,
 };
 
-match Decoder::<()>::new(
+match Decoder::new(
     DecoderConfig {
         codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
         pixel_format: PixelFormat::I420,
     },
-    FnDecodeHandler::new(|_| {}),
+    FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {}),
 ) {
     Ok(_decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
