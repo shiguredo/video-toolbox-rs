@@ -11,6 +11,11 @@
 
 ## develop
 
+- [CHANGE] MSRV (rust-version) を 1.95 に上げる
+  - `AtomicU64::fetch_update` が 1.99.0 で `try_update` への改名により非推奨になるため、
+    1.95.0 で安定化された `AtomicU64::try_update` に置き換える
+  - 開発と CI のツールチェーンも 1.95 に固定する。1.93 / 1.94 のツールチェーンではビルドできない
+  - @melpon
 - [CHANGE] `EncoderConfig` / `H264EncoderConfig` / `HevcEncoderConfig` のプロパティ指定を `Option` にし、
   未指定なら設定せず未対応なら `Encoder::new` がエラーを返すようにする
   - `Encoder::new` はプロパティを 1 個ずつ `VTSessionSetProperty` で設定して戻り値を確認する。
