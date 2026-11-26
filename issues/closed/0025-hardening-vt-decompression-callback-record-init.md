@@ -1,6 +1,6 @@
 # `VTDecompressionOutputCallbackRecord` の初期化方針をコード内で明示する
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

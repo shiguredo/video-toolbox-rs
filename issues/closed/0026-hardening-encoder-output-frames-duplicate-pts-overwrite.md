@@ -1,6 +1,6 @@
 # `Encoder` の `output_frames`（HashMap）で同一 PTS が二度届くと先のフレームが上書きされる
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## 分類

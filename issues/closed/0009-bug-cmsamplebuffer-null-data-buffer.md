@@ -1,7 +1,7 @@
 # `process_encoded_output` で `CMSampleBufferGetDataBuffer` の戻りが NULL のときに `CMBlockBufferGetDataPointer` を呼び得る
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

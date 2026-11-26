@@ -1,7 +1,7 @@
 # エンコード出力で `CMBlockBufferGetDataLength` に基づく `Vec` 確保に上限がない
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

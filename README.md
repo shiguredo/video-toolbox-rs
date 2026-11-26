@@ -30,14 +30,17 @@ macOS 専用で、ビルド時に Xcode の SDK ヘッダーを参照して bind
 - ピクセルフォーマット選択 (`PixelFormat::I420` / `PixelFormat::Nv12`)
   - エンコーダー入力: `EncoderConfig` の `pixel_format` で指定
   - デコーダー出力: `DecoderConfig` の `pixel_format` で指定
-- 動的解像度変更
-  - エンコーダー: `Encoder::reconfigure()` でセッションを再作成
-  - デコーダー: `Decoder::update_format()` でフォーマットを更新
-- AVCC 形式の入出力
+- 動的設定更新
+  - エンコーダー: `Encoder::reconfigure()` で動的に更新 (対象項目は「動的設定更新」節を参照)
+  - デコーダー: `Decoder::update_format()` でフォーマットを更新 (解像度変更を含む)
+- `Encoder::encode_pixel_buffer()` による CVPixelBuffer のゼロコピーエンコード
+- 圧縮映像フレーム単位の非同期入出力
+- エンコード結果からフレームの提示時刻 (`EncodedFrame::timestamp`) とピクチャータイプ (`EncodedFrame::picture_type`) を取得
 
 ## 動作要件
 
 - macOS (arm64)
+- Rust 1.95 以降
 - Xcode Command Line Tools (ビルド時に Video Toolbox のヘッダーファイルが必要)
 
 ## テスト
@@ -66,58 +69,83 @@ DOCS_RS=1 cargo doc --no-deps
 
 ```rust
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, Encoder, EncoderConfig, FrameData,
-    H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error, FnEncodeHandler,
+    FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, PixelFormat,
 };
 
 let config = EncoderConfig {
     width: 1920,
     height: 1080,
     codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
+        // None にするとプロファイルレベルを設定せず Video Toolbox の既定に任せます
+        profile: Some(H264Profile::Main),
+        entropy_mode: Some(H264EntropyMode::Cabac),
     }),
     pixel_format: PixelFormat::I420,
     average_bitrate: Some(5_000_000),
     fps_numerator: 30,
     fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
+    prioritize_encoding_speed_over_quality: Some(false),
+    real_time: Some(false),
+    maximize_power_efficiency: Some(false),
+    allow_frame_reordering: Some(false),
+    allow_temporal_compression: Some(true),
     max_key_frame_interval: None,
     max_key_frame_interval_duration: None,
     max_frame_delay_count: None,
+    data_rate_limits: Vec::new(),
 };
 
-let mut encoder = Encoder::new(config)?;
+let mut encoder = Encoder::new(config, FnEncodeHandler::new(
+    |result: Result<EncodedFrame<u64>, Error>| {
+        match result {
+            Ok(encoded) => {
+                println!(
+                    "encoded bytes: {} (user_data={})",
+                    encoded.data.len(),
+                    encoded.user_data
+                );
+            }
+            Err(e) => {
+                eprintln!("encode callback error: {e}");
+            }
+        }
+    },
+))?;
 
 // I420 フレームデータをエンコード
 let frame = FrameData::I420 { y: &y_plane, u: &u_plane, v: &v_plane };
-encoder.encode(&frame, &EncodeOptions::default())?;
+encoder.encode(&frame, &EncodeOptions::default(), 0)?;
 
 // キーフレームを強制的に生成する
 encoder.encode(&frame, &EncodeOptions {
     force_key_frame: true,
-})?;
-
-// エンコード済みフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("encoded bytes: {}", encoded.data.len());
-}
+}, 1)?;
 
 // 残りのフレームをフラッシュ
 encoder.finish()?;
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
+```
+
+#### CVPixelBuffer の直接エンコード
+
+`Encoder::encode_pixel_buffer()` へ CVPixelBuffer のポインターを渡すと、フレームデータをコピーせずにエンコードできます。
+この API はピクセルフォーマットだけを検証します。CVPixelBuffer の幅、高さ、プレーン構成を `EncoderConfig` と一致させ、エンコード前にアンロックすることは呼び出し側の責務です。
+
+```rust
+// pixel_buffer_ptr は有効かつアンロック済みの CVPixelBuffer ポインター
+unsafe {
+    encoder.encode_pixel_buffer(
+        pixel_buffer_ptr,
+        &EncodeOptions::default(),
+        2,
+    )?;
 }
 ```
 
 ### デコード
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, PixelFormat};
 
 // H.264 デコーダー (SPS / PPS が必要)
 let mut decoder = Decoder::new(DecoderConfig {
@@ -127,24 +155,28 @@ let mut decoder = Decoder::new(DecoderConfig {
         nalu_len_bytes: 4,
     },
     pixel_format: PixelFormat::I420,
-})?;
-
-// AVCC フォーマットのデータをデコード
-if let Some(frame) = decoder.decode(&avcc_data)? {
-    match frame {
-        DecodedFrame::I420(f) => {
-            let y = f.y_plane();
-            let u = f.u_plane();
-            let v = f.v_plane();
-            println!("{}x{}", f.width(), f.height());
+}, FnDecodeHandler::new(|result: Result<DecodedFrame<u64>, Error>| {
+    match result {
+        Ok(DecodedFrame::I420 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let u = frame.u_plane();
+            let v = frame.v_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
         }
-        DecodedFrame::Nv12(f) => {
-            let y = f.y_plane();
-            let uv = f.uv_plane();
-            println!("{}x{}", f.width(), f.height());
+        Ok(DecodedFrame::Nv12 { frame, user_data }) => {
+            let y = frame.y_plane();
+            let uv = frame.uv_plane();
+            println!("{}x{} user_data={}", frame.width(), frame.height(), user_data);
+        }
+        Err(e) => {
+            eprintln!("decode callback error: {e}");
         }
     }
-}
+}))?;
+
+// AVCC フォーマットのデータを非同期デコード
+decoder.decode(&avcc_data, 42)?;
+decoder.finish()?;
 ```
 
 ## 設定
@@ -162,14 +194,68 @@ if let Some(frame) = decoder.decode(&avcc_data)? {
 | `average_bitrate` | `Option<u64>` | 平均ビットレート (bps)、`None` でバックエンド依存 |
 | `fps_numerator` | `u32` | フレームレートの分子 |
 | `fps_denominator` | `u32` | フレームレートの分母 |
-| `prioritize_encoding_speed_over_quality` | `bool` | 品質より速度を優先 |
-| `real_time` | `bool` | リアルタイムエンコード |
-| `maximize_power_efficiency` | `bool` | 電力効率最大化 |
-| `allow_frame_reordering` | `bool` | フレーム再順序付け許可 |
-| `allow_temporal_compression` | `bool` | 時間的圧縮許可 |
+| `prioritize_encoding_speed_over_quality` | `Option<bool>` | 品質より速度を優先 |
+| `real_time` | `Option<bool>` | リアルタイムエンコード |
+| `maximize_power_efficiency` | `Option<bool>` | 電力効率最大化 |
+| `allow_frame_reordering` | `Option<bool>` | フレーム再順序付け許可 |
+| `allow_temporal_compression` | `Option<bool>` | 時間的圧縮許可 |
 | `max_key_frame_interval` | `Option<NonZeroU32>` | 最大キーフレーム間隔 (フレーム数) |
 | `max_key_frame_interval_duration` | `Option<Duration>` | 最大キーフレーム間隔 (秒数) |
 | `max_frame_delay_count` | `Option<NonZeroU32>` | フレーム遅延制限 |
+| `data_rate_limits` | `Vec<DataRateLimit>` | 短期ウィンドウごとのデータレート上限 |
+
+`Option` のフィールドは、`None` が「そのプロパティを設定しない (Video Toolbox の既定に任せる)」を
+意味します。`None` のときに使われる値は Video Toolbox の既定であり、このクレートが決めた値では
+ありません。`allow_frame_reordering` など、未指定時の値によってビットストリームが変わるものがあります。
+
+`Encoder::new()` は指定されたプロパティを 1 個ずつ設定し、選択されたエンコーダーが受け付けなかった
+プロパティがある場合は `Error::VideoToolbox` を返します。このエラーの `property` から、どの
+プロパティが受け付けられなかったかを確認できます。値そのものが Video Toolbox に受理された範囲へ
+丸められることはありますが、指定したプロパティが反映されたかどうかは `Encoder::new()` の結果で
+判定できます。
+
+```rust
+use shiguredo_video_toolbox::{Encoder, Error};
+
+// handler は EncodeHandler を実装したハンドラー
+match Encoder::new(config, handler) {
+    Ok(encoder) => { /* エンコード処理 */ }
+    Err(Error::VideoToolbox {
+        status,
+        function,
+        property,
+    }) => {
+        // 受け付けられなかったプロパティが分かる (プロパティ以外の失敗では property は None)
+        eprintln!("{function}: status={status}, property={property:?}");
+    }
+    Err(e) => return Err(e),
+}
+```
+
+### `H264EncoderConfig` / `HevcEncoderConfig`
+
+`CodecConfig` が持つコーデック固有の設定です。プロパティに対応するフィールドは `Option` で、
+`None` の場合はそのプロパティを設定せず Video Toolbox の既定に任せます。
+
+| 型 | フィールド | 型 | 説明 |
+|---|---|---|---|
+| `H264EncoderConfig` | `profile` | `Option<H264Profile>` | H.264 プロファイル (`Baseline` / `Main` / `High`) |
+| `H264EncoderConfig` | `entropy_mode` | `Option<H264EntropyMode>` | エントロピー符号化モード (`Cavlc` / `Cabac`) |
+| `HevcEncoderConfig` | `profile` | `Option<HevcProfile>` | HEVC プロファイル (`Main` / `Main10`) |
+| `HevcEncoderConfig` | `allow_open_gop` | `Option<bool>` | Open GOP 許可 |
+
+### `DataRateLimit`
+
+`kVTCompressionPropertyKey_DataRateLimits` に対応するデータレートのハードリミットです。
+`bytes` で `window` の期間内に生成できる圧縮データの総バイト数を指定します。
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `bytes` | `u64` | ウィンドウあたりの総バイト数の上限 |
+| `window` | `Duration` | ウィンドウの長さ |
+
+指定できるリミットは最大 2 個です。`bytes` と `window` には 0 を指定できず、`bytes` は `i64::MAX` 以下である必要があります。
+`EncoderConfig::data_rate_limits` が空の `Vec` のときは `kVTCompressionPropertyKey_DataRateLimits` を設定せず、Video Toolbox の既定に任せます。既定値はエンコーダーによって異なるため、上限なしになることを保証するものではありません。
 
 ### `DecoderConfig`
 
@@ -196,33 +282,128 @@ if let Some(frame) = decoder.decode(&avcc_data)? {
 | `FrameData::I420` | `y`, `u`, `v` | I420 形式 (3 プレーン) |
 | `FrameData::Nv12` | `y`, `uv` | NV12 形式 (2 プレーン) |
 
-## コーデック情報の取得
+### `EncodedFrame`
 
-`supported_codecs()` で、実行環境で利用可能なコーデック情報を一覧取得できます。
+エンコード結果です。`EncodeHandler::on_encoded` に `Result<EncodedFrame<T>, Error>` として渡されます。
 
-デコード判定に `VTIsHardwareDecodeSupported`、エンコード判定に `VTCopyVideoEncoderList` と `VTCopySupportedPropertyDictionaryForEncoder` を使用しています。
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `timestamp` | `Option<Timestamp>` | フレームの提示時刻。有効な時刻が得られなかった場合は `None` |
+| `picture_type` | `PictureType` | ピクチャータイプ |
+| `sps_list` | `Vec<Vec<u8>>` | SPS (キーフレームのときのみ) |
+| `pps_list` | `Vec<Vec<u8>>` | PPS (キーフレームのときのみ) |
+| `vps_list` | `Vec<Vec<u8>>` | VPS (H.265 のキーフレームのときのみ) |
+| `data` | `Vec<u8>` | 圧縮データ (AVCC 形式) |
+| `user_data` | `T` | `encode` / `encode_pixel_buffer` 呼び出し時に指定したユーザーデータ |
+
+`timestamp` は `value / timescale` 秒を表す有理数です。`timescale` には、その時刻を生成したときに
+エンコーダーが入力フレームのタイムスタンプに使っていた値 (`EncoderConfig::fps_numerator`) が入ります。
+`Encoder::reconfigure` でフレームレートを変更すると、変更前のフレームと変更後のフレームで
+`timescale` が異なるため、複数の `timescale` をまたいで時刻を比較する場合は `Timestamp::seconds()`
+で秒に直してください。1 回のエンコードで投入したフレームのうち、フレームレートの変更をまたがない
+ものは `timescale` が同じになるため、`value` の差分をそのまま表示順の間隔として使えます。
+
+`picture_type` は Video Toolbox が返すフレーム種別の情報から判定できる範囲だけを表します。
+Video Toolbox は I フレームと IDR フレームを区別しないため、`PictureType::I` には
+IDR フレームも含まれます。`PictureType::B` は `allow_frame_reordering` が `Some(true)` のときと、
+このプロパティを設定しない `None` のとき (Video Toolbox の既定がフレーム再順序付け有効のため) に
+現れます。`Some(false)` のときは現れません。
+キーフレームかどうかは `PictureType::I` かどうかで判定します。
 
 ```rust
-use shiguredo_video_toolbox::{supported_codecs, VideoCodecType, EncodingProfiles};
+use shiguredo_video_toolbox::{EncodedFrame, Error, PictureType};
+
+// エンコードコールバックの中
+let encoded: EncodedFrame<u64> = match result {
+    Ok(encoded) => encoded,
+    Err(e) => {
+        eprintln!("encode callback error: {e}");
+        return;
+    }
+};
+
+// 提示時刻 (秒) と、その時刻の目盛り
+if let Some(timestamp) = encoded.timestamp {
+    println!("pts: {} (timescale={})", timestamp.seconds(), timestamp.timescale);
+}
+match encoded.picture_type {
+    // キーフレームかどうかは PictureType::I かどうかで判定します
+    PictureType::I => println!("keyframe"),
+    PictureType::B => println!("b frame"),
+    PictureType::P => println!("p frame"),
+    PictureType::Unknown => println!("unknown picture type"),
+}
+```
+
+## コーデック情報の取得
+
+`supported_codecs()` で、解像度に依存しないコーデック情報を一覧取得できます。
+デコード判定に `VTIsHardwareDecodeSupported`、エンコーダーの一覧に `VTCopyVideoEncoderList` を使用しています。
+
+`DecodingInfo` の `hardware_accelerated` は「ハードウェアデコードが可能か」です。
+
+```rust
+use shiguredo_video_toolbox::{VideoCodecType, supported_codecs};
 
 for info in supported_codecs() {
-    println!("{:?}: decoding={}, encoding={}",
-        info.codec, info.decoding.supported, info.encoding.supported);
+    println!("{:?}: decoding_hw={}, encoders={}",
+        info.codec, info.decoding.hardware_accelerated, info.encoders.len());
 
-    if info.decoding.supported {
-        println!("  decoding: hw={}", info.decoding.hardware_accelerated);
-    }
+    // ハードウェアデコードが使えるか
+    println!("  decoding: hw={}", info.decoding.hardware_accelerated);
 
-    if info.encoding.supported {
-        println!("  encoding: hw={}", info.encoding.hardware_accelerated);
-        match &info.encoding.profiles {
-            EncodingProfiles::H264(profiles) => println!("  profiles: {:?}", profiles),
-            EncodingProfiles::Hevc(profiles) => println!("  profiles: {:?}", profiles),
-            EncodingProfiles::None => {}
-        }
+    // エンコーダー 1 件ずつの属性。hardware_accelerated はこのエントリ自身が
+    // ハードウェア実装かどうかを表す
+    for encoder in &info.encoders {
+        println!("  encoder: id={}, hw={}",
+            encoder.encoder_id, encoder.hardware_accelerated);
+        println!("    encoder_name={:?}, codec_name={:?}",
+            encoder.encoder_name, encoder.codec_name);
+        println!("    frame_reordering={}, multi_pass={}",
+            encoder.supports_frame_reordering, encoder.supports_multi_pass);
+
+        // 同じコーデックの他のエンコーダーとの相対値。None は「不明」
+        println!("    ratings: performance={:?}, quality={:?}",
+            encoder.performance_rating, encoder.quality_rating);
     }
 }
 ```
+
+`CodecInfo::encoders` が空の場合は、そのコーデックではエンコードできません。
+
+どのエンコーダーが選ばれるかは解像度によって変わるため、解像度が決まっている場合は `query_encoding_capabilities()` を使います。
+
+```rust
+use shiguredo_video_toolbox::{EncodingProfiles, VideoCodecType, query_encoding_capabilities};
+
+// エンコーダーが無いコーデック (VP9 / AV1) や、解像度が不正な場合は None になります
+if let Some(capabilities) = query_encoding_capabilities(VideoCodecType::H264, 1920, 1080) {
+    // この解像度でハードウェアエンコーダーが使えるかは、選ばれるエンコーダーの属性で判定します
+    println!("hardware_accelerated={}", capabilities.encoder.hardware_accelerated);
+    println!("encoder_id={}", capabilities.encoder.encoder_id);
+
+    match &capabilities.profiles {
+        Some(EncodingProfiles::H264(profiles)) => println!("profiles: {profiles:?}"),
+        Some(EncodingProfiles::Hevc(profiles)) => println!("profiles: {profiles:?}"),
+        // Video Toolbox がプロファイル一覧を返さなかった場合
+        None => println!("profiles: unknown"),
+    }
+}
+```
+
+`query_encoding_capabilities()` は `encoderSpecification` に NULL を渡した
+`VTCopySupportedPropertyDictionaryForEncoder` を使用します。これは `VTCompressionSessionCreate` と
+同じ既定の選択（解像度に対応するハードウェアエンコーダーがあればそれを、無ければソフトウェア
+エンコーダーを選ぶ）なので、返る `encoder` は実際に使われるエンコーダーです。
+ハードウェアエンコーダーの資源が枯渇している場合、この照会が成功してもセッションの生成に失敗することがあります。
+
+`profiles` には、Video Toolbox がプロファイルレベルに指定できる値のうち、このクレートが
+`H264EncodingProfile` / `HevcEncodingProfile` として表現できるものだけが入ります。
+Video Toolbox は H.264 の High 4:2:2 / High 4:4:4 Predictive、HEVC の 4:4:4 系や Monochrome 系なども
+返しうるため、`profiles` に含まれないことが「そのプロファイルが使えない」ことを意味するとは限りません。
+
+解像度の上下限と、ビットレート・フレームレートなどの数値プロパティの範囲は公開していません。
+解像度ごとの可否は `query_encoding_capabilities()` で判定してください。
 
 ## サポートコーデック
 
@@ -250,12 +431,12 @@ VP9 と AV1 はハードウェアサポートに依存するため、環境に�
 - **`width` / `height` が無効**な場合（0 である、または `i32::MAX` を超える等）は `Error::InvalidConfig` が返されます。
 
 ```rust
-use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, Error, PixelFormat};
+use shiguredo_video_toolbox::{Decoder, DecoderCodec, DecoderConfig, DecodedFrame, Error, FnDecodeHandler, PixelFormat};
 
 match Decoder::new(DecoderConfig {
     codec: DecoderCodec::Vp9 { width: 1920, height: 1080 },
     pixel_format: PixelFormat::I420,
-}) {
+}, FnDecodeHandler::new(|_: Result<DecodedFrame<()>, Error>| {})) {
     Ok(decoder) => { /* デコード処理 */ }
     Err(Error::UnsupportedCodec { codec }) => {
         eprintln!("{codec} is not supported on this platform");
@@ -267,50 +448,41 @@ match Decoder::new(DecoderConfig {
 }
 ```
 
-## 動的解像度変更
+## 動的設定更新
 
-WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に解像度が変わるユースケースに対応しています。
+WebRTC やアダプティブビットレートストリーミングなど、ストリーム中に設定を変更するユースケースに対応しています。
 
 ### エンコーダー
 
-`reconfigure()` でセッションを再作成して解像度やその他の設定を変更できます。
+`reconfigure()` で `ReconfigureParams` を渡し、動的に変更可能な項目だけを更新します。
+`VTSessionSetProperties` を 1 回呼び出して指定された項目を一括反映するため、セッション再作成は行われません。
 
-Video Toolbox のエンコーダーはセッション作成時に解像度を固定するため、変更時は常にセッションの破棄と再作成が行われます。未出力フレームは自動的にフラッシュされ、`next_frame()` で取得できます。
+動的に更新できる項目は `average_bitrate` / `expected_frame_rate` の 2 つです。
+解像度・コーデック・ピクセルフォーマットなど Video Toolbox が動的変更をサポートしない項目は、
+`Encoder` を作り直して対応します。
+
+`expected_frame_rate` を更新すると `fps_numerator` / `fps_denominator` は `expected_frame_rate / 1` に
+正規化されます (分数 fps は保持されません)。分数 fps を保持したい場合は `Encoder` を作り直してください。
+
+`Encoder::config()` は、初期化時の設定に直近の動的更新を反映した値を返します。
+Video Toolbox が内部で丸めた実効値ではありません。
 
 ```rust
-// 動的に解像度を変更
-// 未出力フレームは自動的にフラッシュされる
-let new_config = EncoderConfig {
-    width: 1280,
-    height: 720,
-    codec: CodecConfig::H264(H264EncoderConfig {
-        profile: H264Profile::Main,
-        entropy_mode: H264EntropyMode::Cabac,
-    }),
-    pixel_format: PixelFormat::I420,
-    average_bitrate: Some(2_000_000),
-    fps_numerator: 30,
-    fps_denominator: 1,
-    prioritize_encoding_speed_over_quality: false,
-    real_time: false,
-    maximize_power_efficiency: false,
-    allow_frame_reordering: false,
-    allow_temporal_compression: true,
-    max_key_frame_interval: None,
-    max_key_frame_interval_duration: None,
-    max_frame_delay_count: None,
-};
-encoder.reconfigure(new_config)?;
+use shiguredo_video_toolbox::ReconfigureParams;
 
-// フラッシュされたフレームを取得
-while let Some(encoded) = encoder.next_frame()? {
-    println!("flushed bytes: {}", encoded.data.len());
-}
+// ビットレートとフレームレートを動的に更新
+// 未指定 (None) の項目は現在値を維持する
+encoder.reconfigure(ReconfigureParams {
+    average_bitrate: Some(2_000_000),
+    expected_frame_rate: Some(60),
+    ..Default::default()
+})?;
 ```
 
 ### デコーダー
 
 `update_format()` で新しいパラメータセットや解像度を渡してフォーマットを更新できます。H.264 / H.265 / VP9 / AV1 すべてのコーデックに対応しています。
+呼び出しの先頭で `finish()` を実行し、遅延フレームを排出してからフォーマットを更新します。
 
 Video Toolbox の `VTDecompressionSessionCanAcceptFormatDescription()` で既存セッションが新しいフォーマットを受け入れ可能か判定し、可能な場合はセッションを流用、不可能な場合のみセッションを再作成します。
 
@@ -348,8 +520,72 @@ decoder.update_format(DecoderCodec::Av1 {
 | | エンコーダー | デコーダー |
 |---|---|---|
 | メソッド | `reconfigure()` | `update_format()` |
-| 仕組み | 常にセッション破棄 + 再作成 | セッション流用を判定し、不可能な場合のみ再作成 |
-| 引数 | `EncoderConfig` (全設定) | `DecoderCodec` (パラメータセットのみ) |
+| 仕組み | `VTSessionSetProperties` で動的更新 (セッション再作成なし) | セッション流用を判定し、不可能な場合のみ再作成 |
+| 引数 | `ReconfigureParams` (動的更新可能項目のみ) | `DecoderCodec` (パラメータセットのみ) |
+| 対応外項目 | 解像度・コーデック・ピクセルフォーマット → `Encoder` を作り直す | (`DecoderCodec` バリアントが対応するもの以外) |
+
+## 統計値
+
+`Encoder::stats()` / `Decoder::stats()` で、エンコード / デコードの進行状況をメトリクスとして取得できます。
+
+統計値はエンコーダー / デコーダーを操作するスレッドと Video Toolbox のコールバックスレッドの
+両方が更新するため、戻り値はエンコーダー / デコーダーと共有されている値への参照です。
+複数のフィールドを読む間に値が変化し得るので、値を保存しておきたい場合は `clone()` してください。
+
+`Counter` は単調増加の通算値、`Gauge` は増減する時点値です。どちらも `clone()` は現在値の
+コピーを返します。
+
+### `EncoderStats`
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `total_encode_count` | `Counter` | `encode()` / `encode_pixel_buffer()` が Video Toolbox に受理された通算回数 |
+| `total_output_frame_count` | `Counter` | 出力コールバックに `Ok` を渡した通算回数 |
+| `total_error_count` | `Counter` | 出力コールバックに `Err` を渡した通算回数 |
+| `total_reconfigure_count` | `Counter` | `reconfigure()` が成功した通算回数 |
+| `in_flight_frames` | `Gauge` | 送信済みでまだ出力コールバックが来ていないフレーム数の現在値 |
+
+### `DecoderStats`
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `total_decode_count` | `Counter` | `decode()` が Video Toolbox に受理された通算回数 |
+| `total_output_frame_count` | `Counter` | 出力コールバックに `Ok` を渡した通算回数 |
+| `total_error_count` | `Counter` | 出力コールバックに `Err` を渡した通算回数 |
+| `total_create_session_count` | `Counter` | デコーダーセッションの作成に成功した通算回数 |
+| `total_update_format_count` | `Counter` | `update_format()` がセッションを流用した通算回数 |
+| `total_recreate_session_count` | `Counter` | `update_format()` がセッションを再作成した通算回数 |
+| `in_flight_frames` | `Gauge` | 送信済みでまだ出力コールバックが来ていないフレーム数の現在値 |
+
+`in_flight_frames` は送信の直前に増え、出力コールバックがユーザーデータを回収した時点で減ります。
+Video Toolbox が満杯を起こさない上限値は公開していないため、利用側で上限を決めて
+`finish()` を挟むことで、処理中のフレーム数を制御できます。
+
+`total_create_session_count` は `Decoder::new()` の初回作成を含みます。
+
+```rust
+// 送信済みで処理中のフレーム数を確認し、閾値に達したらフラッシュする
+let in_flight = encoder.stats().in_flight_frames.get();
+if in_flight >= 4 {
+    encoder.finish()?;
+}
+
+// 通算値のコピーを取得する (フィールド間の一貫性は保証されない)
+let stats = encoder.stats().clone();
+println!(
+    "encoded={} output={} error={}",
+    stats.total_encode_count.get(),
+    stats.total_output_frame_count.get(),
+    stats.total_error_count.get()
+);
+
+// update_format() がセッションを流用したか再作成したかも統計値で確認できる
+println!(
+    "reuse={} recreate={}",
+    decoder.stats().total_update_format_count.get(),
+    decoder.stats().total_recreate_session_count.get()
+);
+```
 
 ## ライセンス
 

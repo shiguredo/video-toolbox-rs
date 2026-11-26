@@ -1,0 +1,257 @@
+use std::ffi::c_void;
+
+use crate::{error::Error, sys};
+
+/// `std::panic::catch_unwind` で捕捉した panic payload からメッセージを取り出す
+///
+/// panic 時のメッセージは `&str` または `String` のいずれかで payload に積まれる。
+/// どちらでもない場合は汎用メッセージを返す。
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+/// ユーザーハンドラの panic を捕捉してエラーログを出力する
+///
+/// `on_encoded` / `on_decoded` が panic すると、unwind が `extern "C"` 境界を越えて
+/// プロセスを abort させるため、`catch_unwind` で捕捉する (CODEBASE.md の
+/// 「catch_unwind の許可」参照)。捕捉した panic はエラーログで可視化し、セッションは継続する。
+/// `&mut H` は `UnwindSafe` でないため `AssertUnwindSafe` で包む。
+pub(crate) fn catch_user_panic(callback_name: &'static str, f: impl FnOnce()) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    if let Err(payload) = outcome {
+        // `&payload` は `&Box<dyn Any + Send>` となり、`&(dyn Any + Send)` への coerce 時に
+        // deref ではなく Box 構造体自体の unsize が適用されるため、明示的に `&*payload` で deref する。
+        let message = panic_payload_message(&*payload);
+        tracing::error!("{callback_name}: user handler panicked: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `&'static str` の panic payload からメッセージを取り出せること
+    #[test]
+    fn panic_payload_message_extracts_str() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("panic message");
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "panic message",
+            "&str payload からメッセージを取り出せること"
+        );
+    }
+
+    /// `String` の panic payload からメッセージを取り出せること
+    #[test]
+    fn panic_payload_message_extracts_string() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("panic message"));
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "panic message",
+            "String payload からメッセージを取り出せること"
+        );
+    }
+
+    /// `&str` でも `String` でもない panic payload は汎用メッセージになること
+    #[test]
+    fn panic_payload_message_falls_back_for_unknown_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            panic_payload_message(&*payload),
+            "unknown panic payload",
+            "未知の payload は汎用メッセージになること"
+        );
+    }
+}
+
+/// Video Toolbox / CoreMedia の `i32` 寸法引数に渡す前に、`u32` が正の `i32` に収まることを検証する。
+pub(crate) fn validate_video_dimensions_for_toolbox(width: u32, height: u32) -> Result<(), Error> {
+    let max = i32::MAX as u32;
+    if width == 0 {
+        return Err(Error::InvalidConfig {
+            field: "width".into(),
+            reason: "must not be zero".into(),
+        });
+    }
+    if height == 0 {
+        return Err(Error::InvalidConfig {
+            field: "height".into(),
+            reason: "must not be zero".into(),
+        });
+    }
+    if width > max {
+        return Err(Error::InvalidConfig {
+            field: "width".into(),
+            reason: "must fit in i32 for Video Toolbox dimensions".into(),
+        });
+    }
+    if height > max {
+        return Err(Error::InvalidConfig {
+            field: "height".into(),
+            reason: "must fit in i32 for Video Toolbox dimensions".into(),
+        });
+    }
+    Ok(())
+}
+
+/// ピクセルフォーマット
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// kCVPixelFormatType_420YpCbCr8Planar (3 プレーン: Y, U, V)
+    I420,
+    /// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange (2 プレーン: Y, UV interleaved)
+    Nv12,
+}
+
+/// `CVPixelBufferLockBaseAddress` の後に束ね、`Drop` で必ず `CVPixelBufferUnlockBaseAddress` を呼ぶ。
+/// `copy_plane` が `Err` でもロック解除を漏らさない。
+pub(crate) struct CvPixelBufferUnlockGuard(pub(crate) sys::CVPixelBufferRef);
+
+impl Drop for CvPixelBufferUnlockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let status = sys::CVPixelBufferUnlockBaseAddress(self.0, 0);
+            if status != 0 {
+                tracing::error!("CVPixelBufferUnlockBaseAddress failed: status={status}");
+            }
+        }
+    }
+}
+
+// ドロップ時に確実に sys::CFRelease() を呼び出すようにするためのラッパー
+#[derive(Debug)]
+pub(crate) struct CfPtrMut<T>(pub(crate) *mut T);
+
+impl<T> Drop for CfPtrMut<T> {
+    fn drop(&mut self) {
+        unsafe { sys::CFRelease(self.0.cast()) }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CfPtr<T>(pub(crate) *const T);
+
+impl<T> Drop for CfPtr<T> {
+    fn drop(&mut self) {
+        unsafe { sys::CFRelease(self.0.cast()) }
+    }
+}
+
+/// CF のキーと値のペアから CFDictionary を生成する
+///
+/// `kCFTypeDictionaryKeyCallBacks` / `kCFTypeDictionaryValueCallBacks` を使うため、
+/// 生成された CFDictionary は各キーと値を retain する。
+/// 返り値は `CfPtr` ガードであり、drop 時に `CFRelease` される。
+/// 呼び出し側は FFI 関数に渡す際に `guard.0` から生ポインタを取り出し、
+/// ガードを FFI 呼び出しが終わるまで生存させること。
+pub(crate) fn cf_dictionary(
+    kvs: &[(sys::CFStringRef, *const c_void)],
+) -> Result<CfPtr<c_void>, Error> {
+    let mut keys = kvs.iter().map(|(k, _)| k.cast()).collect::<Vec<_>>();
+    let mut values = kvs.iter().map(|(_, v)| *v).collect::<Vec<_>>();
+    let ptr = unsafe {
+        sys::CFDictionaryCreate(
+            std::ptr::null_mut(),
+            keys.as_mut_ptr(),
+            values.as_mut_ptr(),
+            kvs.len() as sys::CFIndex,
+            &sys::kCFTypeDictionaryKeyCallBacks,
+            &sys::kCFTypeDictionaryValueCallBacks,
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFDictionaryCreate".into(),
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}
+
+/// CF オブジェクトの配列から CFArray を生成する
+///
+/// `kCFTypeArrayCallBacks` を使うため、生成された CFArray は各要素を retain する。
+/// 呼び出し側は渡した要素の `CfPtr` を CFArray 生成後に drop してよい。
+pub(crate) fn cf_array(values: &[*const c_void]) -> Result<CfPtr<c_void>, Error> {
+    let ptr = unsafe {
+        sys::CFArrayCreate(
+            std::ptr::null_mut(),
+            values.as_ptr().cast_mut(),
+            values.len() as sys::CFIndex,
+            &sys::kCFTypeArrayCallBacks,
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFArrayCreate".into(),
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}
+
+/// `bool` に対応する CFBoolean を、プロパティの値として渡せる生ポインタにする
+///
+/// `kCFBooleanTrue` / `kCFBooleanFalse` は Core Foundation が所有する定数であるため、
+/// 返り値を解放してはならない。
+pub(crate) fn cf_boolean(value: bool) -> *const c_void {
+    unsafe {
+        if value {
+            sys::kCFBooleanTrue.cast()
+        } else {
+            sys::kCFBooleanFalse.cast()
+        }
+    }
+}
+
+pub(crate) fn cf_number_i32(n: i32) -> Result<CfPtr<c_void>, Error> {
+    let ptr = unsafe {
+        sys::CFNumberCreate(
+            std::ptr::null_mut(),
+            sys::kCFNumberSInt32Type as sys::CFNumberType,
+            ((&n) as *const i32).cast(),
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate".into(),
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}
+
+pub(crate) fn cf_number_i64(n: i64) -> Result<CfPtr<c_void>, Error> {
+    let ptr = unsafe {
+        sys::CFNumberCreate(
+            std::ptr::null_mut(),
+            sys::kCFNumberSInt64Type as sys::CFNumberType,
+            ((&n) as *const i64).cast(),
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate".into(),
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}
+
+pub(crate) fn cf_number_f64(n: f64) -> Result<CfPtr<c_void>, Error> {
+    let ptr = unsafe {
+        sys::CFNumberCreate(
+            std::ptr::null_mut(),
+            sys::kCFNumberFloat64Type as sys::CFNumberType,
+            ((&n) as *const f64).cast(),
+        )
+    };
+    if ptr.is_null() {
+        return Err(Error::CfObjectCreationFailed {
+            function: "CFNumberCreate".into(),
+        });
+    }
+    Ok(CfPtr(ptr.cast()))
+}

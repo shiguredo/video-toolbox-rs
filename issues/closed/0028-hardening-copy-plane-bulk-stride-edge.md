@@ -1,6 +1,6 @@
 # `copy_plane` の一括コピー経路でバックエンド異常時のプレーン実サイズとの整合を追加検証する
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

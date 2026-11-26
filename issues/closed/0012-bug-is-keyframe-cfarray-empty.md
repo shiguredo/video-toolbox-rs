@@ -1,7 +1,7 @@
 # `is_keyframe` が `CFArray` の要素数を確認せず `CFArrayGetValueAtIndex(attachments, 0)` を呼ぶ
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

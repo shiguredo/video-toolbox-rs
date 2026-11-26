@@ -1,7 +1,7 @@
 # エンコード出力の `from_raw_parts` が NULL ポインタや長さ 0 の組み合わせで未定義動作になり得る
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

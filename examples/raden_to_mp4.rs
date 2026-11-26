@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
+use std::sync::mpsc;
 
 use raden::{Circle, CompOp, Context, Image, PipelineRuntime, PixelFormat, Rect, Rgba32};
 use shiguredo_mp4::boxes::{
@@ -17,14 +18,16 @@ use shiguredo_mp4::boxes::{
 use shiguredo_mp4::mux::{Mp4FileMuxer, Sample};
 use shiguredo_mp4::{TrackKind, Uint};
 use shiguredo_video_toolbox::{
-    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, FrameData, H264EncoderConfig,
-    H264EntropyMode, H264Profile, HevcEncoderConfig, HevcProfile, PixelFormat as VideoPixelFormat,
+    CodecConfig, EncodeOptions, EncodedFrame, Encoder, EncoderConfig, Error as VideoToolboxError,
+    FnEncodeHandler, FrameData, H264EncoderConfig, H264EntropyMode, H264Profile, HevcEncoderConfig,
+    HevcProfile, PictureType, PixelFormat as VideoPixelFormat, Timestamp,
 };
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_FPS: u32 = 30;
 const DEFAULT_DURATION_SECS: f64 = 5.0;
+type EncodedResult = Result<EncodedFrame<u64>, VideoToolboxError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Codec {
@@ -40,8 +43,11 @@ fn prgb32_to_i420(
     stride: usize,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut y_plane = vec![0u8; width * height];
-    let mut u_plane = vec![0u8; (width / 2) * (height / 2)];
-    let mut v_plane = vec![0u8; (width / 2) * (height / 2)];
+    // 奇数幅・高さでも 4:2:0 のクロマ寸法を正しく計算する
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
+    let mut u_plane = vec![0u8; uv_width * uv_height];
+    let mut v_plane = vec![0u8; uv_width * uv_height];
 
     for row in 0..height {
         for col in 0..width {
@@ -57,15 +63,17 @@ fn prgb32_to_i420(
         }
     }
 
-    // U/V プレーンは 2x2 ブロック平均
-    for row in 0..(height / 2) {
-        for col in 0..(width / 2) {
+    // U/V プレーンは 2x2 ブロック平均（奇数寸法では画面外ピクセルを clamp で処理）
+    for row in 0..uv_height {
+        for col in 0..uv_width {
             let mut sum_r = 0u32;
             let mut sum_g = 0u32;
             let mut sum_b = 0u32;
             for dy in 0..2 {
                 for dx in 0..2 {
-                    let offset = (row * 2 + dy) * stride + (col * 2 + dx) * 4;
+                    let src_row = (row * 2 + dy).min(height - 1);
+                    let src_col = (col * 2 + dx).min(width - 1);
+                    let offset = src_row * stride + src_col * 4;
                     sum_b += data[offset] as u32;
                     sum_g += data[offset + 1] as u32;
                     sum_r += data[offset + 2] as u32;
@@ -78,8 +86,8 @@ fn prgb32_to_i420(
             let u = (-0.169 * r - 0.331 * g + 0.500 * b + 128.0).clamp(0.0, 255.0) as u8;
             let v = (0.500 * r - 0.419 * g - 0.081 * b + 128.0).clamp(0.0, 255.0) as u8;
 
-            u_plane[row * (width / 2) + col] = u;
-            v_plane[row * (width / 2) + col] = v;
+            u_plane[row * uv_width + col] = u;
+            v_plane[row * uv_width + col] = v;
         }
     }
 
@@ -169,7 +177,7 @@ fn render_frame(ctx: &mut Context, t: f64, w: f64, h: f64) {
 }
 
 /// H.264 用の SampleEntry を構築する
-fn build_h264_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> SampleEntry {
+fn build_h264_sample_entry<T>(frame: &EncodedFrame<T>, width: u16, height: u16) -> SampleEntry {
     SampleEntry::Avc1(Avc1Box {
         visual: visual_sample_entry_fields(width, height),
         avcc_box: AvccBox {
@@ -189,7 +197,7 @@ fn build_h264_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> Sam
 }
 
 /// H.265 用の SampleEntry を構築する
-fn build_h265_sample_entry(frame: &EncodedFrame, width: u16, height: u16) -> SampleEntry {
+fn build_h265_sample_entry<T>(frame: &EncodedFrame<T>, width: u16, height: u16) -> SampleEntry {
     // HEVC NAL unit type: VPS=32, SPS=33, PPS=34
     let mut nalu_arrays = Vec::new();
     if !frame.vps_list.is_empty() {
@@ -252,6 +260,94 @@ fn visual_sample_entry_fields(width: u16, height: u16) -> VisualSampleEntryField
     }
 }
 
+/// エンコード済みフレームを MP4 のサンプルとして書き込む
+///
+/// サンプルの尺は、直前のサンプルとの提示時刻の差から求める。MP4 のタイムスケールは
+/// CLI で指定された fps のため、`fps_denominator` が 1 である本サンプルでは
+/// エンコーダーの提示時刻をそのまま尺に使える。フレームがドロップした場合は
+/// その間隔ぶんの尺になり、ギャップを埋められる。
+struct Mp4Writer {
+    /// エンコード対象のコーデック (サンプルエントリーの組み立てに使う)
+    codec: Codec,
+    /// 映像の幅
+    width: u16,
+    /// 映像の高さ
+    height: u16,
+    /// MP4 のタイムスケール (CLI で指定された fps)
+    timescale: NonZeroU32,
+    /// サンプルエントリーを書き込むトラックのファイル
+    file: File,
+    /// MP4 マルチプレクサー
+    muxer: Mp4FileMuxer,
+    /// ファイル内のサンプルデータ開始位置
+    data_offset: u64,
+    /// サンプルエントリーをまだ書き込んでいないかどうか
+    needs_sample_entry: bool,
+    /// 直前のサンプルの提示時刻
+    previous_timestamp: Option<Timestamp>,
+}
+
+impl Mp4Writer {
+    /// エンコード結果 1 件をサンプルとして書き込む
+    ///
+    /// Video Toolbox はキーフレームのときにだけ SPS / PPS (H.265 では VPS も) を通知するため、
+    /// 最初のキーフレームでサンプルエントリーを 1 度だけ書き込む。
+    /// キーフレームかどうかはピクチャータイプが [`PictureType::I`] かどうかで判定する。
+    fn write(&mut self, encoded: &EncodedFrame<u64>) -> Result<(), Box<dyn std::error::Error>> {
+        let keyframe = encoded.picture_type == PictureType::I;
+        let sample_entry = if self.needs_sample_entry && keyframe {
+            self.needs_sample_entry = false;
+            Some(match self.codec {
+                Codec::H264 => build_h264_sample_entry(encoded, self.width, self.height),
+                Codec::H265 => build_h265_sample_entry(encoded, self.width, self.height),
+            })
+        } else {
+            None
+        };
+
+        // 直前のサンプルの尺は、次のサンプルの提示時刻が届くまで確定しない。
+        // 最後のサンプルは次が無いため 1 フレームぶんの尺とする。
+        let duration = match (self.previous_timestamp, encoded.timestamp) {
+            (Some(previous), Some(current)) => {
+                let delta = (current.seconds() - previous.seconds()) * self.timescale.get() as f64;
+                if delta < 1.0 {
+                    // 尺 0 のサンプルは書けないため、1 以上に丸める
+                    1
+                } else {
+                    delta.round() as u32
+                }
+            }
+            _ => 1,
+        };
+        self.previous_timestamp = encoded.timestamp;
+
+        self.file.write_all(&encoded.data)?;
+        let sample = Sample {
+            track_kind: TrackKind::Video,
+            sample_entry,
+            keyframe,
+            timescale: self.timescale,
+            duration,
+            data_offset: self.data_offset,
+            data_size: encoded.data.len(),
+            composition_time_offset: None,
+        };
+        self.muxer.append_sample(&sample)?;
+        self.data_offset += encoded.data.len() as u64;
+        Ok(())
+    }
+
+    /// 構築された MP4 のボックス群をファイルへ書き戻す
+    fn finalize(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let finalized = self.muxer.finalize()?;
+        for (offset, bytes) in finalized.offset_and_bytes_pairs() {
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(bytes)?;
+        }
+        Ok(())
+    }
+}
+
 /// コマンドライン引数からオプション値を取得する
 fn get_arg(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -302,12 +398,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // エンコーダーの初期化
     let codec_config = match codec {
         Codec::H264 => CodecConfig::H264(H264EncoderConfig {
-            profile: H264Profile::Main,
-            entropy_mode: H264EntropyMode::Cabac,
+            profile: Some(H264Profile::Main),
+            entropy_mode: Some(H264EntropyMode::Cabac),
         }),
         Codec::H265 => CodecConfig::Hevc(HevcEncoderConfig {
-            profile: HevcProfile::Main,
-            allow_open_gop: true,
+            profile: Some(HevcProfile::Main),
+            allow_open_gop: Some(true),
         }),
     };
     let config = EncoderConfig {
@@ -318,63 +414,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         average_bitrate: Some(2_000_000),
         fps_numerator: fps,
         fps_denominator: 1,
-        prioritize_encoding_speed_over_quality: false,
-        real_time: false,
-        maximize_power_efficiency: false,
-        allow_frame_reordering: false,
-        allow_temporal_compression: true,
+        prioritize_encoding_speed_over_quality: Some(false),
+        real_time: Some(false),
+        maximize_power_efficiency: Some(false),
+        allow_frame_reordering: Some(false),
+        allow_temporal_compression: Some(true),
         max_key_frame_interval: None,
         max_key_frame_interval_duration: None,
         max_frame_delay_count: None,
+        data_rate_limits: Vec::new(),
     };
-    let mut encoder = Encoder::new(config)?;
+    let (encoded_result_tx, encoded_result_rx) = mpsc::channel::<EncodedResult>();
+    let mut encoder = Encoder::new(
+        config,
+        FnEncodeHandler::new({
+            move |result: Result<EncodedFrame<u64>, VideoToolboxError>| {
+                if encoded_result_tx.send(result).is_err() {
+                    eprintln!("encoded results receiver is dropped");
+                }
+            }
+        }),
+    )?;
 
     // MP4 マルチプレクサーの初期化
-    let mut muxer = Mp4FileMuxer::new()?;
+    let muxer = Mp4FileMuxer::new()?;
     let initial_bytes = muxer.initial_boxes_bytes();
     let mut file = File::create(&output_path)?;
     file.write_all(initial_bytes)?;
-    let mut data_offset = initial_bytes.len() as u64;
+    let mut writer = Mp4Writer {
+        codec,
+        width: width as u16,
+        height: height as u16,
+        timescale: NonZeroU32::new(fps).expect("fps must be non-zero (validated by CLI parser)"),
+        data_offset: initial_bytes.len() as u64,
+        file,
+        muxer,
+        needs_sample_entry: true,
+        previous_timestamp: None,
+    };
 
     let w = width as f64;
     let h = height as f64;
     let dt = 1.0 / fps as f64;
-    let timescale = NonZeroU32::new(fps).unwrap();
-    let mut first_keyframe = true;
 
-    // エンコード済みフレームを MP4 に書き込む共通処理
-    let write_encoded_frame = |encoded: &EncodedFrame,
-                               file: &mut File,
-                               muxer: &mut Mp4FileMuxer,
-                               data_offset: &mut u64,
-                               first_keyframe: &mut bool|
-     -> Result<(), Box<dyn std::error::Error>> {
-        let sample_entry = if *first_keyframe && encoded.keyframe {
-            *first_keyframe = false;
-            let entry = match codec {
-                Codec::H264 => build_h264_sample_entry(encoded, width as u16, height as u16),
-                Codec::H265 => build_h265_sample_entry(encoded, width as u16, height as u16),
-            };
-            Some(entry)
-        } else {
-            None
-        };
-
-        file.write_all(&encoded.data)?;
-        let sample = Sample {
-            track_kind: TrackKind::Video,
-            sample_entry,
-            keyframe: encoded.keyframe,
-            timescale,
-            duration: 1,
-            data_offset: *data_offset,
-            data_size: encoded.data.len(),
-            composition_time_offset: None,
-        };
-        muxer.append_sample(&sample)?;
-        *data_offset += encoded.data.len() as u64;
-        Ok(())
-    };
+    // エンコード結果は全フレームをフラッシュしてから MP4 に書き込む。
+    // サンプルの尺は次のサンプルの提示時刻から求めるため、書き込みを保留する。
+    let mut encoded_frames = Vec::new();
 
     for frame_idx in 0..total_frames {
         let t = frame_idx as f64 * dt;
@@ -402,17 +487,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 v: &v,
             },
             &EncodeOptions::default(),
+            frame_idx,
         )?;
 
-        // エンコード済みフレームを MP4 に書き込む
-        while let Some(encoded) = encoder.next_frame()? {
-            write_encoded_frame(
-                &encoded,
-                &mut file,
-                &mut muxer,
-                &mut data_offset,
-                &mut first_keyframe,
-            )?;
+        // エンコード結果を回収しておく
+        for result in encoded_result_rx.try_iter() {
+            encoded_frames.push(result?);
         }
 
         if (frame_idx + 1) % (fps as u64) == 0 {
@@ -425,24 +505,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 残りのフレームをフラッシュ
+    // 残りのフレームをフラッシュして回収する
     encoder.finish()?;
-    while let Some(encoded) = encoder.next_frame()? {
-        write_encoded_frame(
-            &encoded,
-            &mut file,
-            &mut muxer,
-            &mut data_offset,
-            &mut first_keyframe,
-        )?;
+    for result in encoded_result_rx.try_iter() {
+        encoded_frames.push(result?);
+    }
+
+    // エンコード済みフレームを MP4 に書き込む
+    for encoded in &encoded_frames {
+        writer.write(encoded)?;
     }
 
     // MP4 ファイナライズ
-    let finalized = muxer.finalize()?;
-    for (offset, bytes) in finalized.offset_and_bytes_pairs() {
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)?;
-    }
+    writer.finalize()?;
 
     println!("Done: {}", output_path);
 

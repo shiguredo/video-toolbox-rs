@@ -1,7 +1,7 @@
 # `average_bitrate` を `u64 as i64` で渡すと大きな値が負のビットレートになる
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: GPT-5.2
 
 ## なぜこの対応が必要か

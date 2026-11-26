@@ -1,7 +1,7 @@
 # デコード成功時にプレーンが空スライスになる可能性と API の意味を再検討する
 
-Created: 2026-04-01  
-Completed: 2026-04-01  
+Created: 2026-04-01
+Completed: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

@@ -1,6 +1,6 @@
 # エンコード出力が `mpsc::channel` の無制限バッファでメモリを伸ばし続けうる
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か

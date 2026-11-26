@@ -1,6 +1,6 @@
 # `codec_info` で Core Foundation オブジェクトの型を検証せずにキャストしている
 
-Created: 2026-04-01  
+Created: 2026-04-01
 Model: Composer 2 Fast
 
 ## なぜこの対応が必要か
