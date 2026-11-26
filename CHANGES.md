@@ -11,6 +11,10 @@
 
 ## develop
 
+## 2026.2.0
+
+**リリース日**: 2026-11-26
+
 - [CHANGE] MSRV (rust-version) を 1.95 に上げる
   - `AtomicU64::fetch_update` が 1.99.0 で `try_update` への改名により非推奨になるため、
     1.95.0 で安定化された `AtomicU64::try_update` に置き換える
