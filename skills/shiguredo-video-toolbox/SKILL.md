@@ -28,7 +28,7 @@ Apple の [Video Toolbox](https://developer.apple.com/documentation/videotoolbox
 ## バージョン情報
 
 - crate 名: `shiguredo_video_toolbox`
-- バージョン: 2026.2.0-canary.4
+- バージョン: 2026.2.0
 - Rust Edition: 2024
 - 最小 Rust バージョン: 1.95
 - ライセンス: Apache-2.0
